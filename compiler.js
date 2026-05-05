@@ -105,14 +105,15 @@ const Keyword = Object.freeze({
   X_REFEXTERN: "__refextern",
   X_STRUCT_GC: "__struct",
   X_ARRAY_GC: "__array",
-  X_NEW: "__new",
+  X_STRUCT_NEW: "__struct_new",
+  X_ARRAY_NEW: "__array_new",
   X_REF_IS_NULL: "__ref_is_null",
   X_REF_EQ: "__ref_eq",
   X_REF_NULL: "__ref_null",
   X_REF_TEST: "__ref_test",
   X_REF_TEST_NULL: "__ref_test_null",
   X_ARRAY_LEN: "__array_len",
-  X_NEW_ARRAY: "__new_array",
+  X_ARRAY_OF: "__array_of",
   X_EXTENDS: "__extends",
   X_REF_CAST: "__ref_cast",
   X_REF_CAST_NULL: "__ref_cast_null",
@@ -839,14 +840,15 @@ const KEYWORD_MAP = new Map([
   ["__refextern", Keyword.X_REFEXTERN],
   ["__struct", Keyword.X_STRUCT_GC],
   ["__array", Keyword.X_ARRAY_GC],
-  ["__new", Keyword.X_NEW],
+  ["__struct_new", Keyword.X_STRUCT_NEW],
+  ["__array_new", Keyword.X_ARRAY_NEW],
   ["__ref_is_null", Keyword.X_REF_IS_NULL],
   ["__ref_eq", Keyword.X_REF_EQ],
   ["__ref_null", Keyword.X_REF_NULL],
   ["__ref_test", Keyword.X_REF_TEST],
   ["__ref_test_null", Keyword.X_REF_TEST_NULL],
   ["__array_len", Keyword.X_ARRAY_LEN],
-  ["__new_array", Keyword.X_NEW_ARRAY],
+  ["__array_of", Keyword.X_ARRAY_OF],
   ["__extends", Keyword.X_EXTENDS],
   ["__ref_cast", Keyword.X_REF_CAST],
   ["__ref_cast_null", Keyword.X_REF_CAST_NULL],
@@ -4748,44 +4750,58 @@ class Parser {
       return first;
     }
 
-    // __new(type, args...)
-    if (this.matchKW(Lexer.Keyword.X_NEW)) {
+    // __struct_new(Name, args...) — struct.new / struct.new_default
+    if (this.matchKW(Lexer.Keyword.X_STRUCT_NEW)) {
       const newTok = this.peek(-1);
       this.expect("(");
-      if (!this.isTypeName()) this.error(this.peek(), "__new requires a type as the first argument");
-      const specs = this.parseDeclSpecifiers();
-      let nType = specs.type;
-      if (this.atText("*") || this.atText("[") || this.atText("(")) {
-        const decl = this.parseDeclarator(nType);
-        nType = decl.type;
+      if (!this.atKW(Lexer.Keyword.X_STRUCT_GC)) {
+        this.error(this.peek(), `__struct_new requires a __struct type name`);
       }
+      const nType = this.parseGCStructSpecifier();
+      while (this.matchText("*")) { /* collapse pointer sugar */ }
       const nq = nType.removeQualifiers();
-      if (!nq.isGCRef()) {
-        this.error(newTok, `__new requires a GC type (__struct or __array), got '${nType.toString()}'`);
+      if (!nq.isGCStruct()) {
+        this.error(newTok, `__struct_new requires a __struct type, got '${nType.toString()}'`);
       }
+      if (!nq.isComplete) this.error(newTok, `__struct_new of incomplete GC struct '${nq.tagName}'`);
       const args = [];
       while (this.matchText(",")) args.push(this.parseAssignmentExpression());
       this.expect(")");
-      // Validate arg count
-      if (nq.isGCStruct()) {
-        if (!nq.isComplete) this.error(newTok, `__new of incomplete GC struct '${nq.tagName}'`);
-        const fields = nq.tagDecl.members;
-        if (args.length !== 0 && args.length !== fields.length) {
-          this.error(newTok, `__new(__struct ${nq.tagName}, ...): expected ${fields.length} field args, got ${args.length}`);
-        }
-        // Reject implicit non-zero int → non-eqref ref field (silent-null bug).
-        for (let i = 0; i < args.length; i++) {
-          this._rejectNonZeroToRef(fields[i].type, args[i], newTok);
-        }
-      } else {
-        // GC_ARRAY: __new(__array(T), length) or __new(__array(T), length, init)
-        if (args.length < 1 || args.length > 2) {
-          this.error(newTok, `__new(__array(...), ...): expected length [, init], got ${args.length} args`);
-        }
-        // Reject non-zero int as fill value when element type is a non-eqref ref.
-        if (args.length === 2) this._rejectNonZeroToRef(nq.baseType, args[1], newTok);
+      const fields = nq.tagDecl.members;
+      if (args.length !== 0 && args.length !== fields.length) {
+        this.error(newTok, `__struct_new(__struct ${nq.tagName}, ...): expected ${fields.length} field args, got ${args.length}`);
+      }
+      // Reject implicit non-zero int → non-eqref ref field (silent-null bug).
+      for (let i = 0; i < args.length; i++) {
+        this._rejectNonZeroToRef(fields[i].type, args[i], newTok);
       }
       return new AST.EGCNew(nq, args);
+    }
+
+    // __array_new(elemType, length [, init]) — array.new / array.new_default
+    if (this.matchKW(Lexer.Keyword.X_ARRAY_NEW)) {
+      const newTok = this.peek(-1);
+      this.expect("(");
+      if (!this.isTypeName()) this.error(this.peek(), `__array_new requires an element type as the first argument`);
+      const specs = this.parseDeclSpecifiers();
+      let elemType = specs.type;
+      if (this.atText("*") || this.atText("[") || this.atText("(")) {
+        const decl = this.parseDeclarator(elemType);
+        elemType = decl.type;
+      }
+      if (elemType.kind === Types.TypeKind.ARRAY || elemType.kind === Types.TypeKind.FUNCTION) {
+        this.error(newTok, `__array_new element type must not be a C array or function`);
+      }
+      const arrType = Types.gcArrayOf(elemType);
+      const args = [];
+      while (this.matchText(",")) args.push(this.parseAssignmentExpression());
+      this.expect(")");
+      if (args.length < 1 || args.length > 2) {
+        this.error(newTok, `__array_new(...): expected length [, init], got ${args.length} args`);
+      }
+      // Reject non-zero int as fill value when element type is a non-eqref ref.
+      if (args.length === 2) this._rejectNonZeroToRef(elemType, args[1], newTok);
+      return new AST.EGCNew(arrType, args);
     }
 
     // __memory_size, __memory_grow
@@ -4931,11 +4947,11 @@ class Parser {
       return new AST.EIntrinsic(Types.TINT, Types.IntrinsicKind.ARRAY_LEN, [arg]);
     }
 
-    // __new_array(elemType, v1, v2, ...) — array.new_fixed
-    if (this.matchKW(Lexer.Keyword.X_NEW_ARRAY)) {
+    // __array_of(elemType, v1, v2, ...) — array.new_fixed
+    if (this.matchKW(Lexer.Keyword.X_ARRAY_OF)) {
       const tok = this.peek(-1);
       this.expect("(");
-      if (!this.isTypeName()) this.error(tok, "__new_array first argument must be the element type");
+      if (!this.isTypeName()) this.error(tok, "__array_of first argument must be the element type");
       const specs = this.parseDeclSpecifiers();
       let elemType = specs.type;
       if (this.atText("*") || this.atText("[") || this.atText("(")) {
@@ -4946,7 +4962,7 @@ class Parser {
       while (this.matchText(",")) args.push(this.parseAssignmentExpression());
       this.expect(")");
       if (elemType.kind === Types.TypeKind.ARRAY || elemType.kind === Types.TypeKind.FUNCTION) {
-        this.error(tok, `__new_array element type must not be a C array or function`);
+        this.error(tok, `__array_of element type must not be a C array or function`);
       }
       // Reject implicit non-zero int → non-eqref ref element (silent-null bug).
       for (let i = 0; i < args.length; i++) {

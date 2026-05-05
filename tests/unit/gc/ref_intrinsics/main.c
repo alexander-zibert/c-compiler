@@ -8,7 +8,7 @@ int main(void) {
   printf("a null: %d\n", __ref_is_null(a));     // 1
 
   // After __new, no longer null
-  __struct Point *b = __new(__struct Point *, 1, 2);
+  __struct Point *b = __struct_new(__struct Point *, 1, 2);
   printf("b null: %d\n", __ref_is_null(b));     // 0
 
   // __ref_eq: aliasing
@@ -17,13 +17,13 @@ int main(void) {
   printf("b eq a: %d\n", __ref_eq(b, a));       // 0
 
   // Two distinct allocations are not equal even if fields are equal
-  __struct Point *d = __new(__struct Point *, 1, 2);
+  __struct Point *d = __struct_new(__struct Point *, 1, 2);
   printf("b eq d: %d\n", __ref_eq(b, d));       // 0
 
   // Works on __array too
-  __array(int) arr = __new(__array(int), 3);
+  __array(int) arr = __array_new(int, 3);
   __array(int) arr2 = arr;
-  __array(int) arr3 = __new(__array(int), 3);
+  __array(int) arr3 = __array_new(int, 3);
   printf("arr null: %d\n", __ref_is_null(arr)); // 0
   printf("arr eq arr2: %d\n", __ref_eq(arr, arr2)); // 1
   printf("arr eq arr3: %d\n", __ref_eq(arr, arr3)); // 0

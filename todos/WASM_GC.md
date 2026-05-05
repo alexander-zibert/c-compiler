@@ -15,7 +15,7 @@ A GC struct **value** is conceptually a reference to a heap-allocated object. To
 ```c
 __struct Point { int x; int y; };
 
-__struct Point *p = __new(__struct Point *, 3, 7);
+__struct Point *p = __struct_new(__struct Point *, 3, 7);
 p->x = 99;
 printf("%d\n", p->x);
 ```
@@ -23,7 +23,7 @@ printf("%d\n", p->x);
 For GC arrays, **never** add `*` — arrays don't have a "pointer to" idiom in C, and the compiler will reject `__array(T) *`:
 
 ```c
-__array(int) arr = __new(__array(int), 5);    // OK
+__array(int) arr = __array_new(int, 5);       // OK
 arr[0] = 42;
 __array_len(arr);
 
@@ -33,26 +33,26 @@ __array(int) *bad = ...;                      // ERROR — write `__array(int) n
 When an array's element type is a GC struct, spell that with `*` too:
 
 ```c
-__array(__struct Point *) ps = __new_array(__struct Point *,
-    __new(__struct Point *, 1, 2),
-    __new(__struct Point *, 3, 4));
+__array(__struct Point *) ps = __array_of(__struct Point *,
+    __struct_new(__struct Point *, 1, 2),
+    __struct_new(__struct Point *, 3, 4));
 ps[0]->x;   // works because element type already says `*`
 ```
 
-### `__new()` always takes the `*` form
+### `__struct_new()` takes the `*` form
 
-For consistency with `__new(__array(T))`, the type-arg to `__new` should always be already in its "ref-spelled" form. So:
+The type-arg to `__struct_new` should always be in its "ref-spelled" `*` form, matching how GC struct refs are written elsewhere:
 
 | Allocation | Always write |
 |---|---|
-| Struct | `__new(__struct Foo *, args...)` |
-| Array (default-init) | `__new(__array(T), n)` |
-| Array (filled) | `__new(__array(T), n, val)` |
-| Array (literal values) | `__new_array(T, v1, v2, ...)` |
+| Struct | `__struct_new(__struct Foo *, args...)` |
+| Array (default-init) | `__array_new(T, n)` |
+| Array (filled) | `__array_new(T, n, val)` |
+| Array (literal values) | `__array_of(T, v1, v2, ...)` |
 
-This way the IDE macro shim for `__new` doesn't need to differentiate struct vs array: `#define __new(t, ...) ((t)0)` works for both because `__struct Foo *` and `__array(int)` are both castable from `0`.
+The array allocation intrinsics (`__array_new`, `__array_of`) take the bare element type directly, so there is no `*` awkwardness for arrays. The IDE macro shims are straightforward: `#define __struct_new(T, ...) ((T){0})`, `#define __array_new(T, ...) ((__array(T)){0})`, `#define __array_of(T, ...) ((__array(T)){0})`.
 
-The same `*` consistency applies to type-arg intrinsics that can take an array: `__ref_test(__struct Foo *, x)`, `__ref_cast(__struct Foo *, x)`, `__ref_null(__struct Foo *)`. **Exception**: `__extends(__struct Animal)` stays bare — it names a parent class (mirroring C++'s `class Dog : public Animal`), and the parent is always a struct, never an array, so there's no consistency pressure from another form.
+The same `*` consistency applies to type-arg intrinsics that can take a struct ref: `__ref_test(__struct Foo *, x)`, `__ref_cast(__struct Foo *, x)`, `__ref_null(__struct Foo *)`. **Exception**: `__extends(__struct Animal)` stays bare — it names a parent class (mirroring C++'s `class Dog : public Animal`), and the parent is always a struct, never an array, so there's no consistency pressure from another form.
 
 ### Why both forms work
 
@@ -103,12 +103,12 @@ Implicit upcast works automatically (Dog → Animal in function calls or assignm
 GC-managed arrays with a fixed element type and runtime length:
 
 ```c
-__array(int) scores = __new(__array(int), 100);    // 100 default-initialized
+__array(int) scores = __array_new(int, 100);    // 100 default-initialized
 scores[0] = 42;
 int len = __array_len(scores);
 
-__array(int) vals = __new_array(int, 1, 2, 3);     // literal element list
-__array(int) ones = __new(__array(int), 5, 1);     // 5 elements, all = 1
+__array(int) vals = __array_of(int, 1, 2, 3);  // literal element list
+__array(int) ones = __array_new(int, 5, 1);    // 5 elements, all = 1
 ```
 
 Bulk operations:
@@ -214,10 +214,10 @@ Rejected (no meaningful semantics): `ref < other`, `ref >= 0`, etc. Also `__stru
 C23 `auto` pairs naturally with GC types — the type spelling can stay on the right side of the `=`:
 
 ```c
-auto p = __new(__struct Point *, 7, 11);
+auto p = __struct_new(__struct Point *, 7, 11);
 p->x;
 
-auto arr = __new_array(int, 1, 2, 3);
+auto arr = __array_of(int, 1, 2, 3);
 for (auto cur = head; cur; cur = cur->next) printf("%d\n", cur->v);
 ```
 

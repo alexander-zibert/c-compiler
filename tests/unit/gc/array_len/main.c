@@ -1,13 +1,13 @@
 #include <stdio.h>
 
 int main(void) {
-  __array(int) a = __new(__array(int), 5);
+  __array(int) a = __array_new(int, 5);
   printf("len: %d\n", __array_len(a));         // 5
 
-  __array(double) d = __new(__array(double), 100, 1.5);
+  __array(double) d = __array_new(double, 100, 1.5);
   printf("len: %d\n", __array_len(d));         // 100
 
-  __array(int) e = __new_array(int, 1, 2, 3);
+  __array(int) e = __array_of(int, 1, 2, 3);
   printf("len: %d\n", __array_len(e));         // 3
 
   // __array_len works as a loop bound

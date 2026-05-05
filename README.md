@@ -101,7 +101,7 @@ A GC struct **value** is a reference to a heap-allocated object. To match C's po
 ```c
 __struct Point { int x; int y; };
 
-__struct Point *p = __new(__struct Point *, 3, 7);
+__struct Point *p = __struct_new(__struct Point *, 3, 7);
 p->x = 99;
 printf("%d\n", p->x);
 ```
@@ -109,19 +109,19 @@ printf("%d\n", p->x);
 For GC arrays, **never** add `*` — arrays don't have a "pointer to" idiom in C, and the compiler rejects `__array(T) *`:
 
 ```c
-__array(int) arr = __new(__array(int), 5);    // OK
+__array(int) arr = __array_new(int, 5);    // OK
 arr[0] = 42;
 __array_len(arr);
 ```
 
-The same `*` convention applies to type-args of every intrinsic that can take an array — `__new`, `__new_array`, `__ref_test` / `__ref_test_null`, `__ref_cast` / `__ref_cast_null`, `__ref_null`. (Exception: `__extends(__struct Foo)` stays bare because it names a parent class, never an array.) This means the IDE shim for `__new` doesn't need to differentiate struct vs array (both `__struct Foo *` and `__array(int)` cast cleanly from `0`):
+The `*` convention applies to `__struct_new` and to type-arg intrinsics like `__ref_test` / `__ref_test_null`, `__ref_cast` / `__ref_cast_null`, `__ref_null`. (Exception: `__extends(__struct Foo)` stays bare because it names a parent class, never an array.) The array allocation intrinsics (`__array_new`, `__array_of`) take the bare element type directly, so there is no `*` awkwardness for arrays:
 
 | Allocation | Always write |
 |---|---|
-| Struct | `__new(__struct Foo *, args...)` |
-| Array (default-init) | `__new(__array(T), n)` |
-| Array (filled) | `__new(__array(T), n, val)` |
-| Array (literal values) | `__new_array(T, v1, v2, ...)` |
+| Struct | `__struct_new(__struct Foo *, args...)` |
+| Array (default-init) | `__array_new(T, n)` |
+| Array (filled) | `__array_new(T, n, val)` |
+| Array (literal values) | `__array_of(T, v1, v2, ...)` |
 
 The bare form (`__struct Foo` and `.`) also works — both spellings produce the same WASM type — but the `*`/`->` form is the documented preferred style.
 
@@ -149,20 +149,20 @@ Single inheritance via `__extends`. All `__struct` types are emitted as open for
 GC-managed arrays with a fixed element type and runtime length:
 
 ```c
-__array(int) scores = __new(__array(int), 100);  // 100 zero-initialized
+__array(int) scores = __array_new(int, 100);  // 100 zero-initialized
 scores[0] = 42;
 int len = __array_len(scores);
 
-__array(int) vals = __new_array(int, 1, 2, 3, 4, 5);  // literal element list
-__array(int) ones = __new(__array(int), 5, 1);        // 5 elements, all = 1
+__array(int) vals = __array_of(int, 1, 2, 3, 4, 5);  // literal element list
+__array(int) ones = __array_new(int, 5, 1);           // 5 elements, all = 1
 ```
 
 When the element type is a GC struct, spell *that* with `*` too:
 
 ```c
-__array(__struct Point *) pts = __new_array(__struct Point *,
-    __new(__struct Point *, 1, 2),
-    __new(__struct Point *, 3, 4));
+__array(__struct Point *) pts = __array_of(__struct Point *,
+    __struct_new(__struct Point *, 1, 2),
+    __struct_new(__struct Point *, 3, 4));
 pts[0]->x;
 ```
 
@@ -242,8 +242,8 @@ GC refs cross the JS/Wasm boundary via `__eqref` + the extern conversions:
 C23 `auto` pairs naturally with GC types — the type spelling stays on the right of the `=`:
 
 ```c
-auto p = __new(__struct Point *, 7, 11);
-auto arr = __new_array(int, 1, 2, 3);
+auto p = __struct_new(__struct Point *, 7, 11);
+auto arr = __array_of(int, 1, 2, 3);
 for (auto cur = head; cur; cur = cur->next) printf("%d\n", cur->v);
 ```
 
@@ -254,7 +254,7 @@ for (auto cur = head; cur; cur = cur->next) printf("%d\n", cur->v);
 - No `sizeof` on ref types
 - No casts to/from integers (use `__ref_*` intrinsics)
 - `__array(T) *` is rejected — arrays don't take the `*` sugar
-- `__new(__struct Foo, ...)` works but the preferred form is `__new(__struct Foo *, ...)`
+- `__struct_new(__struct Foo, ...)` works but the preferred form is `__struct_new(__struct Foo *, ...)`
 
 For the full GC design doc see [todos/WASM_GC.md](todos/WASM_GC.md).
 

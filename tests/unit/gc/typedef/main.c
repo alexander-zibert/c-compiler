@@ -7,7 +7,7 @@ typedef __struct Foo *FooRef;
 typedef __array(int) IntArr;
 typedef __array(__struct Foo *) FooArr;
 
-FooRef make(int a, int b) { return __new(__struct Foo *, a, b); }
+FooRef make(int a, int b) { return __struct_new(__struct Foo *, a, b); }
 
 int sum_arr(IntArr a) {
   int s = 0;
@@ -22,10 +22,10 @@ int main(void) {
   FooRef f = make(11, 22);
   printf("%d %d\n", f->x, f->y);
 
-  IntArr a = __new_array(int, 7, 8, 9);
+  IntArr a = __array_of(int, 7, 8, 9);
   printf("sum: %d\n", sum_arr(a));
 
-  FooArr fa = __new_array(FooRef, make(1, 2), make(3, 4));
+  FooArr fa = __array_of(FooRef, make(1, 2), make(3, 4));
   for (int i = 0; i < __array_len(fa); i++) printf("(%d,%d)\n", fa[i]->x, fa[i]->y);
 
   int (*fn)(int) = square;

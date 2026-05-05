@@ -5,7 +5,7 @@ __struct Foo { int x; };
 
 int main(void) {
   __struct Foo *a;  // null
-  __struct Foo *b = __new(__struct Foo *, 7);
+  __struct Foo *b = __struct_new(__struct Foo *, 7);
 
   // boolean coercion in if/else
   if (a) printf("a non-null\n"); else printf("a null\n");
@@ -42,13 +42,13 @@ int main(void) {
   printf("d null: %d  e null: %d\n", d == 0, e == 0);
 
   // boolean coercion in for-loop condition
-  __array(int) arr = __new_array(int, 1, 2, 3);
+  __array(int) arr = __array_of(int, 1, 2, 3);
   int seen = 0;
   for (auto i = arr; i; i = 0) seen++;
   printf("for-seen: %d\n", seen);
 
   // && / || with refs
-  __struct Foo *p = __new(__struct Foo *, 1);
+  __struct Foo *p = __struct_new(__struct Foo *, 1);
   __struct Foo *q;
   if (p && !q) printf("p&&!q\n");
   if (q || p) printf("q||p\n");

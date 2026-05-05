@@ -12,7 +12,7 @@ __struct Dog {
 };
 
 __struct Node *cons(int v, __struct Node *tl) {
-  auto n = __new(__struct Node *);
+  auto n = __struct_new(__struct Node *);
   n->v = v;
   n->next = tl;
   return n;
@@ -55,11 +55,11 @@ int main(void) {
   // GC array — no '*' allowed here. Arrays don't take the pointer-form sugar
   // (the C "pointer to array" idiom doesn't really exist; arrays are already
   // single-indirection refs). See gc/err_array_pointer for the error case.
-  __array(int) arr = __new_array(int, 100, 200, 300);
+  __array(int) arr = __array_of(int, 100, 200, 300);
   printf("len=%d arr[2]=%d\n", __array_len(arr), arr[2]);
 
   // Inheritance: pass child via pointer-form to parent-pointer param
-  __struct Dog *d = __new(__struct Dog *, 7, 4);
+  __struct Dog *d = __struct_new(__struct Dog *, 7, 4);
   describe(d);
 
   // -> through inheritance chain

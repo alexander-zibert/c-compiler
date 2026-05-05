@@ -3,7 +3,7 @@
 __struct Point { int x; int y; };
 
 __struct Point *make_point(int a, int b) {
-  return __new(__struct Point *, a, b);
+  return __struct_new(__struct Point *, a, b);
 }
 
 int point_sum(__struct Point *p) {
@@ -11,7 +11,7 @@ int point_sum(__struct Point *p) {
 }
 
 __array(int) make_seq(int n) {
-  __array(int) a = __new(__array(int), n);
+  __array(int) a = __array_new(int, n);
   for (int i = 0; i < n; i++) a[i] = (i + 1) * 10;
   return a;
 }

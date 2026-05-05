@@ -9,12 +9,12 @@ __struct Dog {
 };
 
 __struct Point *make_point(int a, int b) {
-  return __new(__struct Point *, a, b);
+  return __struct_new(__struct Point *, a, b);
 }
 
 int main(void) {
   // Inferred GC struct ref
-  auto p = __new(__struct Point *, 7, 11);
+  auto p = __struct_new(__struct Point *, 7, 11);
   printf("%d %d\n", p->x, p->y);
 
   // Inferred from function return
@@ -22,12 +22,12 @@ int main(void) {
   printf("%d %d\n", p2->x, p2->y);
 
   // Inferred GC array ref
-  auto arr = __new_array(int, 10, 20, 30, 40, 50);
+  auto arr = __array_of(int, 10, 20, 30, 40, 50);
   for (int i = 0; i < __array_len(arr); i++) printf("%d ", arr[i]);
   printf("\n");
 
   // Default-init array
-  auto buf = __new(__array(int), 4);
+  auto buf = __array_new(int, 4);
   for (int i = 0; i < __array_len(buf); i++) printf("%d ", buf[i]);
   printf("\n");
 
@@ -40,7 +40,7 @@ int main(void) {
   printf("%d\n", fst);
 
   // GC ref with inheritance
-  auto d = __new(__struct Dog *, 99, 4);
+  auto d = __struct_new(__struct Dog *, 99, 4);
   printf("%d %d\n", d->id, d->paws);
 
   // Cast result via __ref_cast
