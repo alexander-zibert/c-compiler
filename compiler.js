@@ -4754,15 +4754,18 @@ class Parser {
 
     // __struct_new(__struct Foo, args...) — struct.new / struct.new_default
     // __new(__struct Foo, args...) — alias for __struct_new
+    // Accepts any type expression that resolves to a GC struct (including typedefs).
     if (this.matchKW(Lexer.Keyword.X_STRUCT_NEW) || this.matchKW(Lexer.Keyword.X_NEW)) {
       const newTok = this.peek(-1);
       const callName = newTok.text;
       this.expect("(");
-      if (!this.atKW(Lexer.Keyword.X_STRUCT_GC)) {
-        this.error(this.peek(), `${callName} requires a __struct type`);
+      if (!this.isTypeName()) this.error(this.peek(), `${callName} requires a __struct type`);
+      const specs = this.parseDeclSpecifiers();
+      let nType = specs.type;
+      if (this.atText("*") || this.atText("[") || this.atText("(")) {
+        const decl = this.parseDeclarator(nType);
+        nType = decl.type;
       }
-      const nType = this.parseGCStructSpecifier();
-      while (this.matchText("*")) { /* tolerate trailing * */ }
       const nq = nType.removeQualifiers();
       if (!nq.isGCStruct()) {
         this.error(newTok, `${callName} requires a __struct type, got '${nType.toString()}'`);
