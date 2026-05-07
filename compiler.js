@@ -13428,9 +13428,13 @@ class Translator {
         const stmts = [];
         for (const decl of stmt.declarations) {
           if (decl.declKind !== Types.DeclKind.VAR) continue;
+          // `static` and `extern` locals have global storage duration; they
+          // were registered as IR globals in _collectGlobals (statics) or
+          // resolved via the existing extern path. The DECL statement itself
+          // emits no code for them — just like the default backend.
           if (decl.storageClass === Types.StorageClass.STATIC ||
               decl.storageClass === Types.StorageClass.EXTERN) {
-            nyi(`local ${decl.storageClass} variables`, loc);
+            continue;
           }
           if (decl.allocClass === Types.AllocClass.MEMORY) {
             // Frame storage was already assigned by _collectMemoryLocals.
@@ -14523,24 +14527,43 @@ class Translator {
   _collectGlobals(units) {
     const { T, IR } = this.GUC;
 
+    // Iterate over file-scope variables AND function-scope `static` locals.
+    // Static locals have global storage duration (C11 §6.2.4/3) so they go
+    // through the same code paths as file-scope globals. The default backend
+    // uses the same approach (registerGlobalVar is called for both — see the
+    // staticLocals walk in CodeGenerator's generateCode).
+    const allGlobalDefs = (yield_) => {
+      for (const unit of units) {
+        for (const v of unit.definedVariables) {
+          const def = v.definition || v;
+          if (def !== v) continue;
+          yield_(def);
+        }
+        for (const func of unit.definedFunctions || []) {
+          const fdef = func.definition || func;
+          for (const sloc of (fdef.staticLocals || [])) yield_(sloc);
+        }
+        for (const func of unit.staticFunctions || []) {
+          const fdef = func.definition || func;
+          for (const sloc of (fdef.staticLocals || [])) yield_(sloc);
+        }
+      }
+    };
+
     // First pass: REGISTER-class globals — those with statically-
     // evaluable inits become wasm globals; those with non-const inits
     // (e.g. `int *p = &x;`) fall back to MEMORY-class storage so they
     // can use initExprs.
     const fallbackToMemory = new Set();
-    for (const unit of units) {
-      for (const v of unit.definedVariables) {
-        const def = v.definition || v;
-        if (def !== v) continue;
-        if (def.storageClass === Types.StorageClass.EXTERN) continue;
-        if (this.cGlobalToIR.has(def) || this.cGlobalToMb.has(def)) continue;
-        if (def.allocClass === Types.AllocClass.REGISTER) {
-          if (!this._defineRegisterGlobal(def)) {
-            fallbackToMemory.add(def);
-          }
+    allGlobalDefs((def) => {
+      if (def.storageClass === Types.StorageClass.EXTERN) return;
+      if (this.cGlobalToIR.has(def) || this.cGlobalToMb.has(def)) return;
+      if (def.allocClass === Types.AllocClass.REGISTER) {
+        if (!this._defineRegisterGlobal(def)) {
+          fallbackToMemory.add(def);
         }
       }
-    }
+    });
 
     // Second pass: MEMORY-class globals + REGISTER fallbacks. Two-phase
     // so that init exprs referencing &otherGlobal can find the other
@@ -14549,21 +14572,17 @@ class Translator {
     //
     // Phase 2a: allocate every MB identity with empty initExprs.
     const memGlobals = []; // Array<{def, mb}>
-    for (const unit of units) {
-      for (const v of unit.definedVariables) {
-        const def = v.definition || v;
-        if (def !== v) continue;
-        if (def.storageClass === Types.StorageClass.EXTERN) continue;
-        const isMem = def.allocClass === Types.AllocClass.MEMORY ||
-                      fallbackToMemory.has(def);
-        if (!isMem) continue;
-        if (this.cGlobalToMb.has(def)) continue;
-        const sz = def.type.size || 1;
-        const mb = new IR.MutableBytes(def.name, new Uint8Array(sz), []);
-        this.cGlobalToMb.set(def, mb);
-        memGlobals.push({ def, mb });
-      }
-    }
+    allGlobalDefs((def) => {
+      if (def.storageClass === Types.StorageClass.EXTERN) return;
+      const isMem = def.allocClass === Types.AllocClass.MEMORY ||
+                    fallbackToMemory.has(def);
+      if (!isMem) return;
+      if (this.cGlobalToMb.has(def)) return;
+      const sz = def.type.size || 1;
+      const mb = new IR.MutableBytes(def.name, new Uint8Array(sz), []);
+      this.cGlobalToMb.set(def, mb);
+      memGlobals.push({ def, mb });
+    });
     // Phase 2b: populate bytes + initExprs (mutating mb.bytes / mb.initExprs).
     for (const { def, mb } of memGlobals) {
       if (def.initExpr) {
