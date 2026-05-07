@@ -670,10 +670,26 @@ const IR = (() => {
 
     class Program {
         // memorySpec (optional): {
-        //   minPages,         // required if memorySpec is provided
+        //   staticDataBase?,  // start address for auto-laid-out static
+        //                     //   data (default 0). All BytesLiterals and
+        //                     //   MutableBytesLiterals are placed starting
+        //                     //   here.
+        //   stackPages?,      // bytes of stack to reserve, in 64KB pages.
+        //                     //   When > 0, codegen auto-creates a mutable
+        //                     //   `__stack_pointer` global initialized to
+        //                     //   the top of the stack, and computes
+        //                     //   `IR.HeapBase` to point at the first byte
+        //                     //   above the stack. Functions with
+        //                     //   StackSlots / Alloca / containsAlloca get
+        //                     //   an auto-generated SP-saving prologue.
+        //   minHeapPages?,    // pages reserved for heap above the stack.
+        //                     //   Computed-minPages = ceil(heapBase /
+        //                     //   65536) + minHeapPages.
+        //   minPages?,        // explicit min pages. Required when
+        //                     //   stackPages is absent. Ignored (computed)
+        //                     //   when stackPages is set.
         //   maxPages?,        // optional upper bound
         //   exportName?,      // if set, export the memory under this name
-        //   staticDataBase?,  // start address for auto-laid-out BytesLiterals (default 0)
         // }
         // tables   — Array<IR.Table>, optional.
         // elements — Array<IR.ElementSegment>, optional. (Active segments only;
@@ -687,8 +703,10 @@ const IR = (() => {
         //   custom-section header (length-prefixed UTF-8 name + raw payload).
         // dataInit — Uint8Array | number[], optional. User-supplied initial
         //   linear-memory contents starting at memorySpec.staticDataBase.
-        //   BytesLiterals are laid out after this region. Use this for things
-        //   like global-variable initializers.
+        //   Placed before any BytesLiterals/MutableBytesLiterals. Frontends
+        //   can also (preferably) use IR.MutableBytesLiteral to declare
+        //   addressable, mutable static blobs without committing to fixed
+        //   absolute addresses up front.
         constructor(functions, variables, memorySpec, tables, elements, tags, customSections, dataInit) {
             this.functions = functions;
             this.variables = variables;
@@ -910,6 +928,11 @@ const IR = (() => {
             this.referencedTypes = this._computeReferencedTypes();
             this.referencedFunctions = this._computeReferencedFunctions();
             this.tableReferencedFunctions = this._computeTableReferencedFunctions();
+            this.unclaimedSlots = this._computeUnclaimedSlots();
+            this.frameNodes = this._computeFrameNodes();
+            this.containsAlloca = this._computeContainsAlloca();
+            this.hasNullTableCallIndirect =
+                this._computeHasNullTableCallIndirect();
             Object.freeze(this.types);
             Object.freeze(this.children);
             Object.freeze(this);
@@ -965,6 +988,45 @@ const IR = (() => {
             throw new Error(
                 `${this.constructor.name} must implement _withChildren ` +
                 `(node has ${this.children.length} children)`);
+        }
+
+        // unclaimedSlots: TreeBag<StackSlot> — StackSlots referenced via
+        // StackSlotAddr in this subtree that have not yet been "claimed" by
+        // an enclosing Block scope. A Block consumes its body's
+        // unclaimedSlots into a fresh FrameNode and re-publishes empty.
+        // Anything still unclaimed at a Function body is laid out by the
+        // function's outer frame.
+        _computeUnclaimedSlots() {
+            return new TreeBag(null, ...this.children.map(c => c.unclaimedSlots));
+        }
+
+        // frameNodes: TreeBag<FrameNode> — already-rooted scope frames from
+        // descendant Blocks. Each Block packages its body's unclaimedSlots
+        // and frameNodes into a single FrameNode and bubbles a singleton
+        // bag up. Order is preserved (TreeBag honors iteration order), so
+        // sibling FrameNodes from disjoint scopes stay disjoint and codegen
+        // can apply stack coloring (sibling overlay).
+        _computeFrameNodes() {
+            return new TreeBag(null, ...this.children.map(c => c.frameNodes));
+        }
+
+        // containsAlloca: bool — disables stack coloring on the path from
+        // the Alloca up to the function frame, since alloca dynamically
+        // bumps SP and we'd lose track of overlay regions.
+        _computeContainsAlloca() {
+            for (const c of this.children) if (c.containsAlloca) return true;
+            return false;
+        }
+
+        // hasNullTableCallIndirect: bool — at least one CallIndirect with
+        // table === null appears in this subtree. Codegen needs to know so
+        // it can synthesize the auto-table (with at least a null entry)
+        // even when no IR.FuncIndex references exist.
+        _computeHasNullTableCallIndirect() {
+            for (const c of this.children) {
+                if (c.hasNullTableCallIndirect) return true;
+            }
+            return false;
         }
 
         // Union of `Map<label, TreeBag<X>>` across children, indexed by label.
@@ -1206,6 +1268,10 @@ const IR = (() => {
             return this.funcType
                 ? new TreeBag(new Set([this.funcType]), inherited)
                 : inherited;
+        }
+        _computeHasNullTableCallIndirect() {
+            return this.table === null
+                || super._computeHasNullTableCallIndirect();
         }
         _withChildren(newChildren) {
             const args = newChildren.slice(0, this.args.length);
@@ -1608,6 +1674,111 @@ const IR = (() => {
 
         _computeBytesLiterals() {
             return new TreeBag(new Set([this]), super._computeBytesLiterals());
+        }
+    }
+
+    // MutableBytesLiteral: like BytesLiteral but each instance gets its OWN
+    // address (no content-dedup), and the laid-out region is intended to be
+    // mutated at runtime via Store/MemoryFill/MemoryCopy. The address is a
+    // constant i32; codegen places the bytes in an active data segment in
+    // the same static-data region as BytesLiterals.
+    class MutableBytesLiteral extends Expression {
+        constructor(loc, bytes, name) {
+            super(loc, [T.I32], [], 'UNRESTRICTED');
+            this.bytes = new Uint8Array(bytes);
+            this.name = name || null; // optional, for debugging only
+            this._finalize();
+        }
+
+        _computeBytesLiterals() {
+            return new TreeBag(new Set([this]), super._computeBytesLiterals());
+        }
+    }
+
+    // StackSlot: an identity object representing a fixed-size, fixed-align
+    // region in the stack frame. Not an Expression — it has no value on the
+    // wasm stack. Address it via IR.StackSlotAddr(slot). Codegen assigns
+    // each slot an offset within its enclosing FrameNode at layout time.
+    class StackSlot {
+        constructor(name, size, align) {
+            this.name = name;
+            this.size = size;     // bytes
+            this.align = align;   // bytes (power of 2)
+            assert(typeof size === 'number' && size >= 0,
+                () => `StackSlot ${name}: size must be a non-negative number`);
+            assert(typeof align === 'number' && align >= 1 &&
+                (align & (align - 1)) === 0,
+                () => `StackSlot ${name}: align must be a power of 2`);
+            Object.freeze(this);
+        }
+    }
+
+    // StackSlotAddr: the i32 address of a StackSlot in the current frame.
+    // Address-frame-stable: codegen emits `global.get $sp; i32.const $off;
+    // i32.add` (where $off is the slot's offset assigned by frame layout).
+    // UNRESTRICTED — pure address arithmetic.
+    class StackSlotAddr extends Expression {
+        constructor(loc, slot) {
+            assert(slot instanceof StackSlot,
+                'StackSlotAddr: slot must be a StackSlot');
+            super(loc, [T.I32], [], 'UNRESTRICTED');
+            this.slot = slot;
+            this._finalize();
+        }
+
+        _computeUnclaimedSlots() {
+            return new TreeBag(new Set([this.slot]),
+                super._computeUnclaimedSlots());
+        }
+    }
+
+    // Alloca: dynamic stack allocation. Bumps the stack pointer down by
+    // `align`-rounded `size` bytes and returns the new top-of-stack as an
+    // i32 address. The region is valid until the function returns (the
+    // function-level prologue/epilogue restores SP). LINEAR — has SP
+    // side-effect.
+    class Alloca extends Expression {
+        constructor(loc, size, align) {
+            assert(typeof size === 'number' && size >= 0,
+                () => `Alloca: size must be a non-negative number`);
+            assert(typeof align === 'number' && align >= 1 &&
+                (align & (align - 1)) === 0,
+                () => `Alloca: align must be a power of 2`);
+            super(loc, [T.I32], [], 'LINEAR');
+            this.size = size;
+            this.align = align;
+            this._finalize();
+        }
+
+        _computeContainsAlloca() { return true; }
+    }
+
+    // HeapBase: the i32 address of the start of the heap region (i.e. the
+    // first byte after the static-data and stack regions). Resolves to a
+    // constant i32 at codegen time, after layout determines its value.
+    // UNRESTRICTED — pure constant.
+    class HeapBase extends Expression {
+        constructor(loc) {
+            super(loc, [T.I32], [], 'UNRESTRICTED');
+            this._finalize();
+        }
+    }
+
+    // FrameNode: a tree node representing a lexical scope's stack frame.
+    // Built bottom-up at Block construction. `ownSlots` are slots claimed
+    // directly at this scope (i.e. slots from non-Block descendants and
+    // slots not claimed by any inner Block); `children` are FrameNodes for
+    // each enclosed Block scope. Layout walks this tree depth-first; each
+    // FrameNode's children are siblings whose storage can overlay (max not
+    // sum), enabling stack coloring across disjoint scopes.
+    class FrameNode {
+        constructor(owner, ownSlots, children) {
+            this.owner = owner;       // Block | null (synthetic root)
+            this.ownSlots = ownSlots; // Array<StackSlot>
+            this.children = children; // Array<FrameNode>
+            Object.freeze(this.ownSlots);
+            Object.freeze(this.children);
+            Object.freeze(this);
         }
     }
 
@@ -2981,6 +3152,27 @@ const IR = (() => {
             return inherited;
         }
 
+        // Block is a scope: it claims any descendant unclaimedSlots and
+        // packages them with descendant FrameNodes into a fresh FrameNode
+        // representing this scope. Re-published bags: unclaimedSlots empty
+        // (claimed), frameNodes singleton {self}.
+        _computeUnclaimedSlots() {
+            return _EMPTY_TREE_BAG;
+        }
+        _computeFrameNodes() {
+            const childUnclaimed = new TreeBag(null,
+                ...this.children.map(c => c.unclaimedSlots));
+            const childFrames = new TreeBag(null,
+                ...this.children.map(c => c.frameNodes));
+            const ownSlots = [...childUnclaimed];
+            const subFrames = [...childFrames];
+            if (ownSlots.length === 0 && subFrames.length === 0) {
+                return _EMPTY_TREE_BAG;
+            }
+            const fn = new FrameNode(this, ownSlots, subFrames);
+            return new TreeBag(new Set([fn]));
+        }
+
         static _collectOwnLabel(children, label, getMap) {
             let merged = null;
             for (const child of children) {
@@ -3502,6 +3694,12 @@ const IR = (() => {
         MemoryCopy,
         MemoryFill,
         BytesLiteral,
+        MutableBytesLiteral,
+        StackSlot,
+        StackSlotAddr,
+        Alloca,
+        HeapBase,
+        FrameNode,
         StructNew,
         StructNewDefault,
         StructGet,
@@ -3949,6 +4147,7 @@ const OPTIMIZER = (() => {
             newElements,
             program.tags.filter(tagOk),
             program.customSections,
+            program.dataInit,
         );
     }
 
@@ -4124,12 +4323,26 @@ const CODEGEN = (() => {
         const funcTableIdxMap = new Map();
         let autoTable = null;
         let autoTableSegment = null;
-        if (funcIndexFuncs.length > 0) {
+        // Detect any CallIndirect with table === null — even with zero
+        // FuncIndex references, a null-table CallIndirect requires an
+        // auto-table to dispatch through (it'll still trap at runtime if
+        // its index isn't backed by a real function, but the module needs
+        // to validate).
+        const anyNullTableCI = (() => {
+            for (const func of definedFunctions) {
+                if (!func.body) continue;
+                if (func.body.hasNullTableCallIndirect) return true;
+            }
+            return false;
+        })();
+        if (funcIndexFuncs.length > 0 || anyNullTableCI) {
             funcIndexFuncs.forEach((f, i) => funcTableIdxMap.set(f, i + 1));
             autoTable = new IR.Table(null, null,
                 new IR.ExportSpec('__indirect_function_table'),
                 T.FUNCREF, funcIndexFuncs.length + 1, null);
-            autoTableSegment = new IR.ElementSegment(null, autoTable, 1, funcIndexFuncs);
+            if (funcIndexFuncs.length > 0) {
+                autoTableSegment = new IR.ElementSegment(null, autoTable, 1, funcIndexFuncs);
+            }
             tables.push(autoTable);
             definedTables.push(autoTable);
             tableIndexMap.set(autoTable, tables.length - 1);
@@ -4166,15 +4379,17 @@ const CODEGEN = (() => {
             declarativeFuncs.push(f);
         }
 
-        // Lay out BytesLiterals in linear memory. Dedupe by content (so
-        // repeated identical blobs share a single data segment) and assign
-        // each unique blob an address starting at `staticDataBase`.
-        // If `program.dataInit` is set, that user-supplied initial blob is
-        // placed at `staticDataBase` first; BytesLiterals follow.
+        // Lay out BytesLiterals + MutableBytesLiterals in linear memory.
+        // Immutable BytesLiterals are deduplicated by content (repeated
+        // identical blobs share a single data segment); MutableBytesLiterals
+        // each get a unique address (no dedup, since they're mutated at
+        // runtime). All blobs sit in one contiguous static-data region
+        // starting at `staticDataBase`.
         const memorySpec = program.memorySpec;
         const staticDataBase = (memorySpec && memorySpec.staticDataBase) || 0;
         const dataSegments = []; // [{ offset, bytes }]
-        const bytesAddrMap = new Map(); // BytesLiteral -> address
+        const bytesAddrMap = new Map(); // BytesLiteral|MutableBytesLiteral -> address
+        let staticDataEnd = staticDataBase;
         if (memorySpec) {
             const byContentKey = new Map(); // content key -> address
             let cursor = staticDataBase;
@@ -4185,6 +4400,14 @@ const CODEGEN = (() => {
             for (const func of definedFunctions) {
                 if (!func.body) continue;
                 for (const bl of func.body.bytesLiterals) {
+                    if (bl instanceof IR.MutableBytesLiteral) {
+                        // Each mutable literal gets its own address.
+                        const addr = cursor;
+                        dataSegments.push({ offset: addr, bytes: bl.bytes });
+                        cursor += bl.bytes.length;
+                        bytesAddrMap.set(bl, addr);
+                        continue;
+                    }
                     const key = Array.from(bl.bytes).join(',');
                     let addr = byContentKey.get(key);
                     if (addr === undefined) {
@@ -4196,6 +4419,104 @@ const CODEGEN = (() => {
                     bytesAddrMap.set(bl, addr);
                 }
             }
+            staticDataEnd = cursor;
+        }
+
+        // Stack region & __stack_pointer:
+        //   - When memorySpec.stackPages is set, we reserve that many wasm
+        //     pages immediately after the static-data region for the stack.
+        //     SP is initialized to the *top* of the region (stack grows
+        //     down toward staticDataEnd).
+        //   - HeapBase is the first byte after the stack region.
+        //   - When stackPages is absent or 0, no SP global is created and
+        //     IR.HeapBase resolves to the first 16-byte-aligned address
+        //     after staticDataEnd. Functions with StackSlots still get a
+        //     prologue (with no SP save needed) — but in practice frontends
+        //     should set stackPages whenever they use StackSlots.
+        const PAGE = 65536;
+        const stackPages = (memorySpec && memorySpec.stackPages) || 0;
+        const minHeapPages = (memorySpec && memorySpec.minHeapPages) || 0;
+        const align16 = (n) => (n + 15) & ~15;
+        const stackStart = align16(staticDataEnd);
+        const stackTop = stackStart + stackPages * PAGE;
+        const heapBaseAddr = stackTop;
+        // computedMinPages: smallest page count that fits everything.
+        const computedMinPages = Math.max(
+            1,
+            Math.ceil((heapBaseAddr + minHeapPages * PAGE) / PAGE),
+        );
+
+        // Synthesize __stack_pointer if we have a stack.
+        let stackPointerGlobal = null;
+        let stackPointerIndex = -1;
+        if (stackPages > 0) {
+            stackPointerGlobal = new IR.GlobalVariable(
+                null, null, new IR.ExportSpec('__stack_pointer'),
+                true, '__stack_pointer', T.I32,
+                new IR.Literal(null, T.I32, BigInt(stackTop)),
+            );
+            // Append to definedGlobals (after string globals, after user
+            // defined globals). It needs an index in globalIndexMap, and
+            // it must also live in `variables` so the exports loop picks
+            // up its exportSpec.
+            stackPointerIndex = importedGlobals.length + stringValues.length
+                + definedGlobals.length;
+            definedGlobals.push(stackPointerGlobal);
+            variables.push(stackPointerGlobal);
+            globalIndexMap.set(stackPointerGlobal, stackPointerIndex);
+        }
+
+        // Per-function frame layout. The function body's frameNodes +
+        // unclaimedSlots are rolled into a synthetic root FrameNode and
+        // laid out depth-first with sibling overlay (stack coloring).
+        // Result: per StackSlot offset within the function frame, plus the
+        // function's total frame size in bytes.
+        //   slotOffsets: Map<StackSlot, number>
+        //   frameSizeByFunc: Map<Function, number>
+        const slotOffsets = new Map();
+        const frameSizeByFunc = new Map();
+        const layoutFrameNode = (node, baseOffset, color) => {
+            // Lay out ownSlots packed by alignment, starting at baseOffset.
+            let off = baseOffset;
+            for (const slot of node.ownSlots) {
+                off = (off + slot.align - 1) & ~(slot.align - 1);
+                slotOffsets.set(slot, off);
+                off += slot.size;
+            }
+            const ownEnd = off;
+            // Children: overlay (max not sum) when `color` is true,
+            // otherwise stack them sequentially. We always try to align
+            // each child's start to 16 for safety.
+            let childStart = (ownEnd + 15) & ~15;
+            let maxEnd = ownEnd;
+            for (const ch of node.children) {
+                const chEnd = layoutFrameNode(ch, childStart, color);
+                if (color) {
+                    if (chEnd > maxEnd) maxEnd = chEnd;
+                    // Next sibling overlays; keep childStart fixed.
+                } else {
+                    maxEnd = chEnd;
+                    childStart = (chEnd + 15) & ~15;
+                }
+            }
+            return maxEnd;
+        };
+        for (const func of definedFunctions) {
+            if (!func.body) { frameSizeByFunc.set(func, 0); continue; }
+            const body = func.body;
+            const topFrames = [...body.frameNodes];
+            const topUnclaimed = [...body.unclaimedSlots];
+            if (topFrames.length === 0 && topUnclaimed.length === 0
+                    && !body.containsAlloca) {
+                frameSizeByFunc.set(func, 0);
+                continue;
+            }
+            // Coloring is disabled if the function contains alloca anywhere.
+            const color = !body.containsAlloca;
+            const root = new IR.FrameNode(null, topUnclaimed, topFrames);
+            const totalSize = layoutFrameNode(root, 0, color);
+            // 16-byte align the frame total size.
+            frameSizeByFunc.set(func, align16(totalSize));
         }
 
         // Type-section pipeline:
@@ -4353,6 +4674,10 @@ const CODEGEN = (() => {
 
         // Per-function context — set before encoding a function body, cleared after.
         let currentLocalIndexMap = null;
+        // Restore-SP bytes prefixed to every emitted Return when the
+        // current function owns a stack frame (or contains alloca). Empty
+        // otherwise.
+        let currentReturnRestoreBytes = [];
         // Stack of {name, kind} entries, one per enclosing wasm scope.
         // 'block' scopes catch `break`s; 'loop' scopes catch `continue`s.
         const labelStack = [];
@@ -4744,14 +5069,55 @@ const CODEGEN = (() => {
                     ...refBytes, 0xFB, sub,
                     ...encodeHeapType(expr.targetRefType.heapType),
                 ];
-            } else if (expr instanceof IR.BytesLiteral) {
+            } else if (expr instanceof IR.BytesLiteral
+                    || expr instanceof IR.MutableBytesLiteral) {
                 const addr = bytesAddrMap.get(expr);
                 assert(addr !== undefined,
                     'BytesLiteral used without a memorySpec on Program');
                 return [0x41, ...encodeLEBS128(addr)]; // i32.const <addr>
+            } else if (expr instanceof IR.HeapBase) {
+                return [0x41, ...encodeLEBS128(heapBaseAddr)]; // i32.const heap_base
+            } else if (expr instanceof IR.StackSlotAddr) {
+                const off = slotOffsets.get(expr.slot);
+                assert(off !== undefined,
+                    () => `StackSlotAddr: slot ${expr.slot.name} not laid out`);
+                // global.get $sp; (i32.const off; i32.add)?
+                if (off === 0) {
+                    return [0x23, ...encodeLEBU128(stackPointerIndex)];
+                }
+                return [
+                    0x23, ...encodeLEBU128(stackPointerIndex),
+                    0x41, ...encodeLEBS128(off),
+                    0x6A, // i32.add
+                ];
+            } else if (expr instanceof IR.Alloca) {
+                assert(stackPointerIndex >= 0,
+                    'Alloca requires memorySpec.stackPages > 0');
+                // sp = (sp - aligned_size); return new sp.
+                const align = expr.align;
+                const size = (expr.size + align - 1) & ~(align - 1);
+                // sp -= size; tee sp ; (drop the tee value? no — leave on stack)
+                // We want the value of sp on the stack:
+                //   global.get $sp
+                //   i32.const size
+                //   i32.sub
+                //   global.set $sp
+                //   global.get $sp
+                // Or with tee: i32.const size, sub, then set+get is shorter
+                // as set/get pair. wasm has no global.tee, so:
+                return [
+                    0x23, ...encodeLEBU128(stackPointerIndex), // global.get $sp
+                    0x41, ...encodeLEBS128(size),              // i32.const size
+                    0x6B,                                       // i32.sub
+                    0x24, ...encodeLEBU128(stackPointerIndex), // global.set $sp
+                    0x23, ...encodeLEBU128(stackPointerIndex), // global.get $sp
+                ];
             } else if (expr instanceof IR.Return) {
                 const argBytes = expr.args.flatMap(a => encodeExpression(a));
-                return [...argBytes, 0x0F]; // return
+                // Restore SP before returning, if we're inside a frame-owning
+                // function. The currentReturnRestoreBytes state is set in the
+                // function-emit prelude.
+                return [...argBytes, ...currentReturnRestoreBytes, 0x0F]; // return
             } else if (expr instanceof IR.Unreachable) {
                 return [0x00]; // unreachable
             } else if (expr instanceof IR.Drop) {
@@ -5069,10 +5435,24 @@ const CODEGEN = (() => {
         if (memorySpec) {
             const hasMax = memorySpec.maxPages !== undefined && memorySpec.maxPages !== null;
             const flags = hasMax ? 0x01 : 0x00;
+            // When stackPages > 0 we own the layout; minPages is
+            // recomputed from staticDataEnd + stackPages + minHeapPages and
+            // any explicit memorySpec.minPages becomes an effective lower
+            // bound (max of both).
+            let minPages;
+            if (stackPages > 0 || minHeapPages > 0) {
+                const explicit = memorySpec.minPages || 0;
+                minPages = Math.max(computedMinPages, explicit);
+            } else {
+                assert(memorySpec.minPages !== undefined &&
+                       memorySpec.minPages !== null,
+                    'memorySpec.minPages required when stackPages/minHeapPages absent');
+                minPages = memorySpec.minPages;
+            }
             const content = [
                 ...encodeLEBU128(1), // 1 memory entry
                 flags,
-                ...encodeLEBU128(memorySpec.minPages),
+                ...encodeLEBU128(minPages),
                 ...(hasMax ? encodeLEBU128(memorySpec.maxPages) : []),
             ];
             appendBytes(out, section(5, content));
@@ -5235,13 +5615,70 @@ const CODEGEN = (() => {
                 let idx = 0;
                 for (const p of func.params) currentLocalIndexMap.set(p, idx++);
                 for (const l of func.locals) currentLocalIndexMap.set(l, idx++);
+
+                // Frame-owning function? Either has a static frame or
+                // contains alloca. Synthesize a `_saved_sp` local at the
+                // end of the local index space, and emit prologue +
+                // SP-restoring epilogue/return prefix.
+                const frameSize = frameSizeByFunc.get(func) || 0;
+                const containsAlloca = func.body.containsAlloca;
+                const needsFrame = frameSize > 0 || containsAlloca;
+                let prologueBytes = [];
+                let restoreBytes = [];
+                let extraLocals = [];
+                if (needsFrame) {
+                    assert(stackPointerIndex >= 0,
+                        () => `Function ${func.name}: stack frame needed but ` +
+                        `no memorySpec.stackPages set`);
+                    const savedSpLocal = new IR.LocalVariable(
+                        null, true, '_saved_sp', T.I32);
+                    currentLocalIndexMap.set(savedSpLocal, idx++);
+                    extraLocals = [savedSpLocal];
+                    const spIdxBytes = encodeLEBU128(stackPointerIndex);
+                    const savedIdx = currentLocalIndexMap.get(savedSpLocal);
+                    const savedIdxBytes = encodeLEBU128(savedIdx);
+                    // saved_sp = sp; sp -= frameSize;  (frameSize may be 0
+                    // if only alloca uses the stack — in that case prologue
+                    // is just the SP save).
+                    prologueBytes = [
+                        0x23, ...spIdxBytes,                  // global.get $sp
+                        0x21, ...savedIdxBytes,               // local.set saved_sp
+                    ];
+                    if (frameSize > 0) {
+                        prologueBytes.push(
+                            0x23, ...spIdxBytes,              // global.get $sp
+                            0x41, ...encodeLEBS128(frameSize),// i32.const frameSize
+                            0x6B,                              // i32.sub
+                            0x24, ...spIdxBytes,              // global.set $sp
+                        );
+                    }
+                    // Restore: sp = saved_sp.
+                    restoreBytes = [
+                        0x20, ...savedIdxBytes,               // local.get saved_sp
+                        0x24, ...spIdxBytes,                  // global.set $sp
+                    ];
+                }
+                currentReturnRestoreBytes = restoreBytes;
+
                 labelStack.length = 0;
+                const bodyEncoded = encodeExpression(func.body);
+                // Fall-through epilogue: if the body's last expression is
+                // not divergent (i.e. control can reach the end of the
+                // function), we need to restore SP before the implicit
+                // return. We emit the restore unconditionally — wasm's
+                // polymorphic-stack rule covers the divergent case.
+                const fallThroughRestore =
+                    needsFrame && func.body.types !== null ? restoreBytes : [];
+
                 const bodyBytes = [
-                    ...encodeLocalDecls(func.locals),
-                    ...encodeExpression(func.body),
+                    ...encodeLocalDecls([...func.locals, ...extraLocals]),
+                    ...prologueBytes,
+                    ...bodyEncoded,
+                    ...fallThroughRestore,
                     0x0B, // end of function body
                 ];
                 currentLocalIndexMap = null;
+                currentReturnRestoreBytes = [];
                 return [...encodeLEBU128(bodyBytes.length), ...bodyBytes];
             });
             const content = [
