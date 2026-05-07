@@ -2697,6 +2697,38 @@ const IR = (() => {
         }
     }
 
+    // Wasm: opaque escape hatch for raw wasm bytecode. Args are evaluated
+    // in order (each leaving its types on the wasm operand stack), then
+    // the supplied bytes execute, then `resultTypes` describes what's left
+    // on the stack.
+    //
+    // NOT type-checked beyond arg-count: the wasm validator catches any
+    // mismatch when the module is compiled. Use sparingly — most ops have
+    // first-class IR nodes that get type-checking and optimizer support.
+    //
+    // The bytes MUST NOT contain index-referencing opcodes (local.get/set,
+    // global.get/set, call by index, etc.). Those refer to indices that
+    // codegen assigns; raw bytes have no way to know them. Pass values
+    // through `args` instead.
+    //
+    // `opLinearity` defaults to 'LINEAR' on the assumption the user is
+    // wrapping something with side effects. If the bytes are pure (e.g. a
+    // SIMD arithmetic op), pass 'UNRESTRICTED' explicitly so the optimizer
+    // can substitute / fold.
+    class Wasm extends Expression {
+        constructor(loc, args, resultTypes, bytes, opLinearity) {
+            const lin = opLinearity || 'LINEAR';
+            super(loc, resultTypes, args, lin);
+            this.bytes = new Uint8Array(bytes);
+            this.opLinearity = lin;
+            this._finalize();
+        }
+        _withChildren(newChildren) {
+            return new Wasm(this.loc, newChildren, this.types,
+                this.bytes, this.opLinearity);
+        }
+    }
+
     // Drop: discards every value the source expression produces. types = []
     // (it consumes whatever the source pushed and produces nothing). For a
     // multi-value source, codegen emits one `drop` per value.
@@ -3959,6 +3991,7 @@ const IR = (() => {
         RefTest,
         Return,
         Unreachable,
+        Wasm,
         Drop,
         Select,
         Continue,
@@ -5407,6 +5440,9 @@ const CODEGEN = (() => {
                 return [...argBytes, ...currentReturnRestoreBytes, 0x0F]; // return
             } else if (expr instanceof IR.Unreachable) {
                 return [0x00]; // unreachable
+            } else if (expr instanceof IR.Wasm) {
+                const argBytes = expr.children.flatMap(a => encodeExpression(a));
+                return [...argBytes, ...expr.bytes];
             } else if (expr instanceof IR.Drop) {
                 const sourceBytes = encodeExpression(expr.source);
                 if (expr.source.types === null) return sourceBytes;

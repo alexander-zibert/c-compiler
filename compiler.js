@@ -12329,7 +12329,17 @@ class Translator {
         return new IR.Convert(loc, reinterpretMap[op], this.translateExpr(expr.args[0]));
       }
     }
-    nyi(`__wasm bytes [${[...bytes].map(b => '0x' + b.toString(16)).join(', ')}] (${expr.args.length} args)`, loc);
+    // Fall back to the generic IR.Wasm escape hatch: pass args through,
+    // splice the raw bytes after them. The wasm validator catches any
+    // type mismatches at module-load. We default to LINEAR linearity
+    // since we have no way to tell whether the user's bytes are pure.
+    const argsIR = expr.args.map(a => this.translateExpr(a));
+    const cResultType = expr.type;
+    const isVoid = !cResultType ||
+        (cResultType.removeQualifiers &&
+         cResultType.removeQualifiers().kind === Types.TypeKind.VOID);
+    const resultTypes = isVoid ? [] : [this.cTypeToIR(cResultType)];
+    return new IR.Wasm(loc, argsIR, resultTypes, [...bytes]);
   }
 
   // Translate a C builtin intrinsic. Currently supports the va_* family,
@@ -13882,53 +13892,94 @@ class Translator {
   //   }
   _lowerSwitch(stmt, loc) {
     const { T, IR } = this.GUC;
+    const SK = Types.StmtKind;
+    const LK = Types.LabelKind;
     const sw = stmt;
     const cases = sw.cases;
     const stmts = sw.body.statements;
 
-    // Handle FORWARD labels inside switch like compiler.js does — but for
-    // simplicity, just stub-bail if there are any goto-targeted labels in
-    // the switch body. (Most switch tests don't have them.)
-    for (const s of stmts) {
-      if (s.kind === Types.StmtKind.LABEL && s.hasGotos) {
-        nyi('switch with goto labels', loc);
+    // Pre-scan for FORWARD goto-labels at the switch-body level. We only
+    // handle labels that are DIRECT children of the switch body —
+    // labels nested inside a case's sub-COMPOUND (the cross_case_compound
+    // pattern) require splitting the sub-COMPOUND at the LABEL position,
+    // which the current IR shape doesn't express cleanly.
+    const switchFwdLabels = []; // [{ label, stmtPos }]
+    for (let si = 0; si < stmts.length; si++) {
+      const s = stmts[si];
+      if (s.kind === SK.LABEL && s.hasGotos &&
+          (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)) {
+        switchFwdLabels.push({ label: s, stmtPos: si });
       }
-      if (s.kind === Types.StmtKind.COMPOUND) {
+      if (s.kind === SK.COMPOUND) {
         for (const cs of s.statements) {
-          if (cs.kind === Types.StmtKind.LABEL && cs.hasGotos) {
-            nyi('switch with goto labels', loc);
+          if (cs.kind === SK.LABEL && cs.hasGotos &&
+              (cs.labelKind === LK.FORWARD || cs.labelKind === LK.BOTH)) {
+            nyi('switch with goto-label hoisted from a sub-compound (cross_case_compound pattern)', loc);
           }
         }
       }
+      if (s.kind === SK.LABEL && s.hasGotos &&
+          s.labelKind === LK.LOOP) {
+        nyi('switch with backward/loop goto labels', loc);
+      }
+    }
+
+    // Symbol allocation. Register goto-label symbols globally so any
+    // `goto LABEL` translation inside the switch body resolves.
+    if (!this.gotoLabelToSym) {
+      this.gotoLabelToSym = new Map();
+      this.gotoLabelToKind = new Map();
+    }
+    for (const { label } of switchFwdLabels) {
+      this.gotoLabelToSym.set(label, Symbol(`label_${label.name}`));
+      this.gotoLabelToKind.set(label, 'fwd');
     }
 
     const breakSym = Symbol('switch_break');
     const defaultSym = Symbol('case_default');
-    let defaultIdx = cases.findIndex(c => c.isDefault);
-
-    // Per-case block symbols. Index matches cases[].
-    const caseSyms = cases.map((c, i) => Symbol(c.isDefault ? 'case_default_only' : `case_${i}`));
+    const defaultIdx = cases.findIndex(c => c.isDefault);
+    const caseSyms = cases.map((c, i) =>
+      Symbol(c.isDefault ? 'case_default_only' : `case_${i}`));
     if (defaultIdx >= 0) caseSyms[defaultIdx] = defaultSym;
 
-    // Push break target so `break;` inside the switch targets break_label.
     if (!this.breakStack) { this.breakStack = []; this.continueStack = []; }
     this.breakStack.push(breakSym);
     let bodyIR;
     try {
-      // Translate each case body region (from cases[i].stmtIndex up to next).
-      const caseBodies = [];
+      // Build a unified, ordered list of "block boundaries" in the switch
+      // body. Each entry says: open a labeled IR.Block here, where
+      // breaking to that label resumes execution at this stmtPos.
+      //
+      // For ties at the same stmtPos: a forward goto-label opens BEFORE
+      // the case-label at the same position (so the goto-block strictly
+      // contains the case-block), so jumping to the goto-label exits the
+      // case wrapper too. Match the default backend's convention.
+      const blockEntries = [];
       for (let i = 0; i < cases.length; i++) {
-        const startIdx = cases[i].stmtIndex;
-        const endIdx = (i + 1 < cases.length) ? cases[i + 1].stmtIndex : stmts.length;
-        const irs = [];
-        for (let j = startIdx; j < endIdx; j++) {
-          irs.push(this.translateStmt(stmts[j]));
-        }
-        caseBodies.push(irs);
+        blockEntries.push({
+          kind: 'case',
+          stmtPos: cases[i].stmtIndex,
+          sym: caseSyms[i],
+        });
       }
+      for (const { label, stmtPos } of switchFwdLabels) {
+        blockEntries.push({
+          kind: 'goto',
+          stmtPos,
+          sym: this.gotoLabelToSym.get(label),
+          label,
+        });
+      }
+      blockEntries.sort((a, b) => {
+        if (a.stmtPos !== b.stmtPos) return a.stmtPos - b.stmtPos;
+        // Forward (goto) opens FIRST → outer → so it appears earlier in
+        // the inside-out construction order (smaller index in the list
+        // ordered by stmtPos asc).
+        if (a.kind !== b.kind) return a.kind === 'goto' ? -1 : 1;
+        return 0;
+      });
 
-      // Build the dispatch block and nest case bodies progressively.
-      // Innermost: dispatch (the body that decides where to jump).
+      // Dispatch.
       const switchExpr = this.translateExpr(sw.expr);
       const exprT = this.cTypeToIR(sw.expr.type);
       const tmp = new IR.LocalVariable(loc, true, '_sw', exprT);
@@ -13945,33 +13996,49 @@ class Translator {
         dispatch.push(new IR.IfElse(loc, cond,
           [new IR.Break(loc, caseSyms[i], [])], []));
       }
-      // No case matched — go to default (if present) or break out entirely.
-      if (defaultIdx >= 0) {
-        dispatch.push(new IR.Break(loc, defaultSym, []));
-      } else {
-        dispatch.push(new IR.Break(loc, breakSym, []));
-      }
+      dispatch.push(new IR.Break(loc, defaultIdx >= 0 ? defaultSym : breakSym, []));
 
-      // Nest: build outermost-first. We start with the dispatch as innermost,
-      // then wrap with each case in REVERSE source order: the LAST case's
-      // block is outermost, so its body is emitted last.
-      let inner = dispatch;
-      // Emit dispatch wrapped in nested case-blocks. Block(case[0]) is
-      // innermost; after each Block ends, the case body for that index runs.
-      // So we wrap progressively: start with dispatch in the case[0] block,
-      // then wrap [block_case0_with_dispatch + case0_body] in case[1] block,
-      // etc.
-      let acc = [new IR.Block(loc, caseSyms[0], inner)];
-      acc.push(...caseBodies[0]);
-      acc.push(new IR.Break(loc, breakSym, [])); // implicit end-of-case fall-out? actually fall-through to next case in C
-      // Wait — fall-through is the default in C. We shouldn't auto-break.
-      // Let me rebuild without auto-break.
-      acc = [new IR.Block(loc, caseSyms[0], inner)];
-      acc.push(...caseBodies[0]);
-      for (let i = 1; i < cases.length; i++) {
-        // Wrap acc in cases[i]'s block, then emit case[i] body.
-        acc = [new IR.Block(loc, caseSyms[i], acc), ...caseBodies[i]];
+      // Build inside-out. acc starts as the dispatch (the innermost
+      // block's body). For each block-entry in order, wrap acc in its
+      // labeled Block, then append the body stmts that live AFTER that
+      // block (i.e. between this block-entry's stmtPos and the next
+      // block-entry's stmtPos, exclusive).
+      let acc = dispatch;
+      for (let bi = 0; bi < blockEntries.length; bi++) {
+        const e = blockEntries[bi];
+        acc = [new IR.Block(loc, e.sym, acc)];
+        // Determine the next stmtPos boundary.
+        const nextPos = bi + 1 < blockEntries.length
+          ? blockEntries[bi + 1].stmtPos
+          : stmts.length;
+        // The first stmt to append depends on entry kind: a 'goto' label
+        // is itself at stmtPos and is consumed (skipped); a 'case' label
+        // has its body STARTING at stmtPos.
+        let from;
+        if (e.kind === 'goto' && e.stmtPos === blockEntries[bi - 1]?.stmtPos
+            && blockEntries[bi - 1].kind === 'case') {
+          // goto immediately following a case at the same stmtPos: skip
+          // the goto-label-stmt (would already be skipped by the case's
+          // body slice; this branch handles only multi-label-at-same-pos).
+          from = e.stmtPos;
+        } else if (e.kind === 'goto' && stmts[e.stmtPos]?.kind === SK.LABEL) {
+          // A direct goto-label at this position — skip it (it's a marker).
+          from = e.stmtPos + 1;
+        } else {
+          from = e.stmtPos;
+        }
+        for (let j = from; j < nextPos; j++) {
+          const s = stmts[j];
+          if (s.kind === SK.LABEL) continue; // skip label markers
+          acc.push(this.translateStmt(s));
+        }
       }
+      // Anything before the first block-entry's stmtPos? In a well-formed
+      // switch, the first case starts at 0 OR the first stmt is something
+      // before any case (rare; treat as unreachable since dispatch jumps
+      // past it). Accept whatever the first entry's prefix looks like.
+      // (No-op; the dispatch already handles "no case matched" via Break.)
+
       bodyIR = new IR.Block(loc, breakSym, acc);
     } finally {
       this.breakStack.pop();
@@ -13999,7 +14066,7 @@ class Translator {
     // inner = second, etc.
     const fwdLabels = [];
     for (const s of stmts) {
-      if (s.kind === SK.LABEL && s.hasGotos &&
+      if (s.kind === SK.LABEL && s.hasGotos && !s.isSwitchLevel &&
           (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)) {
         fwdLabels.push(s);
       }
@@ -14012,7 +14079,7 @@ class Translator {
       let i = startIdx;
       while (i < stmts.length) {
         const s = stmts[i];
-        if (s.kind === SK.LABEL && s.hasGotos) {
+        if (s.kind === SK.LABEL && s.hasGotos && !s.isSwitchLevel) {
           if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH) {
             // Reaching a forward label closes its Block. Everything that
             // followed openFwds[0] (this label) lives outside that Block.
