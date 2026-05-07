@@ -14517,6 +14517,22 @@ class Translator {
     // and MEMORY-class globals (arrays/structs) as static linear-memory.
     this._collectGlobals(units);
 
+    // The host runtime expects an exported `main` (matches the default
+    // backend's check at registerGlobalVar-time). Reject programs without
+    // one before we waste time emitting bodies.
+    let foundMain = false;
+    for (const unit of units) {
+      for (const fdecl of [...unit.definedFunctions, ...unit.staticFunctions]) {
+        const fdef = fdecl.definition || fdecl;
+        if (fdef.body && fdef.name === 'main') { foundMain = true; break; }
+      }
+      if (foundMain) break;
+    }
+    if (!foundMain) {
+      process.stderr.write("Error: no 'main' function defined\n");
+      process.exit(1);
+    }
+
     // Collect all function definitions; translate each (skipping if already
     // translated due to a forward call from an earlier function).
     for (const unit of units) {
