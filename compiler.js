@@ -11937,6 +11937,12 @@ class Translator {
     // global wraps a fresh IR.MutableBytesAddr around this identity;
     // codegen assigns one address per identity.
     this.cGlobalToMb = new Map();
+    // File-scope ECompoundLiteral -> IR.MutableBytes identity. File-scope
+    // compound literals (like `int *a = (int[]){1,2,3};`) have static
+    // storage duration (C11 §6.5.2.5/6); we allocate one MutableBytes per
+    // distinct literal and resolve `&clit` / decay-to-pointer through this
+    // map.
+    this.cFsCompoundLitToMb = new Map();
 
     // Function pointer support is now handled entirely by IR.FuncIndex +
     // codegen's auto-table synthesis. We just emit FuncIndex(irFunc) at
@@ -12356,6 +12362,10 @@ class Translator {
           if (irT === T.F32 || irT === T.F64) return new IR.Literal(loc, irT, 0.0);
           return new IR.Literal(loc, irT, 0n);
         }
+        // File-scope compound literal: registered in _collectGlobals. Decay to
+        // pointer = address of the MutableBytes identity.
+        const fsMb = this.cFsCompoundLitToMb.get(expr);
+        if (fsMb) return new IR.MutableBytesAddr(loc, fsMb);
         // Aggregate / array: stack slot pre-assigned in _collectMemoryLocals.
         const slot = this.compoundLitToStackSlot.get(expr);
         if (!slot) nyi(`compound literal without stack slot`, loc);
@@ -14565,13 +14575,13 @@ class Translator {
       }
     });
 
-    // Second pass: MEMORY-class globals + REGISTER fallbacks. Two-phase
-    // so that init exprs referencing &otherGlobal can find the other
-    // global's MB identity already in cGlobalToMb when we build the
-    // IR.MutableBytesAddr.
-    //
-    // Phase 2a: allocate every MB identity with empty initExprs.
+    // Second pass: allocate MB IDENTITIES for every MEMORY-class global,
+    // REGISTER fallback, AND file-scope compound literal — but don't yet
+    // populate. Two-phase so that init exprs referencing `&otherGlobal` or
+    // `&otherCompoundLiteral` can find the target's MB identity already in
+    // its lookup map when building the IR.MutableBytesAddr.
     const memGlobals = []; // Array<{def, mb}>
+    const fsClits = [];    // Array<{cl, mb}>
     allGlobalDefs((def) => {
       if (def.storageClass === Types.StorageClass.EXTERN) return;
       const isMem = def.allocClass === Types.AllocClass.MEMORY ||
@@ -14583,11 +14593,40 @@ class Translator {
       this.cGlobalToMb.set(def, mb);
       memGlobals.push({ def, mb });
     });
-    // Phase 2b: populate bytes + initExprs (mutating mb.bytes / mb.initExprs).
+    for (const unit of units) {
+      for (const cl of (unit.fileScopeCompoundLiterals || [])) {
+        if (this.cFsCompoundLitToMb.has(cl)) continue;
+        const sz = cl.type.size || 1;
+        const name = `__compound_literal.${fsClits.length}`;
+        const mb = new IR.MutableBytes(name, new Uint8Array(sz), []);
+        this.cFsCompoundLitToMb.set(cl, mb);
+        fsClits.push({ cl, mb });
+      }
+    }
+
+    // Third pass: populate bytes + initExprs. Now every cross-reference
+    // resolvable.
     for (const { def, mb } of memGlobals) {
       if (def.initExpr) {
         this._writeStaticInit(mb.bytes, mb.initExprs, 0, def.type, def.initExpr);
       }
+    }
+    for (const { cl, mb } of fsClits) {
+      if (!cl.initList) continue;
+      const ct = cl.type.removeQualifiers ? cl.type.removeQualifiers() : cl.type;
+      // Scalar compound literal: write the single inner value.
+      if (!ct.isAggregate() && !ct.isArray() && cl.initList.elements.length > 0) {
+        this._writeStaticInit(mb.bytes, mb.initExprs, 0, ct, cl.initList.elements[0]);
+        continue;
+      }
+      // Char array initialized with string literal: write bytes directly.
+      if (ct.isArray() && cl.initList.elements.length === 1 &&
+          cl.initList.elements[0].kind === Types.ExprKind.STRING) {
+        this._writeStaticInit(mb.bytes, mb.initExprs, 0, ct, cl.initList.elements[0]);
+        continue;
+      }
+      // Aggregate / array: feed the EInitList through.
+      this._writeStaticInit(mb.bytes, mb.initExprs, 0, ct, cl.initList);
     }
   }
 
@@ -14611,6 +14650,28 @@ class Translator {
       return;
     }
     if (initExpr.kind === Types.ExprKind.COMPOUND_LITERAL) {
+      const litT = (initExpr.type.removeQualifiers ?
+                    initExpr.type.removeQualifiers() : initExpr.type);
+      // Pointer = compound_literal: the literal has its own storage (file-
+      // scope MutableBytes); the pointer slot gets that address. This covers
+      // `int *p = (int[]){1,2,3};` and similar — the array literal decays.
+      if (!u.isAggregate() && !u.isArray() &&
+          (litT.isArray() || litT.isAggregate())) {
+        const fsMb = this.cFsCompoundLitToMb.get(initExpr);
+        if (fsMb) {
+          const { IR } = this.GUC;
+          initExprs.push({ offset, byteWidth: u.size || 4,
+                           expr: new IR.MutableBytesAddr(initExpr.loc || Lexer.Loc.generated(), fsMb) });
+          return;
+        }
+      }
+      // Scalar compound literal like `(int){42}` initializing a scalar slot:
+      // write the inner element.
+      if (!u.isAggregate() && !u.isArray() && initExpr.initList &&
+          initExpr.initList.elements.length > 0) {
+        return this._writeStaticInit(buf, initExprs, offset, u,
+                                     initExpr.initList.elements[0]);
+      }
       this._writeStaticInitList(buf, initExprs, offset, u, initExpr.initList);
       return;
     }
@@ -14661,6 +14722,12 @@ class Translator {
     // & ident
     if (e.kind === Types.ExprKind.UNARY && e.op === 'OP_ADDR') {
       return this._addressIRForAddrOf(e.operand, loc);
+    }
+    // (compound_literal) — array/aggregate file-scope literal decays to its
+    // address. Scalar literals are handled by the regular eval path.
+    if (e.kind === Types.ExprKind.COMPOUND_LITERAL) {
+      const fsMb = this.cFsCompoundLitToMb.get(e);
+      if (fsMb) return new IR.MutableBytesAddr(loc, fsMb);
     }
     // & expr + N or & expr - N
     if (e.kind === Types.ExprKind.BINARY &&
@@ -14739,6 +14806,10 @@ class Translator {
           return null;
         }
       }
+    }
+    if (operand.kind === Types.ExprKind.COMPOUND_LITERAL) {
+      const fsMb = this.cFsCompoundLitToMb.get(operand);
+      if (fsMb) return new IR.MutableBytesAddr(loc, fsMb);
     }
     return null;
   }
