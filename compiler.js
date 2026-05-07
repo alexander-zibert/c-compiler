@@ -165,6 +165,45 @@ class TokenFlags {
   }
 }
 
+// Loc — source location with start/end span. Mirrors guc.js's Loc shape so
+// AST nodes can be passed directly to the IR layer when --backend=guc lands.
+//
+// Back-compat: .line/.column/.filename getters delegate to .start, so legacy
+// reads (e.g. `loc.line`) still work after construction sites switch from
+// plain `{filename,line}` literals to Loc instances.
+class Loc {
+  constructor(filename, startLine, startColumn, endLine, endColumn) {
+    this.filename = filename;
+    this.start = { line: startLine || 0, column: startColumn || 0 };
+    this.end = {
+      line: endLine || startLine || 0,
+      column: endColumn || startColumn || 0,
+    };
+    Object.freeze(this.start);
+    Object.freeze(this.end);
+    Object.freeze(this);
+  }
+  get line() { return this.start.line; }
+  get column() { return this.start.column; }
+  static fromTok(tok) {
+    if (!tok) return new Loc('<generated>', 0, 0, 0, 0);
+    const col = tok.column || 0;
+    return new Loc(tok.filename || '<generated>', tok.line || 0, col, tok.line || 0, col);
+  }
+  static generated() { return new Loc('<generated>', 0, 0, 0, 0); }
+  // Span over additional locs. All must share the same filename.
+  join(...locs) {
+    let start = this.start, end = this.end;
+    for (const o of locs) {
+      if (!o) continue;
+      if (o.filename !== this.filename) continue; // ignore foreign locs
+      if (o.start.line < start.line || (o.start.line === start.line && o.start.column < start.column)) start = o.start;
+      if (o.end.line > end.line || (o.end.line === end.line && o.end.column > end.column)) end = o.end;
+    }
+    return new Loc(this.filename, start.line, start.column, end.line, end.column);
+  }
+}
+
 class Token {
   constructor(filename, line, column, kind, text) {
     this.filename = filename;
@@ -1887,7 +1926,7 @@ function formatToken(t) {
 }
 
 return {
-  intern, TokenKind, Keyword, Punct, StringPrefix, TokenFlags, Token, LexError, LexResult,
+  intern, TokenKind, Keyword, Punct, StringPrefix, TokenFlags, Token, Loc, LexError, LexResult,
   lex, unescape, decodeCodepoint, unescapeCodepoint, encodeUtf16LE, encodeUtf32LE,
   parseHexFloat, postProcess, spliceLines, PPRegistry, preprocess, cloneToken,
   tokenize, formatToken, encodeUtf8,
@@ -2691,10 +2730,10 @@ class Expr {
     constructor(expr, cases, body, loc) { super(Types.StmtKind.SWITCH); this.expr = expr; this.cases = cases; this.body = body; this.loc = loc || null; Object.seal(this); }
   }
   class SGoto extends Stmt {
-    constructor(label) { super(Types.StmtKind.GOTO); this.label = label; this.target = null; this.loc = null; Object.seal(this); }
+    constructor(label) { super(Types.StmtKind.GOTO); this.label = label; this.target = null; this.loc = null; this.brDepth = 0; Object.seal(this); }
   }
   class SLabel extends Stmt {
-    constructor(name, enclosingBlock) { super(Types.StmtKind.LABEL); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; Object.seal(this); }
+    constructor(name, enclosingBlock) { super(Types.StmtKind.LABEL); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
   }
   class SEmpty extends Stmt {
     constructor() { super(Types.StmtKind.EMPTY); Object.seal(this); }
@@ -5954,7 +5993,7 @@ class Parser {
   parseStatement() {
     const tok = this.peek();
     const stmt = this._parseStatement();
-    if (stmt && !stmt.loc && tok) stmt.loc = { filename: tok.filename, line: tok.line };
+    if (stmt && !stmt.loc && tok) stmt.loc = Lexer.Loc.fromTok(tok);
     return stmt;
   }
 
@@ -6103,7 +6142,7 @@ class Parser {
       const label = tok.text;
       this.expect(";");
       const sg = new AST.SGoto(label);
-      sg.loc = { filename: tok.filename, line: tok.line };
+      sg.loc = Lexer.Loc.fromTok(tok);
       if (this.parsedLabels.has(label)) {
         // Backward goto — label already defined, must be a loop label
         const target = this.parsedLabels.get(label);
@@ -6412,7 +6451,7 @@ class Parser {
   // --- External declaration parsing ---
 
   parseExternalDeclaration(unit) {
-    const loc = { filename: this.peek().filename, line: this.peek().line };
+    const loc = Lexer.Loc.fromTok(this.peek());
     const specs = this.parseDeclSpecifiers();
     let baseType = specs.type;
 
@@ -7336,7 +7375,7 @@ function lowerSetjmpInCompound(compound, tag, counterVar) {
     // Create catch binding variables
     const idName = Lexer.intern("__setjmp_caught_id");
     const valName = Lexer.intern("__setjmp_caught_val");
-    const loc = { filename: "", line: 0 };
+    const loc = Lexer.Loc.generated();
     const idVar = new AST.DVar(loc, idName, Types.TINT, Types.StorageClass.NONE, null);
     idVar.definition = idVar;
     const valVar = new AST.DVar(loc, valName, Types.TINT, Types.StorageClass.NONE, null);
@@ -7442,6 +7481,190 @@ function lowerSetjmpLongjmp(unit, exceptionTagRegistry) {
   for (const f of unit.staticFunctions) lowerFunc(f);
 }
 
+// ====================
+// Goto lowering pass
+// ====================
+// Runs after label classification (during parsing) and before codegen.
+// For each function body it mirrors the exact block-depth accounting that
+// codegen performs, and annotates every SGoto with a pre-computed `brDepth`.
+// Out-of-scope gotos become clean user errors here instead of crashes in codegen.
+
+function lowerGotosInFunc(funcDef) {
+  const SK = Types.StmtKind;
+  const LK = Types.LabelKind;
+  const errors = [];
+  let depth = 0;
+  // SLabel → depth at which its block/loop was opened (mirrors gotoLabelDepths in codegen)
+  const labelDepths = new Map();
+  // Labels inside switch bodies managed by walkSwitch, not walkCompound
+  const switchLevelLabels = new Set();
+
+  function walkCompound(stmt) {
+    const forwardLabels = [];
+    for (const s of stmt.statements) {
+      if (s.kind === SK.LABEL && s.hasGotos && !switchLevelLabels.has(s)) {
+        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)
+          forwardLabels.push(s);
+      }
+    }
+    for (let i = forwardLabels.length - 1; i >= 0; i--) {
+      depth++;
+      labelDepths.set(forwardLabels[i], depth);
+    }
+    const openLoopLabels = [];
+    for (const s of stmt.statements) {
+      if (s.kind === SK.LABEL) {
+        if (!s.hasGotos || switchLevelLabels.has(s)) continue;
+        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH) {
+          for (let j = openLoopLabels.length - 1; j >= 0; j--) {
+            depth--; labelDepths.delete(openLoopLabels[j]);
+          }
+          openLoopLabels.length = 0;
+          depth--; labelDepths.delete(s);
+        }
+        if (s.labelKind === LK.LOOP || s.labelKind === LK.BOTH) {
+          depth++; labelDepths.set(s, depth); openLoopLabels.push(s);
+        }
+      } else {
+        walk(s);
+      }
+    }
+    for (let j = openLoopLabels.length - 1; j >= 0; j--) {
+      depth--; labelDepths.delete(openLoopLabels[j]);
+    }
+  }
+
+  function walkSwitch(sw) {
+    const switchFwdLabels = [];
+    for (let si = 0; si < sw.body.statements.length; si++) {
+      const s = sw.body.statements[si];
+      if (s.kind === SK.LABEL && s.hasGotos) {
+        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)
+          switchFwdLabels.push({ label: s, stmtPos: si });
+      }
+      if (s.kind === SK.COMPOUND) {
+        for (const cs of s.statements) {
+          if (cs.kind === SK.LABEL && cs.hasGotos) {
+            if (cs.labelKind === LK.FORWARD || cs.labelKind === LK.BOTH) {
+              switchFwdLabels.push({ label: cs, stmtPos: si });
+              switchLevelLabels.add(cs);
+              cs.isSwitchLevel = true; // consumed by codegen COMPOUND
+            }
+          }
+        }
+      }
+    }
+    const numCases = sw.cases.length;
+    depth++; // break block
+    const blockEntries = [];
+    for (let i = 0; i < numCases; i++)
+      blockEntries.push({ pos: sw.cases[i].stmtIndex, isForward: false, fwdIdx: -1 });
+    for (let i = 0; i < switchFwdLabels.length; i++)
+      blockEntries.push({ pos: switchFwdLabels[i].stmtPos, isForward: true, fwdIdx: i });
+    blockEntries.sort((a, b) => {
+      if (a.pos !== b.pos) return b.pos - a.pos;
+      if (a.isForward !== b.isForward) return a.isForward ? -1 : 1;
+      return 0;
+    });
+    for (const e of blockEntries) {
+      depth++;
+      if (e.isForward) labelDepths.set(switchFwdLabels[e.fwdIdx].label, depth);
+    }
+    const openLoopLabels = [];
+    for (let i = 0; i < numCases; i++) {
+      depth--;
+      const startIdx = sw.cases[i].stmtIndex;
+      const endIdx = i + 1 < numCases ? sw.cases[i + 1].stmtIndex : sw.body.statements.length;
+      for (let j = startIdx; j < endIdx; j++) {
+        const s = sw.body.statements[j];
+        if (s.kind === SK.LABEL) {
+          if (!s.hasGotos) continue;
+          if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH) {
+            for (let k = openLoopLabels.length - 1; k >= 0; k--) {
+              depth--; labelDepths.delete(openLoopLabels[k]);
+            }
+            openLoopLabels.length = 0;
+            depth--; labelDepths.delete(s);
+          }
+          if (s.labelKind === LK.LOOP || s.labelKind === LK.BOTH) {
+            depth++; labelDepths.set(s, depth); openLoopLabels.push(s);
+          }
+        } else {
+          walk(s);
+        }
+      }
+    }
+    for (let k = openLoopLabels.length - 1; k >= 0; k--) {
+      depth--; labelDepths.delete(openLoopLabels[k]);
+    }
+    for (const fl of switchFwdLabels) labelDepths.delete(fl.label);
+    depth--; // close break block
+  }
+
+  function walkTryCatch(tc) {
+    depth++; // end block
+    for (let i = 0; i < tc.catches.length; i++) depth++; // one per catch
+    depth++; // try_table
+    walk(tc.tryBody);
+    depth--; // end try_table
+    for (let i = 0; i < tc.catches.length; i++) {
+      depth--;
+      walk(tc.catches[i].body);
+    }
+    depth--; // close end block
+  }
+
+  function walk(stmt) {
+    if (!stmt) return;
+    switch (stmt.kind) {
+      case SK.COMPOUND:  walkCompound(stmt); break;
+      case SK.IF:
+        depth++;
+        walk(stmt.thenBranch);
+        if (stmt.elseBranch) walk(stmt.elseBranch);
+        depth--;
+        break;
+      case SK.WHILE:
+        depth += 2; walk(stmt.body); depth -= 2; break;
+      case SK.DO_WHILE:
+        depth += 3; walk(stmt.body); depth -= 3; break;
+      case SK.FOR:
+        depth += 3; walk(stmt.body); depth -= 3; break;
+      case SK.SWITCH:    walkSwitch(stmt); break;
+      case SK.TRY_CATCH: walkTryCatch(stmt); break;
+      case SK.GOTO: {
+        const target = stmt.target;
+        if (!target) break;
+        const d = labelDepths.get(target);
+        if (d === undefined) {
+          const loc = stmt.loc || {};
+          errors.push(new Lexer.LexError(
+            `goto '${stmt.label}': target label not in scope (in function '${funcDef.name || '?'}') ` +
+            `(label may be in a nested block, or a loop label's scope was closed by a forward label)`,
+            loc.filename || '?', loc.line || 0
+          ));
+          stmt.brDepth = -1;
+        } else {
+          stmt.brDepth = depth - d;
+        }
+        break;
+      }
+    }
+  }
+
+  if (funcDef.body) walk(funcDef.body);
+  return errors;
+}
+
+function lowerGotos(unit) {
+  const errors = [];
+  for (const func of [...(unit.definedFunctions || []), ...(unit.staticFunctions || [])]) {
+    const fdef = func.definition || func;
+    if (fdef === func && fdef.body) errors.push(...lowerGotosInFunc(fdef));
+  }
+  return errors;
+}
+
 function annotateImplicitCasts(unit) {
   const annotateFunc = (func) => {
     if (!func.body) return;
@@ -7456,7 +7679,7 @@ return {
   dumpAst, parseTokens, parseSource,
   filterUnusedDeclarations, gcSectionsPass,
   linkTranslationUnits,
-  lowerSetjmpLongjmp,
+  lowerSetjmpLongjmp, lowerGotos,
   annotateImplicitCasts, annotateExpr, annotateStmt,
 };
 })();
@@ -8541,8 +8764,6 @@ class CodeGenerator {
     this.blockDepth = 0;
     this.breakTarget = 0;
     this.continueTarget = 0;
-    this.gotoLabelDepths = new Map();
-    this.switchLevelLabels = new Set();
     this.exceptionToWasmTagIdx = new Map();
     this.currentFuncDef = null;
     this.vaArgsLocalIdx = 0;
@@ -9400,7 +9621,6 @@ class CodeGenerator {
     this.structRetDeferred = 0;
     this.callNesting = 0;
     this.blockDepth = 0;
-    this.gotoLabelDepths.clear();
 
     this._recordSourceLoc(funcDef.loc);
 
@@ -9502,7 +9722,7 @@ class CodeGenerator {
         // Open forward-label blocks
         const forwardLabels = [];
         for (const s of stmts) {
-          if (s.kind === Types.StmtKind.LABEL && s.hasGotos && !this.switchLevelLabels.has(s)) {
+          if (s.kind === Types.StmtKind.LABEL && s.hasGotos && !s.isSwitchLevel) {
             if (s.labelKind === Types.LabelKind.FORWARD || s.labelKind === Types.LabelKind.BOTH)
               forwardLabels.push(s);
           }
@@ -9510,7 +9730,6 @@ class CodeGenerator {
         for (let i = forwardLabels.length - 1; i >= 0; i--) {
           this.body.block();
           this.blockDepth++;
-          this.gotoLabelDepths.set(forwardLabels[i], this.blockDepth);
         }
         const openLoopLabels = [];
         for (const s of stmts) {
@@ -9520,17 +9739,14 @@ class CodeGenerator {
               for (let j = openLoopLabels.length - 1; j >= 0; j--) {
                 this.blockDepth--;
                 this.body.end();
-                this.gotoLabelDepths.delete(openLoopLabels[j]);
               }
               openLoopLabels.length = 0;
               this.blockDepth--;
               this.body.end();
-              this.gotoLabelDepths.delete(s);
             }
             if (s.labelKind === Types.LabelKind.LOOP || s.labelKind === Types.LabelKind.BOTH) {
               this.body.loop();
               this.blockDepth++;
-              this.gotoLabelDepths.set(s, this.blockDepth);
               openLoopLabels.push(s);
             }
           } else {
@@ -9540,7 +9756,6 @@ class CodeGenerator {
         for (let j = openLoopLabels.length - 1; j >= 0; j--) {
           this.blockDepth--;
           this.body.end();
-          this.gotoLabelDepths.delete(openLoopLabels[j]);
         }
         this.popLocalScope();
         break;
@@ -9707,7 +9922,6 @@ class CodeGenerator {
               if (cs.kind === Types.StmtKind.LABEL && cs.hasGotos) {
                 if (cs.labelKind === Types.LabelKind.FORWARD || cs.labelKind === Types.LabelKind.BOTH) {
                   switchFwdLabels.push({ label: cs, stmtPos: si });
-                  this.switchLevelLabels.add(cs);
                 }
               }
             }
@@ -9747,9 +9961,6 @@ class CodeGenerator {
         });
         for (const e of blockEntries) {
           this.body.block(); this.blockDepth++;
-          if (e.isForward) {
-            this.gotoLabelDepths.set(switchFwdLabels[e.idx].label, this.blockDepth);
-          }
         }
 
         // Dispatch
@@ -9817,15 +10028,12 @@ class CodeGenerator {
               if (s.labelKind === Types.LabelKind.FORWARD || s.labelKind === Types.LabelKind.BOTH) {
                 for (let k = openLoopLabels.length - 1; k >= 0; k--) {
                   this.blockDepth--; this.body.end();
-                  this.gotoLabelDepths.delete(openLoopLabels[k]);
                 }
                 openLoopLabels.length = 0;
                 this.blockDepth--; this.body.end();
-                this.gotoLabelDepths.delete(s);
               }
               if (s.labelKind === Types.LabelKind.LOOP || s.labelKind === Types.LabelKind.BOTH) {
                 this.body.loop(); this.blockDepth++;
-                this.gotoLabelDepths.set(s, this.blockDepth);
                 openLoopLabels.push(s);
               }
             } else {
@@ -9835,24 +10043,15 @@ class CodeGenerator {
         }
         for (let k = openLoopLabels.length - 1; k >= 0; k--) {
           this.blockDepth--; this.body.end();
-          this.gotoLabelDepths.delete(openLoopLabels[k]);
         }
         this.blockDepth--; this.body.end();
         this.breakTarget = savedBreak;
         break;
       }
-      case Types.StmtKind.GOTO: {
-        const target = stmt.target;
-        const depth = this.gotoLabelDepths.get(target);
-        if (depth === undefined) {
-          const loc = stmt.loc || {};
-          const funcName = this.currentFuncDef ? this.currentFuncDef.name : "?";
-          process.stderr.write(`${loc.filename || "?"}:${loc.line || 0}: goto '${stmt.label}': target label not in scope (in function '${funcName}') (label may be in a nested block, or a loop label's scope was closed by a forward label)\n`);
-          process.exit(1);
-        }
-        this.body.br(this.blockDepth - depth);
+      case Types.StmtKind.GOTO:
+        if (stmt.brDepth < 0) this.body.unreachable(); // invalid goto, error already reported by lowerGotos
+        else this.body.br(stmt.brDepth);
         break;
-      }
       case Types.StmtKind.LABEL: break; // handled in COMPOUND
       case Types.StmtKind.EMPTY: break;
       case Types.StmtKind.THROW: {
@@ -11562,6 +11761,48 @@ function generateCode(units, outputFile, options) {
 
 return { generateCode };
 })();
+
+// ====================
+// GucBackend
+// ====================
+// Alternative codegen path that walks the C AST and constructs a guc.js IR
+// program, then calls CODEGEN.emit. Selected via --backend=guc.
+//
+// guc.js is loaded lazily — only when this backend is actually invoked.
+// The default-backend path never touches it, so users can ship compiler.js
+// without guc.js as long as they don't ask for --backend=guc.
+
+const GucBackend = (() => {
+
+let _GUC = null;
+function loadGuc() {
+  if (_GUC) return _GUC;
+  try {
+    _GUC = require('./guc.js');
+  } catch (e) {
+    if (e && e.code === 'MODULE_NOT_FOUND') {
+      throw new Error(
+        "--backend=guc requires guc.js next to compiler.js. " +
+        "Copy guc.js into the same directory and re-run."
+      );
+    }
+    throw e;
+  }
+  return _GUC;
+}
+
+function generateCode(units, outputFile, options) {
+  const GUC = loadGuc();
+  // Stub: scaffolding in place, translation not yet implemented.
+  throw new Error(
+    "--backend=guc: not implemented yet. " +
+    "Run without the flag to use the default backend."
+  );
+}
+
+return { generateCode, loadGuc };
+})();
+
 // ====================
 // Stdlib
 // ====================
@@ -15978,6 +16219,13 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // Per-TU passes (before linking)
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
     Parser.annotateImplicitCasts(unit);
+    const gotoErrors = Parser.lowerGotos(unit);
+    if (gotoErrors.length > 0) {
+      hasErrors = true;
+      for (const err of gotoErrors) {
+        writeErr(`${err.filename}:${err.line}: error: ${err.message}\n`);
+      }
+    }
     if (!options?.compilerOptions?.noUndefined) Parser.filterUnusedDeclarations(unit);
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
@@ -16729,7 +16977,7 @@ function main() {
   const opfsFiles = [];
   const runArgs = [];
   const warningFlags = { pointerDecay: false, circularDependency: false };
-  const compilerOptions = { debugSwitch: false, allowImplicitInt: false, allowEmptyParams: false, allowKnRDefinitions: false, allowImplicitFunctionDecl: false, allowUndefined: false, gcSections: false, gcNoExportRoots: false, noUndefined: false, timeReport: false, requireSources: [] };
+  const compilerOptions = { debugSwitch: false, allowImplicitInt: false, allowEmptyParams: false, allowKnRDefinitions: false, allowImplicitFunctionDecl: false, allowUndefined: false, gcSections: false, gcNoExportRoots: false, noUndefined: false, timeReport: false, requireSources: [], backend: "default" };
   let noXterm = false;
   const pp = Stdlib.createDefaultPPRegistry();
 
@@ -16795,6 +17043,13 @@ function main() {
       compilerOptions.gcNoExportRoots = true;
     } else if (args[i] === "--no-undefined") {
       compilerOptions.noUndefined = true;
+    } else if (args[i] === "--backend=guc") {
+      compilerOptions.backend = "guc";
+    } else if (args[i] === "--backend=default") {
+      compilerOptions.backend = "default";
+    } else if (args[i].startsWith("--backend=")) {
+      process.stderr.write(`Error: unknown backend '${args[i].slice("--backend=".length)}'. Valid: default, guc\n`);
+      process.exit(1);
     } else if (args[i] === "--require-source") {
       if (i + 1 >= args.length) {
         process.stderr.write("Error: --require-source requires an argument\n");
@@ -16905,7 +17160,9 @@ function main() {
       t0 = hrtime();
       const codegenOpts = { compilerOptions };
       if (compilerOptions.embedSources) codegenOpts.sourceBuffers = pp.sourceBuffers;
-      const wasmBinary = Codegen.generateCode(units, outputFile, codegenOpts);
+      const wasmBinary = compilerOptions.backend === "guc"
+        ? GucBackend.generateCode(units, outputFile, codegenOpts)
+        : Codegen.generateCode(units, outputFile, codegenOpts);
       const codegenMs = hrtime() - t0;
       t0 = hrtime();
       if (outputFile.endsWith(".html") || outputFile.endsWith(".js")) {
