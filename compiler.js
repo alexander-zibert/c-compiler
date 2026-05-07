@@ -11846,24 +11846,10 @@ class Translator {
     this.globalDataBlobs = []; // [{addr, bytes}]
     this.staticEnd = 0; // End of statically-laid-out globals.
 
-    // Function pointer support. We populate one IR.Table (the
-    // __indirect_function_table) with every function ever encountered, in
-    // the order we add them. Index 0 is reserved (null placeholder), so
-    // tableIdx = i + 1.
-    this.indirectTable = null;
-    this.fnDeclToTableIdx = new Map(); // DFunc -> tableIdx (i+1)
-    this.tableFunctions = [];          // Array<IR.Function> in table-index order
-  }
-
-  // Register a function in the indirect table; return its tableIdx (1-based).
-  // Ensures the IR.Table exists (creates it lazily on first registration).
-  _registerInTable(irFunc, fdecl) {
-    if (this.fnDeclToTableIdx.has(fdecl)) return this.fnDeclToTableIdx.get(fdecl);
-    this._getIndirectTable();  // ensures table exists
-    const idx = this.tableFunctions.length + 1; // index 0 is the null slot
-    this.tableFunctions.push(irFunc);
-    this.fnDeclToTableIdx.set(fdecl, idx);
-    return idx;
+    // Function pointer support is now handled entirely by IR.FuncIndex +
+    // codegen's auto-table synthesis. We just emit FuncIndex(irFunc) at
+    // each `&f` / function-decay site; codegen owns layout, indices, and
+    // the `__indirect_function_table` export.
   }
 
   // Resolve an AST function decl to its IR.Function (creating an import or
@@ -12604,42 +12590,19 @@ class Translator {
     const irFuncType = this.cFuncTypeToIR(funcType);
     const indexExpr = this.translateExpr(calleeExpr);
     const args = expr.arguments.map(a => this.translateExpr(a));
-    const table = this._getIndirectTable();
-    return new IR.CallIndirect(loc, table, irFuncType, indexExpr, args);
+    // table=null → codegen dispatches through the auto-table populated
+    // by IR.FuncIndex references.
+    return new IR.CallIndirect(loc, null, irFuncType, indexExpr, args);
   }
 
-  // Lazy creation of the indirect_function_table.
-  _getIndirectTable() {
-    const { T, IR } = this.GUC;
-    if (!this.indirectTable) {
-      const loc = Lexer.Loc.generated();
-      // size set later when we build the program; minSize must accommodate
-      // index 0 (null) + however many functions we register. We'll patch
-      // by constructing the Table with a sentinel and finalising later, but
-      // since IR.Table is frozen, we instead defer creation until we know
-      // the count. For now, allocate generously: we'll re-create at the
-      // very end with the right size. (Simpler: the IR itself is built up
-      // and Program is constructed last, so we create Table at that point.)
-      // Use a placeholder Table that we'll replace at IR.Program time.
-      this.indirectTable = new IR.Table(
-        loc, null, /*export*/ null,
-        T.FUNCREF, /*minSize*/ 1024, /*maxSize*/ null,
-      );
-    }
-    return this.indirectTable;
-  }
-
-  // Get / register a function's table index. The function must have been
-  // resolved to an IR.Function. Returns an i32 expression.
+  // Address-of-function / function-decay: emit IR.FuncIndex(irFunc).
+  // Codegen allocates the slot, assigns indices, and synthesizes the
+  // __indirect_function_table — we just declare the reference here.
   _funcTableIndex(loc, fdecl) {
     const { IR } = this.GUC;
-    let idx = this.fnDeclToTableIdx.get(fdecl);
-    if (idx === undefined) {
-      const irFunc = this._resolveFuncDecl(fdecl, loc);
-      if (!irFunc) nyi(`address-of unresolved function '${fdecl.name}'`, loc);
-      idx = this._registerInTable(irFunc, fdecl);
-    }
-    return this.iconst(loc, idx);
+    const irFunc = this._resolveFuncDecl(fdecl, loc);
+    if (!irFunc) nyi(`address-of unresolved function '${fdecl.name}'`, loc);
+    return new IR.FuncIndex(loc, irFunc);
   }
 
   // Get or create the IR.Function for an imported C function declaration.
@@ -14512,25 +14475,15 @@ class Translator {
       staticDataBase: this.STACK_END,
     };
 
-    // Indirect function table: emit whenever we created the table, whether
-    // populated or not (CallIndirect references the same Table identity).
-    let tables, elements;
-    if (this.indirectTable) {
-      const tloc = Lexer.Loc.generated();
-      tables = [this.indirectTable];
-      if (this.tableFunctions.length > 0) {
-        elements = [
-          new IR.ElementSegment(tloc, this.indirectTable, /*offset*/ 1, this.tableFunctions),
-        ];
-      }
-    }
+    // No explicit indirect table — codegen synthesizes one (and exports
+    // it as __indirect_function_table) from IR.FuncIndex references.
 
     const tags = this.excTagToIR.size > 0
       ? [...this.excTagToIR.values()]
       : undefined;
     return new IR.Program(
       functions, variables, memorySpec,
-      tables, elements, tags, undefined,
+      undefined, undefined, tags, undefined,
       this.dataInit
     );
   }

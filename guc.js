@@ -909,6 +909,7 @@ const IR = (() => {
             this.bytesLiterals = this._computeBytesLiterals();
             this.referencedTypes = this._computeReferencedTypes();
             this.referencedFunctions = this._computeReferencedFunctions();
+            this.tableReferencedFunctions = this._computeTableReferencedFunctions();
             Object.freeze(this.types);
             Object.freeze(this.children);
             Object.freeze(this);
@@ -940,6 +941,17 @@ const IR = (() => {
 
         _computeReferencedFunctions() {
             return new TreeBag(null, ...this.children.map(c => c.referencedFunctions));
+        }
+
+        // tableReferencedFunctions: functions whose i32 table-index was taken
+        // via `IR.FuncIndex(f)`. Codegen synthesizes a single auto-table
+        // (funcref) populated with these so `IR.CallIndirect` works against
+        // the same indices the FuncIndex literals refer to. Tree-shake uses
+        // this bag the same way as `referencedFunctions` — anything in it is
+        // alive.
+        _computeTableReferencedFunctions() {
+            return new TreeBag(null,
+                ...this.children.map(c => c.tableReferencedFunctions));
         }
 
         // Re-construct this node with replacement children in the same order
@@ -1144,8 +1156,12 @@ const IR = (() => {
         constructor(loc, table, funcType, indexExpr, args) {
             const errors = [];
             let divergent = false;
-            if (!(table instanceof Table)) {
-                errors.push('CallIndirect: table must be an IR.Table');
+            // `table === null` means "use the codegen-synthesized auto-table"
+            // — the same one populated by IR.FuncIndex(f). Frontends that
+            // want C-style function pointers don't have to construct a Table
+            // themselves; they just emit FuncIndex + CallIndirect(null, …).
+            if (table !== null && !(table instanceof Table)) {
+                errors.push('CallIndirect: table must be an IR.Table or null (auto-table)');
                 divergent = true;
             }
             if (!(funcType instanceof T.FunctionType)) {
@@ -1217,6 +1233,37 @@ const IR = (() => {
         _computeReferencedFunctions() {
             return new TreeBag(new Set([this.func]),
                 super._computeReferencedFunctions());
+        }
+    }
+
+    // FuncIndex: produces an i32 (well, U32) holding the function's slot
+    // number in an auto-managed funcref table. Used to implement C-style
+    // function pointers — the value compares with `==`, lives in struct
+    // fields, stores in linear memory, casts to/from `void*`, all as a
+    // plain integer. To call through one, use `IR.CallIndirect` against
+    // the auto-table (`autoFuncTable` returned by codegen, also the
+    // default table when CallIndirect's `table` is null).
+    //
+    // Codegen owns table layout: it walks every reachable defined
+    // function body's `tableReferencedFunctions`, allocates one unique
+    // index per distinct function (starting at 1; index 0 is reserved as
+    // the null function pointer), synthesizes a single funcref table +
+    // active element segment, and emits each `FuncIndex(f)` as
+    // `i32.const idx`. The auto-table is exported as
+    // `__indirect_function_table` to match common C-toolchain ABIs.
+    class FuncIndex extends Expression {
+        constructor(loc, func) {
+            super(loc, [T.U32], [], 'UNRESTRICTED');
+            this.func = func;
+            this._finalize();
+        }
+        _computeReferencedFunctions() {
+            return new TreeBag(new Set([this.func]),
+                super._computeReferencedFunctions());
+        }
+        _computeTableReferencedFunctions() {
+            return new TreeBag(new Set([this.func]),
+                super._computeTableReferencedFunctions());
         }
     }
 
@@ -3444,6 +3491,7 @@ const IR = (() => {
         FunctionCall,
         CallIndirect,
         RefFunc,
+        FuncIndex,
         BinOp,
         UnaryOp,
         Convert,
@@ -4052,6 +4100,41 @@ const CODEGEN = (() => {
         const tableIndexMap = new Map();
         tables.forEach((t, i) => tableIndexMap.set(t, i));
 
+        // Auto-table for `IR.FuncIndex(f)` references. We collect every
+        // function reachable via FuncIndex anywhere in any defined function
+        // body, allocate a fresh slot per distinct function (starting at 1;
+        // index 0 is reserved as the null function-pointer), and synthesize
+        // a (FUNCREF) Table + active ElementSegment populating those slots.
+        // The table is exported as `__indirect_function_table` to match
+        // common C-toolchain ABIs. CallIndirect with `table === null`
+        // dispatches through this auto-table.
+        const funcIndexFuncs = (() => {
+            const seen = new Set();
+            const ordered = [];
+            for (const func of definedFunctions) {
+                if (!func.body) continue;
+                for (const f of func.body.tableReferencedFunctions) {
+                    if (seen.has(f)) continue;
+                    seen.add(f);
+                    ordered.push(f);
+                }
+            }
+            return ordered;
+        })();
+        const funcTableIdxMap = new Map();
+        let autoTable = null;
+        let autoTableSegment = null;
+        if (funcIndexFuncs.length > 0) {
+            funcIndexFuncs.forEach((f, i) => funcTableIdxMap.set(f, i + 1));
+            autoTable = new IR.Table(null, null,
+                new IR.ExportSpec('__indirect_function_table'),
+                T.FUNCREF, funcIndexFuncs.length + 1, null);
+            autoTableSegment = new IR.ElementSegment(null, autoTable, 1, funcIndexFuncs);
+            tables.push(autoTable);
+            definedTables.push(autoTable);
+            tableIndexMap.set(autoTable, tables.length - 1);
+        }
+
         // Tags — same shape.
         const programTags = [...program.tags].sort(stableImportSort);
         const importedTags = programTags.filter(t => t.importSpec);
@@ -4072,6 +4155,9 @@ const CODEGEN = (() => {
         const declaredViaActive = new Set();
         for (const seg of program.elements) {
             for (const f of seg.functions) declaredViaActive.add(f);
+        }
+        if (autoTableSegment) {
+            for (const f of autoTableSegment.functions) declaredViaActive.add(f);
         }
         const declarativeFuncs = [];
         for (const f of refdFuncs) {
@@ -4394,14 +4480,26 @@ const CODEGEN = (() => {
                 const argBytes = expr.args.flatMap(a => encodeExpression(a));
                 const idxBytes = encodeExpression(expr.indexExpr);
                 if (expr.types === null) return [...argBytes, ...idxBytes];
+                // table === null → dispatch through the auto-table
+                // populated from IR.FuncIndex references.
+                const tbl = expr.table === null ? autoTable : expr.table;
+                assert(tbl !== null,
+                    'CallIndirect: null table but no FuncIndex references; ' +
+                    'auto-table not synthesized');
                 return [
                     ...argBytes, ...idxBytes,
                     0x11,
                     ...encodeLEBU128(typeIndexMap.get(expr.funcType)),
-                    ...encodeLEBU128(tableIndexMap.get(expr.table)),
+                    ...encodeLEBU128(tableIndexMap.get(tbl)),
                 ];
             } else if (expr instanceof IR.RefFunc) {
                 return [0xD2, ...encodeLEBU128(funcIndexMap.get(expr.func))];
+            } else if (expr instanceof IR.FuncIndex) {
+                const idx = funcTableIdxMap.get(expr.func);
+                assert(idx !== undefined, () =>
+                    `FuncIndex: function ${expr.func.name} not registered ` +
+                    `in auto-table (was tableReferencedFunctions empty?)`);
+                return [0x41, ...encodeLEBS128(idx)]; // i32.const idx
             } else if (expr instanceof IR.BinOp) {
                 const lhsBytes = encodeExpression(expr.lhs);
                 const rhsBytes = encodeExpression(expr.rhs);
@@ -5079,6 +5177,7 @@ const CODEGEN = (() => {
         // 9: Element section
         //////////////////////////////////////////////////
         const elemSegments = [...program.elements];
+        if (autoTableSegment) elemSegments.push(autoTableSegment);
         const totalElemSegs = elemSegments.length + (declarativeFuncs.length > 0 ? 1 : 0);
         if (totalElemSegs > 0) {
             const content = [...encodeLEBU128(totalElemSegs)];
