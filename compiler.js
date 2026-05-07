@@ -11911,6 +11911,14 @@ class Translator {
         return T.refTypeOf(T.HEAP_EXTERN, /*nullable*/ true);
       case Types.TypeKind.REFEXTERN:
         return T.refTypeOf(T.HEAP_EXTERN, /*nullable*/ false);
+      case Types.TypeKind.TAG:
+        // ENUM: int-sized; map to I32 (matches default backend).
+        // STRUCT/UNION: deliberately bail. Half-supporting structs (returning
+        // I32 for the address while the body emits int-sized loads/stores
+        // that don't match the size) regresses many tests. Full struct ABI
+        // is a separate concept yet to be ported.
+        if (u.tagKind === Types.TagKind.ENUM) return T.I32;
+        nyi(`type tag ${u.tagKind}`);
       default:
         nyi(`type ${u.kind}`);
     }
