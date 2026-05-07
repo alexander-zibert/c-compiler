@@ -11873,6 +11873,25 @@ function nyi(what, loc) {
   throw new Error(`--backend=guc: ${what} not implemented yet${where}`);
 }
 
+// Normalize a BigInt value to the representable range of a guc IR slot type.
+// guc IR.Literal validates against [minValue, maxValue] of the slot type, so a
+// shared-evaluator result like ~0n = -1n must be masked to the slot's bit-
+// width before constructing a Literal for U32 / U64. For signed slots we
+// re-interpret the high bit as the sign.
+function normalizeIntForIRSlot(value, slot, T) {
+  // The slot type may be the integral type itself (T.I32, T.U32, T.I64, T.U64,
+  // T.I8, T.U8, T.I16, T.U16) — anything with `bits` and `signed` set.
+  if (typeof slot.bits !== 'number') return value;
+  const bits = BigInt(slot.bits);
+  const mask = (1n << bits) - 1n;
+  let v = value & mask;
+  if (slot.signed) {
+    const signBit = 1n << (bits - 1n);
+    if (v >= signBit) v -= (1n << bits);
+  }
+  return v;
+}
+
 class Translator {
   constructor(GUC, options) {
     this.GUC = GUC;
@@ -14797,20 +14816,32 @@ class Translator {
   // address-bearing expressions (&x, string literals as addresses, etc.)
   // evaluate to null — those are handled separately by the deferred-IR path
   // in `_translateStaticInitValue`.
+  //
+  // After evaluation, the result is normalized to the IR slot's
+  // representable range. The shared evaluator works in mathematical BigInt
+  // arithmetic, so e.g. `~0U` produces -1n which is out of range for a U32
+  // slot's IR.Literal validation. We mask to the slot's bit-width and apply
+  // the slot's signedness here.
   _evalConstInit(expr, irT) {
     const { T } = this.GUC;
     const v = Codegen.constEvalExpr(expr, Codegen.NULL_ADDR_POLICY);
     if (v === null) return null;
     const slot = irT.slotType || irT;
     const slotIsFloat = (slot === T.F32 || slot === T.F64);
+    let intVal = null;
     if (v.kind === "int") {
-      return slotIsFloat ? Number(v.intVal) : v.intVal;
+      if (slotIsFloat) return Number(v.intVal);
+      intVal = v.intVal;
+    } else if (v.kind === "float") {
+      if (slotIsFloat) return v.floatVal;
+      intVal = BigInt(Math.trunc(v.floatVal));
+    } else {
+      // addr — never produced under NULL_ADDR_POLICY.
+      return null;
     }
-    if (v.kind === "float") {
-      return slotIsFloat ? v.floatVal : BigInt(Math.trunc(v.floatVal));
-    }
-    // addr — never produced under NULL_ADDR_POLICY but be defensive.
-    return null;
+    // Normalize to the IR type's representable range. guc.js validates that
+    // IR.Literal values fit; e.g. U32 rejects negative BigInts.
+    return normalizeIntForIRSlot(intVal, irT, T);
   }
 }
 
