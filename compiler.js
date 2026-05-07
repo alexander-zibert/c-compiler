@@ -11931,9 +11931,76 @@ class Translator {
       case Types.TypeKind.ARRAY:   return T.U32; // arrays decay to pointers in expressions
       case Types.TypeKind.FUNCTION:return T.U32; // functions decay to fn ptrs (table index)
       case Types.TypeKind.AUTO:    return T.I32; // C23 auto — fallback if not resolved
+      case Types.TypeKind.GC_STRUCT:
+        return T.refTypeOf(this._resolveGCStructType(u), /*nullable*/ true);
+      case Types.TypeKind.GC_ARRAY:
+        return T.refTypeOf(this._resolveGCArrayType(u), /*nullable*/ true);
+      case Types.TypeKind.EQREF:
+        return T.refTypeOf(T.HEAP_EQ, /*nullable*/ true);
+      case Types.TypeKind.EXTERNREF:
+        return T.refTypeOf(T.HEAP_EXTERN, /*nullable*/ true);
+      case Types.TypeKind.REFEXTERN:
+        return T.refTypeOf(T.HEAP_EXTERN, /*nullable*/ false);
       default:
         nyi(`type ${u.kind}`);
     }
+  }
+
+  // Resolve a C GC_STRUCT type to a guc.js T.StructType, caching by C type.
+  // Builds the field list from the C struct's members. Cycles work because
+  // we cache before recursing (using a half-built T.StructType is OK since
+  // guc rebuilds its referencedTypes lazily).
+  _resolveGCStructType(cType) {
+    const { T } = this.GUC;
+    if (this._gcStructCache && this._gcStructCache.has(cType)) {
+      return this._gcStructCache.get(cType);
+    }
+    if (!this._gcStructCache) this._gcStructCache = new Map();
+    // Pre-create with empty fields so recursive refs see the same identity.
+    const placeholder = new T.StructType([], null);
+    this._gcStructCache.set(cType, placeholder);
+    // Now fill in real fields.
+    const parent = cType.parentType
+      ? this._resolveGCStructType(cType.parentType)
+      : null;
+    const members = cType.tagDecl.members || [];
+    const fields = members.map(m => this._gcFieldFor(m));
+    // Mutate placeholder. We can't replace it (other places already hold the
+    // reference). Set fields and parent directly. T.StructType isn't frozen
+    // in its constructor — it's just a plain object.
+    placeholder.fields = fields;
+    placeholder.parent = parent;
+    return placeholder;
+  }
+
+  _resolveGCArrayType(cType) {
+    const { T } = this.GUC;
+    if (this._gcArrayCache && this._gcArrayCache.has(cType)) {
+      return this._gcArrayCache.get(cType);
+    }
+    if (!this._gcArrayCache) this._gcArrayCache = new Map();
+    const elemField = this._gcFieldFor({ type: cType.baseType, name: '_elem', bitWidth: -1 });
+    const arrayType = new T.ArrayType(elemField.type, /*mutable*/ true, elemField.packedKind);
+    this._gcArrayCache.set(cType, arrayType);
+    return arrayType;
+  }
+
+  // Build a struct field / array element field record from a C member.
+  // Sub-i32 integer types become packed (i8/i16) in GC types.
+  _gcFieldFor(member) {
+    const { T } = this.GUC;
+    const ct = member.type.removeQualifiers ? member.type.removeQualifiers() : member.type;
+    let type, packedKind = null;
+    switch (ct.kind) {
+      case Types.TypeKind.CHAR:
+      case Types.TypeKind.SCHAR: type = T.I8; packedKind = 'i8'; break;
+      case Types.TypeKind.UCHAR: type = T.U8; packedKind = 'i8'; break;
+      case Types.TypeKind.SHORT: type = T.I16; packedKind = 'i16'; break;
+      case Types.TypeKind.USHORT:type = T.U16; packedKind = 'i16'; break;
+      case Types.TypeKind.BOOL:  type = T.U8; packedKind = 'i8'; break;
+      default: type = this.cTypeToIR(ct); break;
+    }
+    return { type, mutable: true, packedKind, name: member.name };
   }
 
   // Build the IR FunctionType for a C function type. `void` returns map to no
@@ -12003,6 +12070,7 @@ class Translator {
       case Types.TypeKind.FLOAT: return 'f32.store';
       case Types.TypeKind.DOUBLE:
       case Types.TypeKind.LDOUBLE:return 'f64.store';
+      case Types.TypeKind.AUTO: return 'i32.store'; // C23 auto fallback
       default: nyi(`store type ${u.kind}`);
     }
   }
@@ -12062,6 +12130,29 @@ class Translator {
         break;
       }
       case Types.ExprKind.SUBSCRIPT: {
+        // GC array? Use array.get with the structural ArrayType.
+        const arrCType = expr.array.type.removeQualifiers();
+        if (arrCType.isGCArray && arrCType.isGCArray()) {
+          const arrayType = this._resolveGCArrayType(arrCType);
+          const base = this.translateExpr(expr.array);
+          let idx = this.translateExpr(expr.index);
+          // GC array.get takes i32 index.
+          const idxSlot = idx.types && idx.types.length === 1
+            ? (idx.types[0].slotType || idx.types[0]) : null;
+          if (idxSlot && idxSlot.name === 'i64') {
+            idx = new IR.Convert(loc, 'i32.wrap_i64', idx);
+          }
+          // For packed elements, choose signed/unsigned based on C type.
+          const u = arrCType.baseType.removeQualifiers();
+          const isSigned = !(u.kind === Types.TypeKind.UCHAR ||
+            u.kind === Types.TypeKind.USHORT || u.kind === Types.TypeKind.BOOL);
+          if (arrayType.packedKind) {
+            return isSigned
+              ? new IR.ArrayGet(loc, arrayType, base, idx, /*signed*/ true)
+              : new IR.ArrayGet(loc, arrayType, base, idx, /*signed*/ false);
+          }
+          return new IR.ArrayGet(loc, arrayType, base, idx);
+        }
         // a[i] — produce the element value for non-aggregate types, else
         // produce the element's address (stays as i32; lvalue chains).
         const elemType = expr.type;
@@ -12077,6 +12168,31 @@ class Translator {
       }
       case Types.ExprKind.MEMBER:
       case Types.ExprKind.ARROW: {
+        // GC struct member? Look at the base type. ARROW's base is `*GCStruct` (ref);
+        // MEMBER's base is GCStruct directly (ref). Treat both via struct.get.
+        const baseCType = expr.base.type.removeQualifiers();
+        const isGCArrow = expr.kind === Types.ExprKind.ARROW &&
+          baseCType.isPointer && baseCType.isPointer() &&
+          baseCType.baseType.isGCStruct && baseCType.baseType.isGCStruct();
+        const isGCMember = expr.kind === Types.ExprKind.MEMBER &&
+          baseCType.isGCStruct && baseCType.isGCStruct();
+        if (isGCArrow || isGCMember) {
+          const structCType = isGCArrow ? baseCType.baseType : baseCType;
+          const structType = this._resolveGCStructType(structCType);
+          const baseRef = this.translateExpr(expr.base);
+          // Find field index by member identity.
+          const members = structCType.tagDecl.members || [];
+          let fieldIdx = members.indexOf(expr.memberDecl);
+          if (fieldIdx < 0) nyi(`GC field '${expr.memberName}' not found`, loc);
+          const u = expr.memberDecl.type.removeQualifiers();
+          const isSigned = !(u.kind === Types.TypeKind.UCHAR ||
+            u.kind === Types.TypeKind.USHORT || u.kind === Types.TypeKind.BOOL);
+          const isPacked = structType.fields[fieldIdx].packedKind != null;
+          if (isPacked) {
+            return new IR.StructGet(loc, structType, fieldIdx, baseRef, isSigned);
+          }
+          return new IR.StructGet(loc, structType, fieldIdx, baseRef);
+        }
         // s.field or sp->field — compute field's address, load if scalar.
         const baseAddr = expr.kind === Types.ExprKind.ARROW
           ? this.translateExpr(expr.base)
@@ -12151,10 +12267,22 @@ class Translator {
       case Types.ExprKind.ALIGNOF_EXPR: {
         return this.iconst(loc, expr.expr.type.align || 1);
       }
+      case Types.ExprKind.GC_NEW: {
+        return this._translateGCNew(expr, loc);
+      }
       case Types.ExprKind.COMPOUND_LITERAL: {
-        // (struct X){...} — function-scope: frame slot pre-assigned in
-        // _collectMemoryLocals. Initialize the slot on first use, return its
-        // address.
+        const t = expr.type.removeQualifiers();
+        // Scalar compound literal: `(int){42}` is just `42`. No frame slot.
+        if (!(t.isArray && t.isArray()) && !(t.isAggregate && t.isAggregate())) {
+          if (expr.initList && expr.initList.elements.length > 0) {
+            return this.translateExpr(expr.initList.elements[0]);
+          }
+          // Empty init: zero of the type.
+          const irT = this.cTypeToIR(t);
+          if (irT === T.F32 || irT === T.F64) return new IR.Literal(loc, irT, 0.0);
+          return new IR.Literal(loc, irT, 0n);
+        }
+        // Aggregate / array: frame slot pre-assigned in _collectMemoryLocals.
         const offset = this.compoundLitToFrameOffset.get(expr);
         if (offset === undefined) nyi(`compound literal without frame slot`, loc);
         const baseAddrFor = (off) => off === 0
@@ -12163,16 +12291,13 @@ class Translator {
               new IR.GetVars(loc, [this.savedSpLocal]),
               this.iconst(loc, off - this.frameSize));
         const stmts = [];
-        // Zero-fill first to handle partial inits.
-        if (expr.type.size > 0) {
+        if (t.size > 0) {
           stmts.push(new IR.MemoryFill(loc,
-            baseAddrFor(offset), this.iconst(loc, 0), this.iconst(loc, expr.type.size)));
+            baseAddrFor(offset), this.iconst(loc, 0), this.iconst(loc, t.size)));
         }
-        // Populate from initList.
         if (expr.initList) {
-          this._emitInitListStores(stmts, baseAddrFor, offset, expr.type, expr.initList, loc);
+          this._emitInitListStores(stmts, baseAddrFor, offset, t, expr.initList, loc);
         }
-        // Yield address.
         stmts.push(baseAddrFor(offset));
         return new IR.Block(loc, Symbol('compoundlit'), stmts);
       }
@@ -12331,6 +12456,87 @@ class Translator {
         // We don't have a real __heap_base global yet; for now use the
         // staticDataBase (= start of static area). Better: an actual global.
         return this.iconst(loc, this.STACK_END);
+      }
+      // ===== GC intrinsics =====
+      case IK.REF_IS_NULL: {
+        return new IR.RefIsNull(loc, this.translateExpr(expr.args[0]));
+      }
+      case IK.REF_EQ: {
+        return new IR.RefEq(loc,
+          this.translateExpr(expr.args[0]),
+          this.translateExpr(expr.args[1]));
+      }
+      case IK.REF_NULL: {
+        // expr.argType is the C type whose ref-form we want.
+        const cT = expr.argType || expr.type;
+        const irT = this.cTypeToIR(cT.removeQualifiers());
+        if (!(irT instanceof T.RefType)) nyi(`__ref_null on non-ref type`, loc);
+        return new IR.RefNull(loc, irT.heapType);
+      }
+      case IK.REF_TEST:
+      case IK.REF_TEST_NULL: {
+        const targetCT = expr.argType.removeQualifiers();
+        const targetIR = this.cTypeToIR(targetCT);
+        if (!(targetIR instanceof T.RefType)) nyi(`__ref_test target not a ref`, loc);
+        const ref = this.translateExpr(expr.args[0]);
+        const nullable = (expr.intrinsicKind === IK.REF_TEST_NULL);
+        return new IR.RefTest(loc, T.refTypeOf(targetIR.heapType, nullable), ref);
+      }
+      case IK.REF_CAST:
+      case IK.REF_CAST_NULL: {
+        const targetCT = expr.argType.removeQualifiers();
+        const targetIR = this.cTypeToIR(targetCT);
+        if (!(targetIR instanceof T.RefType)) nyi(`__ref_cast target not a ref`, loc);
+        const ref = this.translateExpr(expr.args[0]);
+        const nullable = (expr.intrinsicKind === IK.REF_CAST_NULL);
+        return new IR.RefCast(loc, T.refTypeOf(targetIR.heapType, nullable), ref);
+      }
+      case IK.ARRAY_LEN: {
+        return new IR.ArrayLen(loc, this.translateExpr(expr.args[0]));
+      }
+      case IK.GC_NEW_ARRAY: {
+        // args = [length] or [length, init]; argType is the element type.
+        const elemCT = expr.argType.removeQualifiers();
+        // expr.type is the GC_ARRAY type; resolve it.
+        const arrCT = expr.type.removeQualifiers();
+        const arrayType = this._resolveGCArrayType(arrCT);
+        if (expr.args.length === 1) {
+          const len = this._narrowI64ToI32(this.translateExpr(expr.args[0]), loc);
+          return new IR.ArrayNewDefault(loc, arrayType, len);
+        }
+        const len = this._narrowI64ToI32(this.translateExpr(expr.args[0]), loc);
+        const init = this.translateExpr(expr.args[1]);
+        return new IR.ArrayNew(loc, arrayType, init, len);
+      }
+      case IK.ARRAY_FILL: {
+        // args = [arr, off, val, count]
+        const arrCT = expr.args[0].type.removeQualifiers();
+        const arrayType = this._resolveGCArrayType(arrCT);
+        return new IR.ArrayFill(loc, arrayType,
+          this.translateExpr(expr.args[0]),
+          this._narrowI64ToI32(this.translateExpr(expr.args[1]), loc),
+          this.translateExpr(expr.args[2]),
+          this._narrowI64ToI32(this.translateExpr(expr.args[3]), loc));
+      }
+      case IK.ARRAY_COPY: {
+        // args = [dst, dstOff, src, srcOff, count]
+        const dstCT = expr.args[0].type.removeQualifiers();
+        const srcCT = expr.args[2].type.removeQualifiers();
+        return new IR.ArrayCopy(loc,
+          this._resolveGCArrayType(dstCT),
+          this.translateExpr(expr.args[0]),
+          this._narrowI64ToI32(this.translateExpr(expr.args[1]), loc),
+          this._resolveGCArrayType(srcCT),
+          this.translateExpr(expr.args[2]),
+          this._narrowI64ToI32(this.translateExpr(expr.args[3]), loc),
+          this._narrowI64ToI32(this.translateExpr(expr.args[4]), loc));
+      }
+      case IK.REF_AS_EXTERN: {
+        return new IR.ExternConvertAny(loc, this.translateExpr(expr.args[0]));
+      }
+      case IK.REF_AS_EQ: {
+        const v = new IR.AnyConvertExtern(loc, this.translateExpr(expr.args[0]));
+        return new IR.RefCast(loc, T.refTypeOf(T.HEAP_EQ, /*nullable*/ true), v);
       }
       default:
         nyi(`intrinsic ${expr.intrinsicKind}`, loc);
@@ -12651,6 +12857,21 @@ class Translator {
     }
     if (fromSlot === T.F32 && toSlot === T.F64) return new IR.Convert(loc, "f64.promote_f32", src);
     if (fromSlot === T.F64 && toSlot === T.F32) return new IR.Convert(loc, "f32.demote_f64", src);
+
+    // Ref-to-ref conversions (subtyping). If the source is assignable to the
+    // target, no opcode is needed — the IR doesn't care about ref subtyping
+    // at the wasm level. If the source is NOT assignable, we emit a ref.cast
+    // to the target's heap type.
+    if (fromT instanceof T.RefType && toT instanceof T.RefType) {
+      if (fromT.isAssignableTo(toT)) return src;
+      return new IR.RefCast(loc, toT, src);
+    }
+    // int → ref (NULL constant): only the literal 0 is allowed; emit ref.null.
+    if (toT instanceof T.RefType &&
+        (fromSlot === T.I32 || fromSlot === T.I64) &&
+        src instanceof IR.Literal && (src.value === 0n || src.value === 0)) {
+      return new IR.RefNull(loc, toT.heapType);
+    }
     nyi(`conversion ${fromT} -> ${toT}`, loc);
   }
 
@@ -12836,16 +13057,32 @@ class Translator {
       const ptr = this.translateExpr(lhsAst.operand);
       return this._storeAndYield(loc, ptr, lhsAst.type, rhsIR);
     }
-    if (lhsAst.kind === Types.ExprKind.SUBSCRIPT) {
-      const elemType = lhsAst.type;
-      const elemSize = elemType.size || 1;
-      const base = this.translateExpr(lhsAst.array);
-      let idx = this.translateExpr(lhsAst.index);
-      if (elemSize !== 1) idx = new IR.BinOp(loc, 'mul', idx, this.iconst(loc, elemSize));
-      const addr = new IR.BinOp(loc, 'add', base, idx);
-      return this._storeAndYield(loc, addr, elemType, rhsIR);
-    }
     if (lhsAst.kind === Types.ExprKind.MEMBER || lhsAst.kind === Types.ExprKind.ARROW) {
+      // GC struct field write?
+      const baseCType = lhsAst.base.type.removeQualifiers();
+      const isGCArrow = lhsAst.kind === Types.ExprKind.ARROW &&
+        baseCType.isPointer && baseCType.isPointer() &&
+        baseCType.baseType.isGCStruct && baseCType.baseType.isGCStruct();
+      const isGCMember = lhsAst.kind === Types.ExprKind.MEMBER &&
+        baseCType.isGCStruct && baseCType.isGCStruct();
+      if (isGCArrow || isGCMember) {
+        const structCType = isGCArrow ? baseCType.baseType : baseCType;
+        const structType = this._resolveGCStructType(structCType);
+        const baseRef = this.translateExpr(lhsAst.base);
+        const members = structCType.tagDecl.members || [];
+        const fieldIdx = members.indexOf(lhsAst.memberDecl);
+        if (fieldIdx < 0) nyi(`GC field assign '${lhsAst.memberName}' not found`, loc);
+        // struct.set discards. Emit struct.set then return rhsIR via local round-trip.
+        const irT = structType.fields[fieldIdx].packedKind
+          ? this.GUC.T.I32 : this.cTypeToIR(lhsAst.memberDecl.type);
+        const tmp = new IR.LocalVariable(loc, true, '_gcset', irT);
+        this.extraLocals.push(tmp);
+        return new IR.Block(loc, Symbol('gcset'), [
+          new IR.SetVars(loc, [tmp], [rhsIR]),
+          new IR.StructSet(loc, structType, fieldIdx, baseRef, new IR.GetVars(loc, [tmp])),
+          new IR.GetVars(loc, [tmp]),
+        ]);
+      }
       const baseAddr = lhsAst.kind === Types.ExprKind.ARROW
         ? this.translateExpr(lhsAst.base)
         : this._addressOf(lhsAst.base);
@@ -12857,6 +13094,35 @@ class Translator {
         return this._writeBitfield(loc, addr, fieldDecl, rhsIR);
       }
       return this._storeAndYield(loc, addr, fieldDecl.type, rhsIR);
+    }
+    if (lhsAst.kind === Types.ExprKind.SUBSCRIPT) {
+      // GC array element write?
+      const arrCType = lhsAst.array.type.removeQualifiers();
+      if (arrCType.isGCArray && arrCType.isGCArray()) {
+        const arrayType = this._resolveGCArrayType(arrCType);
+        const base = this.translateExpr(lhsAst.array);
+        let idx = this.translateExpr(lhsAst.index);
+        const idxSlot = idx.types && idx.types.length === 1
+          ? (idx.types[0].slotType || idx.types[0]) : null;
+        if (idxSlot && idxSlot.name === 'i64') {
+          idx = new IR.Convert(loc, 'i32.wrap_i64', idx);
+        }
+        const irT = arrayType.packedKind ? this.GUC.T.I32 : this.cTypeToIR(arrCType.baseType);
+        const tmp = new IR.LocalVariable(loc, true, '_gcaset', irT);
+        this.extraLocals.push(tmp);
+        return new IR.Block(loc, Symbol('gcaset'), [
+          new IR.SetVars(loc, [tmp], [rhsIR]),
+          new IR.ArraySet(loc, arrayType, base, idx, new IR.GetVars(loc, [tmp])),
+          new IR.GetVars(loc, [tmp]),
+        ]);
+      }
+      const elemType = lhsAst.type;
+      const elemSize = elemType.size || 1;
+      const base = this.translateExpr(lhsAst.array);
+      let idx = this.translateExpr(lhsAst.index);
+      if (elemSize !== 1) idx = new IR.BinOp(loc, 'mul', idx, this.iconst(loc, elemSize));
+      const addr = new IR.BinOp(loc, 'add', base, idx);
+      return this._storeAndYield(loc, addr, elemType, rhsIR);
     }
     nyi(`assign to ${lhsAst.kind} lvalue`, loc);
   }
@@ -13591,6 +13857,44 @@ class Translator {
     );
     this.funcDefToIRFunc.set(fdef, irFunc);
     return irFunc;
+  }
+
+  // Translate `__new(__struct Foo, args...)` and `__new(__array(T), n[, init])`.
+  // GC_STRUCT: struct.new (with field args) or struct.new_default.
+  // GC_ARRAY: array.new (init + length) or array.new_default (length only).
+  _translateGCNew(expr, loc) {
+    const { T, IR } = this.GUC;
+    const t = expr.type.removeQualifiers();
+    if (t.isGCStruct && t.isGCStruct()) {
+      const structType = this._resolveGCStructType(t);
+      if (expr.args.length === 0) {
+        return new IR.StructNewDefault(loc, structType);
+      }
+      const args = expr.args.map(a => this.translateExpr(a));
+      return new IR.StructNew(loc, structType, args);
+    }
+    if (t.isGCArray && t.isGCArray()) {
+      const arrayType = this._resolveGCArrayType(t);
+      // EGCNew args: [length] or [length, init].
+      if (expr.args.length === 1) {
+        const len = this._narrowI64ToI32(this.translateExpr(expr.args[0]), loc);
+        return new IR.ArrayNewDefault(loc, arrayType, len);
+      }
+      const len = this._narrowI64ToI32(this.translateExpr(expr.args[0]), loc);
+      const init = this.translateExpr(expr.args[1]);
+      return new IR.ArrayNew(loc, arrayType, init, len);
+    }
+    nyi(`__new for type ${t.kind}`, loc);
+  }
+
+  // If `expr` is i64-typed, wrap in i32.wrap_i64; otherwise pass through.
+  _narrowI64ToI32(expr, loc) {
+    const { T, IR } = this.GUC;
+    if (expr.types && expr.types.length === 1) {
+      const slot = expr.types[0].slotType || expr.types[0];
+      if (slot === T.I64) return new IR.Convert(loc, 'i32.wrap_i64', expr);
+    }
+    return expr;
   }
 
   // Resolve a C exception tag object (with .name + .paramTypes) to an

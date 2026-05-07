@@ -496,6 +496,44 @@ T('exc-multi-catch',
   + 'return 0; }',
   'B=5\n', 0);
 
+// ===== GC types =====
+T('gc-struct-basic',
+  '#include <stdio.h>\n'
+  + '__struct P { int x; int y; };\n'
+  + 'int main(void) { __struct P *p = __new(__struct P, 7, 11); '
+  + 'printf("%d %d\\n", p->x, p->y); p->x = 99; printf("%d\\n", p->x); return 0; }',
+  '7 11\n99\n', 0);
+
+T('gc-array-basic',
+  '#include <stdio.h>\n'
+  + 'int main(void) { __array(int) a = __array_new(int, 5);\n'
+  + 'for (int i = 0; i < 5; ++i) a[i] = i*i;\n'
+  + 'for (int i = 0; i < 5; ++i) printf("%d ", a[i]);\n'
+  + 'printf("len=%d\\n", __array_len(a)); return 0; }',
+  '0 1 4 9 16 len=5\n', 0);
+
+T('gc-array-init-fill',
+  '#include <stdio.h>\n'
+  + 'int main(void) { __array(int) a = __array_new(int, 4, 7);\n'
+  + 'for (int i = 0; i < 4; ++i) printf("%d ", a[i]); printf("\\n"); return 0; }',
+  '7 7 7 7 \n', 0);
+
+T('gc-ref-null',
+  '#include <stdio.h>\n'
+  + '__struct N { int v; };\n'
+  + 'int main(void) { __struct N *p = __ref_null(__struct N *);\n'
+  + 'printf("%d\\n", __ref_is_null(p)); return 0; }',
+  '1\n', 0);
+
+T('gc-ref-eq',
+  '#include <stdio.h>\n'
+  + '__struct N { int v; };\n'
+  + 'int main(void) { __struct N *a = __new(__struct N, 1);\n'
+  + '__struct N *b = a;\n'
+  + '__struct N *c = __new(__struct N, 1);\n'
+  + 'printf("%d %d\\n", __ref_eq(a, b), __ref_eq(a, c)); return 0; }',
+  '1 0\n', 0);
+
 // =========== summary ===========
 
 console.log(`\n${pass}/${pass + fail} passed${skip ? `, ${skip} skipped` : ''}${fail ? `, ${fail} failed` : ''}`);

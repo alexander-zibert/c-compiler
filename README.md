@@ -2,7 +2,7 @@
 
 Single-file C-to-WebAssembly compiler.
 
-**compiler.js** (~16K lines) — JavaScript, runs on Node.js and browser.
+**compiler.js** — JavaScript, runs on Node.js and browser.
 
 A frozen C++20 port (**compiler.cc**) is preserved in `old/` along with its own test runner and unit tests. The two compilers produce identical output for all unit tests (verified by equiv tests in `old/`).
 
