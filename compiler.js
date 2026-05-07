@@ -12252,7 +12252,8 @@ class Translator {
         const elemSize = elemType.size || 1;
         const base = this.translateExpr(expr.array);
         let idx = this.translateExpr(expr.index);
-        // Scale index, then add. Both base and idx are i32 (after decay).
+        // Pointers are i32; widen i64 indices first, then scale.
+        idx = this._narrowI64ToI32(idx, loc);
         if (elemSize !== 1) idx = new IR.BinOp(loc, 'mul', idx, this.iconst(loc, elemSize));
         const addr = new IR.BinOp(loc, 'add', base, idx);
         if ((elemType.isArray && elemType.isArray()) ||
@@ -12970,9 +12971,21 @@ class Translator {
       // x op= y  becomes  x = x op y. Stick with the AST shape — the
       // implicit-cast pass should already have inserted any needed casts.
       const baseOp = expr.op.slice(0, -"_ASSIGN".length); // e.g. "ADD"
+      const lhsType = expr.left.type;
+      const isPtrLhs = (lhsType.isPointer && lhsType.isPointer()) ||
+                       (lhsType.isArray && lhsType.isArray());
       const lhsRead = this.translateExpr(expr.left);
-      const rhs = this.translateExpr(expr.right);
-      const newVal = new IR.BinOp(loc, this.cBopToIR(baseOp), lhsRead, rhs);
+      let rhs = this.translateExpr(expr.right);
+      let newVal;
+      if (isPtrLhs && (baseOp === "ADD" || baseOp === "SUB")) {
+        // Pointer compound arith: scale rhs by elemSize, narrow if i64.
+        const elemSize = (lhsType.baseType && lhsType.baseType.size) || 1;
+        rhs = this._narrowI64ToI32(rhs, loc);
+        if (elemSize !== 1) rhs = new IR.BinOp(loc, 'mul', rhs, this.iconst(loc, elemSize));
+        newVal = new IR.BinOp(loc, baseOp === "ADD" ? 'add' : 'sub', lhsRead, rhs);
+      } else {
+        newVal = new IR.BinOp(loc, this.cBopToIR(baseOp), lhsRead, rhs);
+      }
       return this.translateAssign(expr.left, newVal, loc);
     }
     // Logical short-circuit: && and || lower to IfElse (no IR.BinOp).
@@ -13003,6 +13016,8 @@ class Translator {
       const elemSize = (elemType && elemType.size) || 1;
       const ptr = this.translateExpr(ptrAst);
       let idx = this.translateExpr(intAst);
+      // Pointers are i32; widen i64 indices to i32 (wasm trunc) before scaling.
+      idx = this._narrowI64ToI32(idx, loc);
       if (elemSize !== 1) idx = new IR.BinOp(loc, 'mul', idx, this.iconst(loc, elemSize));
       return new IR.BinOp(loc, 'add', ptr, idx);
     }
@@ -13017,8 +13032,8 @@ class Translator {
         if (elemSize !== 1) diff = new IR.BinOp(loc, 'div', diff, this.iconst(loc, elemSize));
         return diff;
       }
-      // ptr - int
-      let scaled = rhs;
+      // ptr - int (narrow i64 offset to i32 first).
+      let scaled = this._narrowI64ToI32(rhs, loc);
       if (elemSize !== 1) scaled = new IR.BinOp(loc, 'mul', scaled, this.iconst(loc, elemSize));
       return new IR.BinOp(loc, 'sub', lhs, scaled);
     }
@@ -13219,6 +13234,8 @@ class Translator {
         const elemSize = expr.type.size || 1;
         const base = this.translateExpr(expr.array);
         let idx = this.translateExpr(expr.index);
+        // Pointers are i32; widen i64 indices first, then scale.
+        idx = this._narrowI64ToI32(idx, loc);
         if (elemSize !== 1) idx = new IR.BinOp(loc, 'mul', idx, this.iconst(loc, elemSize));
         return new IR.BinOp(loc, 'add', base, idx);
       }
