@@ -3164,7 +3164,16 @@ const IR = (() => {
                 ...this.children.map(c => c.unclaimedSlots));
             const childFrames = new TreeBag(null,
                 ...this.children.map(c => c.frameNodes));
-            const ownSlots = [...childUnclaimed];
+            // Dedup slots: the same StackSlot may appear once per
+            // StackSlotAddr referencing it; we want each slot listed
+            // exactly once for layout.
+            const seen = new Set();
+            const ownSlots = [];
+            for (const s of childUnclaimed) {
+                if (seen.has(s)) continue;
+                seen.add(s);
+                ownSlots.push(s);
+            }
             const subFrames = [...childFrames];
             if (ownSlots.length === 0 && subFrames.length === 0) {
                 return _EMPTY_TREE_BAG;
@@ -4501,11 +4510,23 @@ const CODEGEN = (() => {
             }
             return maxEnd;
         };
+        // Dedup slots from a TreeBag (where the same slot may appear once
+        // per StackSlotAddr referencing it). Preserves first-encounter order.
+        const dedupSlots = (bag) => {
+            const seen = new Set();
+            const out = [];
+            for (const s of bag) {
+                if (seen.has(s)) continue;
+                seen.add(s);
+                out.push(s);
+            }
+            return out;
+        };
         for (const func of definedFunctions) {
             if (!func.body) { frameSizeByFunc.set(func, 0); continue; }
             const body = func.body;
             const topFrames = [...body.frameNodes];
-            const topUnclaimed = [...body.unclaimedSlots];
+            const topUnclaimed = dedupSlots(body.unclaimedSlots);
             if (topFrames.length === 0 && topUnclaimed.length === 0
                     && !body.containsAlloca) {
                 frameSizeByFunc.set(func, 0);
