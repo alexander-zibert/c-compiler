@@ -1785,7 +1785,7 @@ const IR = (() => {
         }
     }
 
-    // RestoreStack: zero-result statement that resets the stack pointer
+    // RestoreStackToPostPrologue: zero-result statement that resets the stack pointer
     // to the POST-PROLOGUE value (top of the static frame, just above
     // any space the function's StackSlots occupy). Discards in-flight
     // Alloca allocations while keeping the static frame valid for
@@ -1797,10 +1797,10 @@ const IR = (() => {
     //
     // NOTE: this is NOT the same as the codegen-emitted return prefix,
     // which restores all the way to function-entry SP (saved_sp itself).
-    // RestoreStack stops one frame short so StackSlots remain reachable.
+    // RestoreStackToPostPrologue stops one frame short so StackSlots remain reachable.
     //
     // LINEAR — has SP side-effect.
-    class RestoreStack extends Expression {
+    class RestoreStackToPostPrologue extends Expression {
         constructor(loc) {
             super(loc, [], [], 'LINEAR');
             this._finalize();
@@ -3372,10 +3372,10 @@ const IR = (() => {
     // locals before the handler body runs. NOT a wasm instruction — like
     // TryFinally, this is a high-level frontend convenience that the
     // `lowerTryCatch` IR pass desugars into TryTable + Block + SetVars +
-    // RestoreStack + Break before codegen.
+    // RestoreStackToPostPrologue + Break before codegen.
     //
     // Why this exists: hand-rolled try/catch lowering has to remember to
-    // emit RestoreStack at every catch-handler entry so that allocas in
+    // emit RestoreStackToPostPrologue at every catch-handler entry so that allocas in
     // the try body don't leak into the catch handler's stack space.
     // TryCatch centralizes that detail.
     //
@@ -3770,7 +3770,7 @@ const IR = (() => {
     }
 
     // lowerTryCatch: IR pass that desugars TryCatch into TryTable + Block
-    // tower with auto-injected RestoreStack at every catch handler entry.
+    // tower with auto-injected RestoreStackToPostPrologue at every catch handler entry.
     //
     // Each TryCatch becomes:
     //   Block(end, [
@@ -3779,11 +3779,11 @@ const IR = (() => {
     //         Block(catch_wrap_0, [
     //           SetVars(c0.bindings, [Block(c0.label, [TryTable(...)])])
     //               OR Block(c0.label, [TryTable(...)])  if no bindings,
-    //           RestoreStack,           // <-- the value-add of TryCatch
+    //           RestoreStackToPostPrologue,           // <-- the value-add of TryCatch
     //           c0.body...,
     //           Break(end),
     //         ])
-    //         c1.body... (with similar SetVars / RestoreStack wrap)
+    //         c1.body... (with similar SetVars / RestoreStackToPostPrologue wrap)
     //       ])
     //     ])
     //   ])
@@ -3837,7 +3837,7 @@ const IR = (() => {
                     stmts.push(labeledBlock);
                 }
                 // Auto-injected at the start of every catch handler.
-                stmts.push(new RestoreStack(loc));
+                stmts.push(new RestoreStackToPostPrologue(loc));
                 stmts.push(...c.body);
                 stmts.push(new Break(loc, endLabel, []));
                 inner = new Block(loc, freshSym('tc_wrap'), stmts);
@@ -3909,7 +3909,7 @@ const IR = (() => {
         StackSlotAddr,
         Alloca,
         HeapBase,
-        RestoreStack,
+        RestoreStackToPostPrologue,
         FrameNode,
         StructNew,
         StructNewDefault,
@@ -5313,7 +5313,7 @@ const CODEGEN = (() => {
                 return [0x41, ...encodeLEBS128(addr)]; // i32.const <addr>
             } else if (expr instanceof IR.HeapBase) {
                 return [0x41, ...encodeLEBS128(heapBaseAddr)]; // i32.const heap_base
-            } else if (expr instanceof IR.RestoreStack) {
+            } else if (expr instanceof IR.RestoreStackToPostPrologue) {
                 // No-op when this function has no frame.
                 if (currentSavedSpIdx < 0) return [];
                 // sp = saved_sp - frameSize  (top of static frame). When
