@@ -1785,6 +1785,20 @@ const IR = (() => {
         }
     }
 
+    // RestoreStack: zero-result statement that restores the stack pointer
+    // to its function-entry value (i.e. discards everything any in-scope
+    // Alloca added). In a function with no frame, codegen emits nothing.
+    // Useful at points where the frontend wants to release alloca'd
+    // storage early — most importantly at the start of every catch
+    // handler, to keep alloca-in-loop-with-throw bounded.
+    // LINEAR — has SP side-effect.
+    class RestoreStack extends Expression {
+        constructor(loc) {
+            super(loc, [], [], 'LINEAR');
+            this._finalize();
+        }
+    }
+
     // FrameNode: a tree node representing a lexical scope's stack frame.
     // Built bottom-up at Block construction. `ownSlots` are slots claimed
     // directly at this scope (i.e. slots from non-Block descendants and
@@ -3729,6 +3743,7 @@ const IR = (() => {
         StackSlotAddr,
         Alloca,
         HeapBase,
+        RestoreStack,
         FrameNode,
         StructNew,
         StructNewDefault,
@@ -5129,6 +5144,13 @@ const CODEGEN = (() => {
                 return [0x41, ...encodeLEBS128(addr)]; // i32.const <addr>
             } else if (expr instanceof IR.HeapBase) {
                 return [0x41, ...encodeLEBS128(heapBaseAddr)]; // i32.const heap_base
+            } else if (expr instanceof IR.RestoreStack) {
+                // No-op when this function has no frame.
+                if (currentSavedSpIdx < 0) return [];
+                return [
+                    0x20, ...encodeLEBU128(currentSavedSpIdx), // local.get _saved_sp
+                    0x24, ...encodeLEBU128(stackPointerIndex), // global.set $sp
+                ];
             } else if (expr instanceof IR.StackSlotAddr) {
                 const off = slotOffsets.get(expr.slot);
                 assert(off !== undefined,

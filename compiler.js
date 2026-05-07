@@ -13894,6 +13894,9 @@ class Translator {
         stmts.push(new IR.Block(loc, ci.label, [inner]));
       }
       stmts.push(this.translateStmt(ci.cc.body));
+      // Discard any in-flight alloca regions before exiting the catch.
+      // RestoreStack is a no-op in functions without a frame.
+      stmts.push(new IR.RestoreStack(loc));
       stmts.push(new IR.Break(loc, endLabel, []));
       inner = new IR.Block(loc, Symbol(`catch${i}_wrap`), stmts);
     }
