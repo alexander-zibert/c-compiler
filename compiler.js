@@ -14428,7 +14428,11 @@ class Translator {
   _collectGlobals(units) {
     const { T, IR } = this.GUC;
 
-    // First pass: REGISTER-class globals.
+    // First pass: REGISTER-class globals — those with statically-
+    // evaluable inits become wasm globals; those with non-const inits
+    // (e.g. `int *p = &x;`) fall back to MEMORY-class storage so they
+    // can use initExprs.
+    const fallbackToMemory = new Set();
     for (const unit of units) {
       for (const v of unit.definedVariables) {
         const def = v.definition || v;
@@ -14436,14 +14440,17 @@ class Translator {
         if (def.storageClass === Types.StorageClass.EXTERN) continue;
         if (this.cGlobalToIR.has(def) || this.cGlobalToMb.has(def)) continue;
         if (def.allocClass === Types.AllocClass.REGISTER) {
-          this._defineRegisterGlobal(def);
+          if (!this._defineRegisterGlobal(def)) {
+            fallbackToMemory.add(def);
+          }
         }
       }
     }
 
-    // Second pass: MEMORY-class globals. Two-phase so that init exprs
-    // referencing &otherGlobal can find the other global's MB identity
-    // already in cGlobalToMb when we build the IR.MutableBytesAddr.
+    // Second pass: MEMORY-class globals + REGISTER fallbacks. Two-phase
+    // so that init exprs referencing &otherGlobal can find the other
+    // global's MB identity already in cGlobalToMb when we build the
+    // IR.MutableBytesAddr.
     //
     // Phase 2a: allocate every MB identity with empty initExprs.
     const memGlobals = []; // Array<{def, mb}>
@@ -14452,7 +14459,9 @@ class Translator {
         const def = v.definition || v;
         if (def !== v) continue;
         if (def.storageClass === Types.StorageClass.EXTERN) continue;
-        if (def.allocClass !== Types.AllocClass.MEMORY) continue;
+        const isMem = def.allocClass === Types.AllocClass.MEMORY ||
+                      fallbackToMemory.has(def);
+        if (!isMem) continue;
         if (this.cGlobalToMb.has(def)) continue;
         const sz = def.type.size || 1;
         const mb = new IR.MutableBytes(def.name, new Uint8Array(sz), []);
@@ -14536,7 +14545,7 @@ class Translator {
     if (!e) return null;
 
     // & ident
-    if (e.kind === Types.ExprKind.UNARY && e.op === 'OP_ADDR_OF') {
+    if (e.kind === Types.ExprKind.UNARY && e.op === 'OP_ADDR') {
       return this._addressIRForAddrOf(e.operand, loc);
     }
     // & expr + N or & expr - N
@@ -14580,7 +14589,7 @@ class Translator {
     }
     if (!cur) return null;
     const loc = cur.loc || fallbackLoc;
-    if (cur.kind === Types.ExprKind.UNARY && cur.op === 'OP_ADDR_OF') {
+    if (cur.kind === Types.ExprKind.UNARY && cur.op === 'OP_ADDR') {
       const ir = this._addressIRForAddrOf(cur.operand, loc);
       return ir ? { kind: 'addr', expr: ir } : null;
     }
@@ -14669,30 +14678,38 @@ class Translator {
     }
   }
 
+  // Returns true if the global was registered as a wasm GlobalVariable
+  // (statically-evaluable init); false if the caller should fall back
+  // to allocating a MutableBytes instead (because the init isn't a
+  // wasm const expression).
   _defineRegisterGlobal(def) {
     const { T, IR } = this.GUC;
     const loc = def.loc || Lexer.Loc.generated();
     const irT = this.cTypeToIR(def.type);
-    if (!irT) return; // void global doesn't make sense; skip
+    if (!irT) return false;
     const slot = irT.slotType || irT;
 
-    // Compile-time evaluate the init expression. For Phase 1: only INT/FLOAT
-    // literals, IMPLICIT_CASTs over them, and 0 default for missing init.
-    let initValue;
+    // Wasm globals can only be initialized with a "const expression"
+    // (i32.const / f32.const / ref.null / ref.func / global.get of an
+    // immutable imported global / struct.new on constants). Anything
+    // we can compile-time evaluate to a literal value qualifies.
+    let initValue = null;
     if (def.initExpr) {
       initValue = this._evalConstInit(def.initExpr, irT);
-      if (initValue === null) {
-        // Couldn't evaluate at compile time — emit zero-init and warn.
-        this.warnings.push(`global '${def.name}': non-constant init not yet supported, defaulting to 0`);
-        initValue = (slot === T.F32 || slot === T.F64) ? 0.0 : 0n;
-      }
     } else {
       initValue = (slot === T.F32 || slot === T.F64) ? 0.0 : 0n;
+    }
+    if (initValue === null) {
+      // Couldn't evaluate. Caller should allocate this as MutableBytes
+      // instead — that path supports initExprs which can encode
+      // address-of-global / __heap_base / etc.
+      return false;
     }
     const init = new IR.Literal(loc, irT, initValue);
     const isMutable = !(def.type.isConst && def.type.isConst());
     const g = new IR.GlobalVariable(loc, null, null, isMutable, def.name, irT, init);
     this.cGlobalToIR.set(def, g);
+    return true;
   }
 
   // Compile-time evaluate a constant initializer expression. Returns a BigInt
