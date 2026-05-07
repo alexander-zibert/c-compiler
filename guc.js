@@ -1785,12 +1785,20 @@ const IR = (() => {
         }
     }
 
-    // RestoreStack: zero-result statement that restores the stack pointer
-    // to its function-entry value (i.e. discards everything any in-scope
-    // Alloca added). In a function with no frame, codegen emits nothing.
-    // Useful at points where the frontend wants to release alloca'd
-    // storage early — most importantly at the start of every catch
-    // handler, to keep alloca-in-loop-with-throw bounded.
+    // RestoreStack: zero-result statement that resets the stack pointer
+    // to the POST-PROLOGUE value (top of the static frame, just above
+    // any space the function's StackSlots occupy). Discards in-flight
+    // Alloca allocations while keeping the static frame valid for
+    // subsequent code that addresses StackSlots.
+    //
+    // Concretely: emits `local.get \$_saved_sp; i32.const -frameSize;
+    // i32.add; global.set \$__stack_pointer`. In a function without a
+    // frame, codegen emits nothing.
+    //
+    // NOTE: this is NOT the same as the codegen-emitted return prefix,
+    // which restores all the way to function-entry SP (saved_sp itself).
+    // RestoreStack stops one frame short so StackSlots remain reachable.
+    //
     // LINEAR — has SP side-effect.
     class RestoreStack extends Expression {
         constructor(loc) {
@@ -3359,6 +3367,60 @@ const IR = (() => {
         }
     }
 
+    // TryCatch: a structured try/catch with one or more catch handlers,
+    // each optionally binding the exception's payload values to fresh
+    // locals before the handler body runs. NOT a wasm instruction — like
+    // TryFinally, this is a high-level frontend convenience that the
+    // `lowerTryCatch` IR pass desugars into TryTable + Block + SetVars +
+    // RestoreStack + Break before codegen.
+    //
+    // Why this exists: hand-rolled try/catch lowering has to remember to
+    // emit RestoreStack at every catch-handler entry so that allocas in
+    // the try body don't leak into the catch handler's stack space.
+    // TryCatch centralizes that detail.
+    //
+    // Args:
+    //   tryBody: Array<Expression> — statements in the try body. The
+    //     try body's value is discarded; result is always [].
+    //   catches: Array<{
+    //     kind: 'catch' | 'catch_all' | 'catch_ref' | 'catch_all_ref',
+    //     tag?: Tag,                     // required for 'catch'/'catch_ref'
+    //     bindings: Array<LocalVariable>,// optional; receives payload
+    //     body: Array<Expression>,       // handler body statements
+    //   }>
+    //
+    // Children flattening: this Expression's `children` is a flat array
+    // of [...tryBody, ...catches[0].body, ...catches[1].body, ...]. We
+    // record per-section lengths so `_withChildren` can split a
+    // walkIR-rebuilt children array back into its parts.
+    class TryCatch extends Expression {
+        constructor(loc, tryBody, catches) {
+            const allChildren = [...tryBody];
+            const catchLens = [];
+            for (const c of catches) {
+                catchLens.push(c.body.length);
+                allChildren.push(...c.body);
+            }
+            super(loc, [], allChildren, 'UNRESTRICTED');
+            this.tryBody = tryBody;
+            this.catches = catches;
+            this._tryLen = tryBody.length;
+            this._catchLens = catchLens;
+            this._finalize();
+        }
+        _withChildren(newChildren) {
+            const newTry = newChildren.slice(0, this._tryLen);
+            let cur = this._tryLen;
+            const newCatches = this.catches.map((c, i) => {
+                const len = this._catchLens[i];
+                const body = newChildren.slice(cur, cur + len);
+                cur += len;
+                return { ...c, body };
+            });
+            return new TryCatch(this.loc, newTry, newCatches);
+        }
+    }
+
     // ===================================================================
     // walkIR: generic IR Expression rewriter with identity preservation.
     //
@@ -3707,6 +3769,110 @@ const IR = (() => {
             program.dataInit);
     }
 
+    // lowerTryCatch: IR pass that desugars TryCatch into TryTable + Block
+    // tower with auto-injected RestoreStack at every catch handler entry.
+    //
+    // Each TryCatch becomes:
+    //   Block(end, [
+    //     Block(catch_wrap_N, [...
+    //       Block(catch_wrap_1, [...
+    //         Block(catch_wrap_0, [
+    //           SetVars(c0.bindings, [Block(c0.label, [TryTable(...)])])
+    //               OR Block(c0.label, [TryTable(...)])  if no bindings,
+    //           RestoreStack,           // <-- the value-add of TryCatch
+    //           c0.body...,
+    //           Break(end),
+    //         ])
+    //         c1.body... (with similar SetVars / RestoreStack wrap)
+    //       ])
+    //     ])
+    //   ])
+    //
+    // Where the TryTable lists every catch's label as a handler. The
+    // try body is wrapped with a Break(end) so normal flow exits past
+    // all catches.
+    function lowerTryCatch(program) {
+        let any = false;
+        for (const fn of program.functions) {
+            if (!fn.body) continue;
+            walkIR(fn.body, n => {
+                if (n instanceof TryCatch) any = true;
+                return undefined;
+            });
+            if (any) break;
+        }
+        if (!any) return program;
+
+        let labelId = 0;
+        const freshSym = (prefix) => Symbol(`${prefix}_${labelId++}`);
+
+        function lower(node) {
+            if (!(node instanceof TryCatch)) return undefined;
+            const tc = node;
+            const loc = tc.loc;
+            const endLabel = freshSym('tc_end');
+
+            // Per-catch label.
+            const catchLabels = tc.catches.map(() => freshSym('tc_catch'));
+
+            // Try body wrapped with explicit Break(end) so normal-completion
+            // of the try jumps past all catch handlers.
+            const tryBody = [...tc.tryBody, new Break(loc, endLabel, [])];
+            const tryCatches = tc.catches.map((c, i) => {
+                if (c.kind === 'catch' || c.kind === 'catch_ref') {
+                    return { kind: c.kind, tag: c.tag, label: catchLabels[i] };
+                }
+                return { kind: c.kind, label: catchLabels[i] };
+            });
+
+            let inner = new TryTable(loc, freshSym('tc_inner'), tryBody, tryCatches);
+
+            for (let i = tc.catches.length - 1; i >= 0; i--) {
+                const c = tc.catches[i];
+                const stmts = [];
+                const labeledBlock = new Block(loc, catchLabels[i], [inner]);
+                if (c.bindings && c.bindings.length > 0) {
+                    stmts.push(new SetVars(loc, c.bindings, [labeledBlock]));
+                } else {
+                    stmts.push(labeledBlock);
+                }
+                // Auto-injected at the start of every catch handler.
+                stmts.push(new RestoreStack(loc));
+                stmts.push(...c.body);
+                stmts.push(new Break(loc, endLabel, []));
+                inner = new Block(loc, freshSym('tc_wrap'), stmts);
+            }
+
+            return new Block(loc, endLabel, [inner]);
+        }
+
+        function lowerFunction(fn) {
+            if (!fn.body) return fn;
+            // Bottom-up: when we hit a TryCatch, lower its children first
+            // (handles nested TryCatch in tryBody / catch bodies), then
+            // desugar.
+            const visit = (n) => {
+                if (n instanceof TryCatch) {
+                    const newChildren = n.children.map(c => walkIR(c, visit));
+                    const updated = newChildren.every((nc, i) => nc === n.children[i])
+                        ? n
+                        : n._withChildren(newChildren);
+                    return lower(updated);
+                }
+                return undefined;
+            };
+            const walked = walkIR(fn.body, visit);
+            if (walked === fn.body) return fn;
+            return new Function(fn.loc, fn.importSpec, fn.exportSpec,
+                fn.name, fn.type, [...fn.params], [...fn.locals], walked);
+        }
+
+        const newFunctions = program.functions.map(lowerFunction);
+        return new Program(newFunctions, program.variables, program.memorySpec,
+            program.tables, program.elements, program.tags, program.customSections,
+            program.dataInit);
+    }
+
     return {
         Program,
         ImportSpec,
@@ -3780,9 +3946,11 @@ const IR = (() => {
         MultiValue,
         Block,
         IfElse,
+        TryCatch,
         walkIR,
         cloneIR,
         lowerTryFinally,
+        lowerTryCatch,
     };
 })();
 
@@ -4273,9 +4441,10 @@ const CODEGEN = (() => {
             const optOpts = options.optimize === true ? {} : options.optimize;
             program = OPTIMIZER.optimize(program, optOpts);
         }
-        // Run IR-level lowering passes first. lowerTryFinally is a no-op
-        // (returns the same Program) when no function contains TryFinally.
+        // Run IR-level lowering passes first. Each is a no-op (returns
+        // the same Program) when no function contains the relevant node.
         program = IR.lowerTryFinally(program);
+        program = IR.lowerTryCatch(program);
 
         const out = [];
 
@@ -5147,9 +5316,20 @@ const CODEGEN = (() => {
             } else if (expr instanceof IR.RestoreStack) {
                 // No-op when this function has no frame.
                 if (currentSavedSpIdx < 0) return [];
+                // sp = saved_sp - frameSize  (top of static frame). When
+                // the static frame is empty (frameSize == 0) but we're
+                // here for alloca cleanup, this becomes sp = saved_sp.
+                if (currentFrameSize === 0) {
+                    return [
+                        0x20, ...encodeLEBU128(currentSavedSpIdx),
+                        0x24, ...encodeLEBU128(stackPointerIndex),
+                    ];
+                }
                 return [
-                    0x20, ...encodeLEBU128(currentSavedSpIdx), // local.get _saved_sp
-                    0x24, ...encodeLEBU128(stackPointerIndex), // global.set $sp
+                    0x20, ...encodeLEBU128(currentSavedSpIdx),     // local.get _saved_sp
+                    0x41, ...encodeLEBS128(-currentFrameSize),     // i32.const -frameSize
+                    0x6A,                                           // i32.add
+                    0x24, ...encodeLEBU128(stackPointerIndex),     // global.set $sp
                 ];
             } else if (expr instanceof IR.StackSlotAddr) {
                 const off = slotOffsets.get(expr.slot);

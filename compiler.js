@@ -13830,78 +13830,38 @@ class Translator {
   // - C1 fires: TryTable jumps to c1_label, payload as Block result. Inner
   //   SetVars binds p1_locals, H1 runs (its Break(end_label) bypasses H0).
   _lowerTryCatch(stmt, loc) {
-    const { T, IR } = this.GUC;
+    const { IR } = this.GUC;
     const tc = stmt;
-    const endLabel = Symbol('try_end');
 
-    // SP rollback on catch is now codegen's job at function return —
-    // intra-function leaks from in-flight allocas are bounded by the
-    // function's lifetime.
-
-    // Resolve catch info up front (so binding locals exist before we
-    // translate catch bodies, which reference them).
-    const catchInfos = [];
+    // Build the per-catch info, allocating binding locals up front (so
+    // catch bodies can reference them when we translate).
+    const catches = [];
     for (const cc of tc.catches) {
-      const label = Symbol(`catch_${cc.tag ? cc.tag.name : 'all'}`);
-      const bindingLocals = [];
-      let kind, irTag = null;
+      const bindings = [];
+      let kind, tag;
       if (!cc.tag) {
         kind = 'catch_all';
       } else {
         kind = 'catch';
-        irTag = this._resolveExceptionTag(cc.tag);
+        tag = this._resolveExceptionTag(cc.tag);
         for (const bv of (cc.bindingVars || [])) {
           const lv = new IR.LocalVariable(loc, true, bv.name, this.cTypeToIR(bv.type));
           this.extraLocals.push(lv);
           this.cVarToLocal.set(bv, lv);
-          bindingLocals.push(lv);
+          bindings.push(lv);
         }
       }
-      catchInfos.push({ cc, label, kind, irTag, bindingLocals });
+      const body = [this.translateStmt(cc.body)];
+      catches.push({ kind, tag, bindings, body });
     }
 
-    // Build the try body and TryTable.
-    const tryBodyIR = this.translateStmt(tc.tryBody);
-    const tryBody = [
-      tryBodyIR,
-      new IR.Break(loc, endLabel, []),
-    ];
-    const tryCatches = catchInfos.map(ci =>
-      ci.irTag
-        ? { kind: ci.kind, tag: ci.irTag, label: ci.label }
-        : { kind: ci.kind, label: ci.label }
-    );
-    let inner = new IR.TryTable(loc, Symbol('_try_inner'), tryBody, tryCatches);
+    const tryBody = [this.translateStmt(tc.tryBody)];
 
-    // Wrap from innermost outward — for each catch (reversed):
-    //   stmts := [
-    //     <bind>: SetVars(bindings, [Block(label, [inner])])
-    //             OR just Block(label, [inner]) if no bindings,
-    //     SetVars(sp, [GetVars(savedSp)]),  // restore SP
-    //     <translated catch body>,
-    //     Break(end_label),
-    //   ]
-    //   inner := Block(<wrapper>, stmts)
-    for (let i = catchInfos.length - 1; i >= 0; i--) {
-      const ci = catchInfos[i];
-      const stmts = [];
-      if (ci.bindingLocals.length > 0) {
-        stmts.push(new IR.SetVars(loc, ci.bindingLocals,
-          [new IR.Block(loc, ci.label, [inner])]));
-      } else {
-        // catch_all or catch with empty params: Block produces []. Just
-        // include it as a statement.
-        stmts.push(new IR.Block(loc, ci.label, [inner]));
-      }
-      stmts.push(this.translateStmt(ci.cc.body));
-      // Discard any in-flight alloca regions before exiting the catch.
-      // RestoreStack is a no-op in functions without a frame.
-      stmts.push(new IR.RestoreStack(loc));
-      stmts.push(new IR.Break(loc, endLabel, []));
-      inner = new IR.Block(loc, Symbol(`catch${i}_wrap`), stmts);
-    }
-
-    return new IR.Block(loc, endLabel, [inner]);
+    // IR.TryCatch desugars (in lowerTryCatch IR pass at codegen time)
+    // into TryTable + Block tower with auto-injected RestoreStack at
+    // every catch handler entry. We don't have to emit RestoreStack
+    // manually anymore.
+    return new IR.TryCatch(loc, tryBody, catches);
   }
 
   // Lower a C switch statement to nested labeled Blocks. We use a br_if
