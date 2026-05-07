@@ -14970,8 +14970,14 @@ class Translator {
     } else if (v.kind === "float") {
       if (slotIsFloat) return v.floatVal;
       intVal = BigInt(Math.trunc(v.floatVal));
+    } else if (v.kind === "addr") {
+      // NULL_ADDR_POLICY can only produce non-zero addresses via &((T*)0)->m
+      // patterns (offsetof) or address arithmetic on a 0 base — the addrVal
+      // is a known compile-time integer offset, so write it as the integer
+      // bytes for an integer slot. For float slots there is no sane meaning.
+      if (slotIsFloat) return null;
+      intVal = BigInt(v.addrVal);
     } else {
-      // addr — never produced under NULL_ADDR_POLICY.
       return null;
     }
     // Normalize to the IR type's representable range. guc.js validates that
