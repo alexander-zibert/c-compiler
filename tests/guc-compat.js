@@ -357,6 +357,107 @@ T('switch-fallthrough',
   + 'return s; }',
   '', 6); // 1 falls through 2, then 3, then break: 1+2+3=6
 
+// ===== Globals =====
+T('global-scalar',
+  'int g = 42; int main(void) { return g; }',
+  '', 42);
+
+T('global-modify',
+  'int g = 0; void inc(void) { g = g + 1; } '
+  + 'int main(void) { inc(); inc(); inc(); return g; }',
+  '', 3);
+
+T('global-uninit',
+  'int g; int main(void) { g = 7; return g; }',
+  '', 7);
+
+// ===== Variadic definitions =====
+T('vardef-simple',
+  '#include <stdarg.h>\n'
+  + 'int sum(int n, ...) { va_list ap; va_start(ap, n); '
+  + 'int s = 0; for (int i = 0; i < n; ++i) s += va_arg(ap, int); va_end(ap); return s; } '
+  + 'int main(void) { return sum(3, 10, 20, 30); }',
+  '', 60);
+
+T('vardef-mixed-fixed',
+  '#include <stdarg.h>\n'
+  + 'int sum_after(int base, int n, ...) { va_list ap; va_start(ap, n); '
+  + 'int s = base; for (int i = 0; i < n; ++i) s += va_arg(ap, int); va_end(ap); return s; } '
+  + 'int main(void) { return sum_after(1, 3, 5, 10, 20); }',
+  '', 36);  // 1 + 5+10+20 = 36
+
+// ===== Ternary =====
+T('ternary-simple',
+  'int max(int a, int b) { return a > b ? a : b; } '
+  + 'int main(void) { return max(7, 3) + max(2, 9); }',
+  '', 16);
+
+// ===== sizeof =====
+T('sizeof-int',
+  'int main(void) { return sizeof(int); }',
+  '', 4);
+
+T('sizeof-array',
+  'int main(void) { int a[7]; return sizeof(a) / sizeof(a[0]); }',
+  '', 7);
+
+// ===== alloca =====
+T('alloca-basic',
+  '#include <alloca.h>\n'
+  + 'int main(void) { int *p = (int*)alloca(sizeof(int) * 4); '
+  + 'p[0] = 1; p[1] = 2; p[2] = 4; p[3] = 8; '
+  + 'return p[0] + p[1] + p[2] + p[3]; }',
+  '', 15);
+
+// ===== printf =====
+T('printf-hello',
+  '#include <stdio.h>\nint main(void){ printf("hello\\n"); return 0; }',
+  'hello\n', 0);
+
+T('printf-int',
+  '#include <stdio.h>\nint main(void){ printf("answer=%d\\n", 42); return 0; }',
+  'answer=42\n', 0);
+
+T('printf-multiple',
+  '#include <stdio.h>\nint main(void){ printf("%d %d %d\\n", 1, 22, 333); return 0; }',
+  '1 22 333\n', 0);
+
+T('printf-string',
+  '#include <stdio.h>\nint main(void){ printf("%s, %s!\\n", "hello", "world"); return 0; }',
+  'hello, world!\n', 0);
+
+T('printf-loop',
+  '#include <stdio.h>\nint main(void){ for(int i=0;i<3;++i) printf("%d\\n", i); return 0; }',
+  '0\n1\n2\n', 0);
+
+// ===== Function pointers =====
+T('fnptr-call',
+  'int add(int a, int b) { return a + b; } '
+  + 'int sub(int a, int b) { return a - b; } '
+  + 'int main(void) { int (*op)(int, int) = add; int x = op(10, 3); op = sub; return x + op(10, 3); }',
+  '', 20); // 13 + 7
+
+T('fnptr-pass',
+  'int apply(int (*f)(int), int x) { return f(x); } '
+  + 'int sq(int x) { return x * x; } '
+  + 'int main(void) { return apply(sq, 7); }',
+  '', 49);
+
+T('fnptr-array',
+  'int add(int a, int b) { return a + b; } '
+  + 'int mul(int a, int b) { return a * b; } '
+  + 'int main(void) { int (*ops[2])(int, int) = { add, mul }; '
+  + 'return ops[0](2, 3) + ops[1](2, 3); }',
+  '', 11);
+
+T('qsort-via-fnptr',
+  '#include <stdio.h>\n#include <stdlib.h>\n'
+  + 'static int cmp(const void *a, const void *b) { return *(const int*)a - *(const int*)b; } '
+  + 'int main(void) { int xs[] = {5,2,9,1,7}; '
+  + 'qsort(xs, 5, sizeof(int), cmp); '
+  + 'for (int i = 0; i < 5; ++i) printf("%d ", xs[i]); printf("\\n"); return 0; }',
+  '1 2 5 7 9 \n', 0);
+
 // =========== summary ===========
 
 console.log(`\n${pass}/${pass + fail} passed${skip ? `, ${skip} skipped` : ''}${fail ? `, ${fail} failed` : ''}`);

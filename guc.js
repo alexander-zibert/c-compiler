@@ -685,7 +685,11 @@ const IR = (() => {
         //   after the data section, in array order. The frontend is responsible
         //   for the payload bytes; codegen just frames them with the standard
         //   custom-section header (length-prefixed UTF-8 name + raw payload).
-        constructor(functions, variables, memorySpec, tables, elements, tags, customSections) {
+        // dataInit — Uint8Array | number[], optional. User-supplied initial
+        //   linear-memory contents starting at memorySpec.staticDataBase.
+        //   BytesLiterals are laid out after this region. Use this for things
+        //   like global-variable initializers.
+        constructor(functions, variables, memorySpec, tables, elements, tags, customSections, dataInit) {
             this.functions = functions;
             this.variables = variables;
             this.memorySpec = memorySpec || null;
@@ -693,6 +697,7 @@ const IR = (() => {
             this.elements = elements || [];
             this.tags = tags || [];
             this.customSections = customSections || [];
+            this.dataInit = dataInit ? new Uint8Array(dataInit) : null;
             Object.freeze(this.functions);
             Object.freeze(this.variables);
             Object.freeze(this.tables);
@@ -3361,7 +3366,8 @@ const IR = (() => {
 
         const newFunctions = program.functions.map(lowerFunction);
         return new Program(newFunctions, program.variables, program.memorySpec,
-            program.tables, program.elements, program.tags, program.customSections);
+            program.tables, program.elements, program.tags, program.customSections,
+            program.dataInit);
     }
 
     return {
@@ -3603,6 +3609,8 @@ const CODEGEN = (() => {
         // Lay out BytesLiterals in linear memory. Dedupe by content (so
         // repeated identical blobs share a single data segment) and assign
         // each unique blob an address starting at `staticDataBase`.
+        // If `program.dataInit` is set, that user-supplied initial blob is
+        // placed at `staticDataBase` first; BytesLiterals follow.
         const memorySpec = program.memorySpec;
         const staticDataBase = (memorySpec && memorySpec.staticDataBase) || 0;
         const dataSegments = []; // [{ offset, bytes }]
@@ -3610,6 +3618,10 @@ const CODEGEN = (() => {
         if (memorySpec) {
             const byContentKey = new Map(); // content key -> address
             let cursor = staticDataBase;
+            if (program.dataInit && program.dataInit.length > 0) {
+                dataSegments.push({ offset: staticDataBase, bytes: program.dataInit });
+                cursor += program.dataInit.length;
+            }
             for (const func of definedFunctions) {
                 if (!func.body) continue;
                 for (const bl of func.body.bytesLiterals) {
