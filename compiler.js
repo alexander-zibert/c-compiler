@@ -2671,8 +2671,11 @@ class Expr {
       super(returnType);
       this.callee = callee;
       this.arguments = args;
-      this.funcDecl = (callee instanceof EIdent && callee.decl instanceof DFunc)
-        ? callee.decl : null;
+      // Look through EDecay so direct calls to a function name still
+      // resolve to a DFunc decl (vs. an indirect call through a pointer).
+      const inner = callee instanceof EDecay ? callee.operand : callee;
+      this.funcDecl = (inner instanceof EIdent && inner.decl instanceof DFunc)
+        ? inner.decl : null;
       Object.seal(this);
     }
   }
@@ -2722,6 +2725,17 @@ class Expr {
   }
   class EImplicitCast extends Expr {
     constructor(type, expr) { super(type); this.expr = expr; Object.seal(this); }
+  }
+  // Array→pointer or function→pointer decay. The operand has array or
+  // function type; the EDecay node has the corresponding decayed pointer type.
+  // Codegen for EDecay just emits the operand (which already produces the
+  // base address for arrays / table index for functions).
+  class EDecay extends Expr {
+    constructor(type, operand) {
+      super(type);
+      this.operand = operand;
+      Object.seal(this);
+    }
   }
   class EGCNew extends Expr {
     constructor(type, args) { super(type); this.args = args; Object.seal(this); }
@@ -2807,7 +2821,7 @@ return {
   EInt, EFloat, EString, EIdent, EBinary, EUnary, ETernary, ECall,
   ESubscript, EMember, EArrow, ECast, ESizeofExpr, ESizeofType,
   EAlignofExpr, EAlignofType, EComma, EInitList, EIntrinsic, EWasm,
-  ECompoundLiteral, EImplicitCast, EGCNew,
+  ECompoundLiteral, EImplicitCast, EDecay, EGCNew,
   SExpr, SDecl, SCompound, SIf, SWhile, SDoWhile, SFor,
   SBreak, SContinue, SReturn, SSwitch, SGoto, SLabel, SEmpty,
   STryCatch, SThrow,
@@ -3012,6 +3026,10 @@ function dumpExpr(expr, ctx, indent) {
     case AST.EImplicitCast:
       ret += "IMPLICIT_CAST " + expr.type.toString();
       ret += dumpExpr(expr.expr, ctx, indent + 1);
+      break;
+    case AST.EDecay:
+      ret += "DECAY " + expr.type.toString();
+      ret += dumpExpr(expr.operand, ctx, indent + 1);
       break;
     case AST.ESizeofExpr:
       ret += "SIZEOF_EXPR";
@@ -4749,7 +4767,7 @@ class Parser {
           else this.currentParsingFunc.compoundLiterals.push(cl);
           return cl;
         }
-        return new AST.ECast(castType, castType, expr);
+        return new AST.ECast(castType, castType, maybeDecay(expr));
       }
       // Regular parenthesized expression
       this.pos = saved;
@@ -5532,10 +5550,12 @@ class Parser {
     }
     if (this.matchText("*")) {
       const tok = this.peek(-1);
-      const e = this.parseCastExpression();
+      let e = this.parseCastExpression();
       if (e.type && e.type.removeQualifiers().isRef()) {
         this.error(tok, `unary '*' on reference type '${e.type.toString()}' is not allowed (use '->' for fields, or just access the ref directly)`);
       }
+      // *arr is *(decay(arr)) — array operand decays to pointer first.
+      e = maybeDecay(e);
       return new AST.EUnary(Types.computeUnaryType("OP_DEREF", e.type), "OP_DEREF", e);
     }
     if (this.matchText("+")) {
@@ -5620,7 +5640,9 @@ class Parser {
             }
             this.error(this.peek(-1), "Cannot cast to or from a reference type; use __cast(T, x) (or __ref_cast for GC ref downcast)");
           }
-          return new AST.ECast(castType, castType, expr);
+          // Decay array/function operand before the cast — (T*)arr is
+          // really (T*)(decay(arr)).
+          return new AST.ECast(castType, castType, maybeDecay(expr));
         }
       }
       this.pos = saved;
@@ -5642,11 +5664,9 @@ class Parser {
         this.expect(")");
 
         // Decay arrays/functions, then if the callee resolves to a function
-        // type extract its FunctionType for argument-validation below. (The
-        // ECall constructor does its own decay to derive the result type;
-        // this is just for the local arg-check pass.)
+        // type extract its FunctionType for argument-validation below.
+        expr = maybeDecay(expr);
         let calleeType = expr.type;
-        if (calleeType.kind === Types.TypeKind.ARRAY || calleeType.kind === Types.TypeKind.FUNCTION) calleeType = calleeType.decay();
         let calleeFuncType = null;
         if (calleeType.kind === Types.TypeKind.POINTER && calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
           calleeFuncType = calleeType.baseType;
@@ -5669,6 +5689,9 @@ class Parser {
           }
         }
 
+        // Decay all array/function-typed arguments first; pointer-typed
+        // params and varargs alike receive pointer values, never arrays.
+        for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
         // Insert implicit casts on arguments. Mirrors the older annotateExpr
         // post-pass for ECall: fixed args wrap to their parameter type;
         // variadic args undergo float→double default-argument promotion.
@@ -5711,7 +5734,9 @@ class Parser {
         else if (baseUt.isRef()) {
           this.error(this.peek(-1), `subscript '[]' on reference type '${expr.type.toString()}' is not allowed (use __array(T) for indexable GC storage)`);
         }
-        expr = new AST.ESubscript(elemType, expr, index);
+        // GC arrays don't decay; keep them as the array operand.
+        const arrayOperand = baseUt.kind === Types.TypeKind.GC_ARRAY ? expr : maybeDecay(expr);
+        expr = new AST.ESubscript(elemType, arrayOperand, index);
         continue;
       }
       if (this.matchText(".")) {
@@ -5905,6 +5930,10 @@ class Parser {
         let thenExpr = this.parseExpression();
         this.expect(":");
         let elseExpr = this.parseBinaryExpression(3);
+        // Decay array/function-typed branches; ternary results are
+        // always pointer-typed (or scalar/aggregate).
+        thenExpr = maybeDecay(thenExpr);
+        elseExpr = maybeDecay(elseExpr);
         const resType = this.computeTernaryType(thenExpr.type, elseExpr.type);
         // Both branches must produce the same type — wrap each in an
         // implicit cast to resType when needed.
@@ -5972,6 +6001,12 @@ class Parser {
            bop === "BOR_ASSIGN")) {
         this.error(opTok, `'${op}' on reference type is not allowed`);
       }
+      // Decay an array/function rhs of a plain assignment to a pointer-typed
+      // lhs (e.g. `p = arr`). Compound assignments use integer rhs so don't
+      // apply here.
+      if (bop === "ASSIGN" && left.type.isPointer()) {
+        right = maybeDecay(right);
+      }
       // Apply C99 6.3.1.1 integer promotions for bitfield operands
       const resType = this.computeBinaryType(bop, this.promoteExprType(left), this.promoteExprType(right));
 
@@ -6000,6 +6035,12 @@ class Parser {
             : resType;
           left = maybeImplicitCast(left, opType);
           right = maybeImplicitCast(right, opType);
+        }
+        // Decay array operands in pointer arithmetic and comparisons so
+        // the AST carries pointer types, not array types.
+        if (isPtrArith) {
+          left = maybeDecay(left);
+          right = maybeDecay(right);
         }
       }
 
@@ -6211,6 +6252,8 @@ class Parser {
       if (this.matchText(";")) return new AST.SReturn(null);
       let expr = this.parseExpression();
       this.expect(";");
+      // Decay array/function before any return-type adjustment.
+      expr = maybeDecay(expr);
       // Forbid implicit int→ref on return (use __ref_null(T) instead).
       if (this.currentParsingFunc) {
         const retType = this.currentParsingFunc.type.getReturnType();
@@ -6332,6 +6375,8 @@ class Parser {
       this.expect(")");
       this.expect(";");
       const tag = this.findExceptionTag(tagName);
+      // Decay array/function-typed throw args; tag params are pointer types.
+      for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
       // Insert implicit casts on args matching the tag's parameter types
       // (when known). Unresolved tag names skip this — the diagnostic for
       // unknown tags fires later via {name: tagName}.
@@ -6520,6 +6565,8 @@ class Parser {
         // handle conversion per-element via normalizeInitList.
         if (dvar.initExpr && !type.isAggregate() &&
             !(dvar.initExpr instanceof AST.EInitList)) {
+          // Initializing a pointer from an array/function decays first.
+          if (type.isPointer()) dvar.initExpr = maybeDecay(dvar.initExpr);
           dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
         }
       }
@@ -6801,6 +6848,8 @@ class Parser {
         // handle conversion per-element via normalizeInitList.
         if (dvar.initExpr && !type.isAggregate() &&
             !(dvar.initExpr instanceof AST.EInitList)) {
+          // Initializing a pointer from an array/function decays first.
+          if (type.isPointer()) dvar.initExpr = maybeDecay(dvar.initExpr);
           dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
         }
       }
@@ -7134,12 +7183,25 @@ function maybeImplicitCast(expr, targetType) {
   return new AST.EImplicitCast(targetType, expr);
 }
 
+// Wrap an expression in EDecay if its type is array or function.
+// Pass-through otherwise. Used at every C-standard decay site:
+// subscript array operand, pointer arithmetic operands, call callee +
+// arguments, dereference operand, ternary branches, cast operand,
+// initialization/assignment/return/throw to a pointer-typed target.
+function maybeDecay(expr) {
+  const t = expr.type;
+  if (t.isArray() || t.isFunction()) return new AST.EDecay(t.decay(), expr);
+  return expr;
+}
+
 // ========== setjmp/longjmp lowering ==========
 
 // Check if an expression is a call to a named function, return the ECall or null
 function getNamedCall(expr, name) {
   if (!(expr instanceof AST.ECall)) return null;
-  const callee = expr.callee;
+  // Look through the function-decay wrapper around a direct callee.
+  let callee = expr.callee;
+  if (callee instanceof AST.EDecay) callee = callee.operand;
   if (!(callee instanceof AST.EIdent)) return null;
   if (callee.name !== name) return null;
   return expr;
@@ -8506,6 +8568,9 @@ const NULL_ADDR_POLICY = {
 
 function constEvalAddr(expr, policy) {
   if (!expr) return null;
+  // Decay wraps an array/function lvalue with the decayed pointer type;
+  // its address-of value is the operand's base address.
+  if (expr instanceof AST.EDecay) return constEvalAddr(expr.operand, policy);
   // Cast from integer to pointer: (type*)intval
   if (expr instanceof AST.ECast || expr instanceof AST.EImplicitCast) {
     const inner = constEvalExpr(expr.expr, policy);
@@ -8762,6 +8827,7 @@ function constEvalExpr(expr, policy) {
       if (addr !== null && addr !== undefined) return { kind: "addr", addrVal: addr };
       return null;
     }
+    case AST.EDecay: return constEvalExpr(expr.operand, policy);
     default: return null;
   }
 }
@@ -11032,6 +11098,13 @@ class CodeGenerator {
         if (ctx === EXPR_DROP) { this.emitExpr(expr.expr, EXPR_DROP); return; }
         this.emitExpr(expr.expr);
         this.emitConversion(expr.expr.type, expr.type, expr.expr);
+        break;
+      }
+      case AST.EDecay: {
+        // Operand has array or function type; emitting it produces the
+        // base address (for arrays) or table index (for functions), which
+        // is exactly the decayed pointer value.
+        this.emitExpr(expr.operand, ctx);
         break;
       }
       case AST.ECast: {
