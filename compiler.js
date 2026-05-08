@@ -5898,7 +5898,7 @@ class Parser {
       }
 
       const nextMinPrec = this.isRightAssociative(op) ? prec : prec + 1;
-      const right = this.parseBinaryExpression(nextMinPrec);
+      let right = this.parseBinaryExpression(nextMinPrec);
       const bop = this.textToBop(op);
       if (this.warningFlags.pointerDecay && (bop === "ADD" || bop === "SUB")) {
         if ((left.type.isArray() && right.type.isInteger()) ||
@@ -5946,6 +5946,35 @@ class Parser {
       }
       // Apply C99 6.3.1.1 integer promotions for bitfield operands
       const resType = this.computeBinaryType(bop, this.promoteExprType(left), this.promoteExprType(right));
+
+      // Insert implicit casts on operands. Mirrors what the older
+      // annotateExpr post-pass did for EBinary: wrap each operand to the
+      // common operation type. Skipped for:
+      //   - assignment ops (handled by lvalue context, not arithmetic)
+      //   - logical && / || (boolean coercion is per-operand, not common)
+      //   - pointer arithmetic ADD/SUB (operand types are deliberately mixed)
+      //   - ref-typed operands (== / != on refs is identity, no conversion)
+      if (!(bop === "ASSIGN" || bop.endsWith("_ASSIGN")) &&
+          bop !== "LAND" && bop !== "LOR") {
+        const leftType = left.type;
+        const rightType = right.type;
+        const isPtrArith = (bop === "ADD" || bop === "SUB") &&
+          (leftType.isPointer() || rightType.isPointer() ||
+           leftType.isArray() || rightType.isArray());
+        const involvesRef = leftType.removeQualifiers().isRef() ||
+                            rightType.removeQualifiers().isRef();
+        if (!isPtrArith && !involvesRef) {
+          const isComparison = bop === "EQ" || bop === "NE" ||
+                               bop === "LT" || bop === "GT" ||
+                               bop === "LE" || bop === "GE";
+          const opType = isComparison
+            ? Types.usualArithmeticConversions(leftType, rightType)
+            : resType;
+          left = maybeImplicitCast(left, opType);
+          right = maybeImplicitCast(right, opType);
+        }
+      }
+
       left = new AST.EBinary(resType, bop, left, right);
     }
     return left;
@@ -7051,26 +7080,25 @@ function wrapImplicitCast(expr, targetType, setter) {
   setter(new AST.EImplicitCast(targetType, expr));
 }
 
+// Inline-friendly: returns the (possibly wrapped) expression. Used by the
+// parser to insert implicit casts at construction time, while
+// wrapImplicitCast is kept for the older post-pass annotation walker.
+function maybeImplicitCast(expr, targetType) {
+  targetType = targetType.removeQualifiers();
+  const srcType = expr.type.removeQualifiers();
+  if (srcType === targetType) return expr;
+  if (targetType.isVoid() || srcType.isVoid()) return expr;
+  return new AST.EImplicitCast(targetType, expr);
+}
+
 function annotateExpr(expr) {
   if (!expr) return;
   if (expr instanceof AST.EBinary) {
+    // BinOp implicit casts are inserted inline at parse time by
+    // parseBinaryExpression; just recurse into operands here for any
+    // remaining post-pass work on nested expressions.
     annotateExpr(expr.left);
     annotateExpr(expr.right);
-    // Skip assignment ops
-    if (expr.op === "ASSIGN" || expr.op.endsWith("_ASSIGN")) return;
-    // Skip logical ops
-    if (expr.op === "LAND" || expr.op === "LOR") return;
-    const leftType = expr.left.type;
-    const rightType = expr.right.type;
-    // Skip pointer/array arithmetic
-    if ((expr.op === "ADD" || expr.op === "SUB") &&
-        (leftType.isPointer() || rightType.isPointer() ||
-         leftType.isArray() || rightType.isArray())) return;
-    if (leftType.removeQualifiers().isRef() || rightType.removeQualifiers().isRef()) return;
-    const isComparison = ["EQ","NE","LT","GT","LE","GE"].includes(expr.op);
-    const opType = isComparison ? Types.usualArithmeticConversions(leftType, rightType) : expr.type;
-    wrapImplicitCast(expr.left, opType, (e) => { expr.left = e; });
-    wrapImplicitCast(expr.right, opType, (e) => { expr.right = e; });
     return;
   }
   if (expr instanceof AST.ECall) {
