@@ -2736,17 +2736,6 @@ class Expr {
       Object.seal(this);
     }
   }
-  // Lvalue→rvalue conversion: read the value at an lvalue. Wraps an lvalue
-  // expression (EIdent, EMember, EArrow, ESubscript, *ptr) when it appears
-  // in a context that consumes its value rather than its address. The type
-  // is the operand's type — loading an lvalue doesn't change the type.
-  class ELValueLoad extends Expr {
-    constructor(operand) {
-      super(operand.type);
-      this.operand = operand;
-      Object.seal(this);
-    }
-  }
   class EGCNew extends Expr {
     constructor(type, args) { super(type); this.args = args; Object.seal(this); }
   }
@@ -2831,7 +2820,7 @@ return {
   EInt, EFloat, EString, EIdent, EBinary, EUnary, ETernary, ECall,
   ESubscript, EMember, EArrow, ECast, ESizeofExpr, ESizeofType,
   EAlignofExpr, EAlignofType, EComma, EInitList, EIntrinsic, EWasm,
-  ECompoundLiteral, EImplicitCast, EDecay, ELValueLoad, EGCNew,
+  ECompoundLiteral, EImplicitCast, EDecay, EGCNew,
   SExpr, SDecl, SCompound, SIf, SWhile, SDoWhile, SFor,
   SBreak, SContinue, SReturn, SSwitch, SGoto, SLabel, SEmpty,
   STryCatch, SThrow,
@@ -3039,10 +3028,6 @@ function dumpExpr(expr, ctx, indent) {
       break;
     case AST.EDecay:
       ret += "DECAY " + expr.type.toString();
-      ret += dumpExpr(expr.operand, ctx, indent + 1);
-      break;
-    case AST.ELValueLoad:
-      ret += "LVALUE_LOAD " + expr.type.toString();
       ret += dumpExpr(expr.operand, ctx, indent + 1);
       break;
     case AST.ESizeofExpr:
@@ -3480,7 +3465,6 @@ function constEvalInt(expr) {
     case AST.EImplicitCast: {
       return constEvalInt(expr.expr);
     }
-    case AST.ELValueLoad: return constEvalInt(expr.operand);
     case AST.ETernary: {
       const c = constEvalInt(expr.condition);
       if (c === null) return null;
@@ -4782,7 +4766,7 @@ class Parser {
           else this.currentParsingFunc.compoundLiterals.push(cl);
           return cl;
         }
-        return new AST.ECast(castType, castType, maybeDecay(maybeLoad(expr)));
+        return new AST.ECast(castType, castType, maybeDecay(expr));
       }
       // Regular parenthesized expression
       this.pos = saved;
@@ -5476,9 +5460,6 @@ class Parser {
     if (expr instanceof AST.EImplicitCast || expr instanceof AST.ECast) {
       return this._isNullPointerConstant(expr.expr);
     }
-    if (expr instanceof AST.ELValueLoad) {
-      return this._isNullPointerConstant(expr.operand);
-    }
     return false;
   }
   _rejectNonZeroToRef(targetType, expr, tok) {
@@ -5572,35 +5553,31 @@ class Parser {
       if (e.type && e.type.removeQualifiers().isRef()) {
         this.error(tok, `unary '*' on reference type '${e.type.toString()}' is not allowed (use '->' for fields, or just access the ref directly)`);
       }
-      // *p reads p (lvalue→rvalue), then decays array/function operands.
-      e = maybeDecay(maybeLoad(e));
+      // *arr is *(decay(arr)) — array operand decays to pointer first.
+      e = maybeDecay(e);
       return new AST.EUnary(Types.computeUnaryType("OP_DEREF", e.type), "OP_DEREF", e);
     }
     if (this.matchText("+")) {
       const tok = this.peek(-1);
-      let e = this.parseCastExpression();
+      const e = this.parseCastExpression();
       if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '+' on reference type is not allowed`);
-      e = maybeLoad(e);
       return new AST.EUnary(Types.computeUnaryType("OP_POS", e.type), "OP_POS", e);
     }
     if (this.matchText("-")) {
       const tok = this.peek(-1);
-      let e = this.parseCastExpression();
+      const e = this.parseCastExpression();
       if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '-' on reference type is not allowed`);
-      e = maybeLoad(e);
       return new AST.EUnary(Types.computeUnaryType("OP_NEG", e.type), "OP_NEG", e);
     }
     if (this.matchText("~")) {
       const tok = this.peek(-1);
-      let e = this.parseCastExpression();
+      const e = this.parseCastExpression();
       if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '~' on reference type is not allowed`);
-      e = maybeLoad(e);
       return new AST.EUnary(Types.computeUnaryType("OP_BNOT", e.type), "OP_BNOT", e);
     }
     if (this.matchText("!")) {
-      let e = this.parseCastExpression();
+      const e = this.parseCastExpression();
       // `!ref` is equivalent to __ref_is_null(ref). Allowed as sugar.
-      e = maybeLoad(e);
       return new AST.EUnary(Types.computeUnaryType("OP_LNOT", e.type), "OP_LNOT", e);
     }
 
@@ -5662,8 +5639,9 @@ class Parser {
             }
             this.error(this.peek(-1), "Cannot cast to or from a reference type; use __cast(T, x) (or __ref_cast for GC ref downcast)");
           }
-          // Load lvalue, decay array/function, then cast.
-          return new AST.ECast(castType, castType, maybeDecay(maybeLoad(expr)));
+          // Decay array/function operand before the cast — (T*)arr is
+          // really (T*)(decay(arr)).
+          return new AST.ECast(castType, castType, maybeDecay(expr));
         }
       }
       this.pos = saved;
@@ -5684,9 +5662,9 @@ class Parser {
         }
         this.expect(")");
 
-        // Load lvalue callee (e.g., a function-pointer var) then decay
-        // arrays/functions. After this expr's type is a function pointer.
-        expr = maybeDecay(maybeLoad(expr));
+        // Decay arrays/functions, then if the callee resolves to a function
+        // type extract its FunctionType for argument-validation below.
+        expr = maybeDecay(expr);
         let calleeType = expr.type;
         let calleeFuncType = null;
         if (calleeType.kind === Types.TypeKind.POINTER && calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
@@ -5710,9 +5688,9 @@ class Parser {
           }
         }
 
-        // Load lvalue args, then decay array/function-typed values.
-        // Pointer-typed params and varargs receive rvalues only.
-        for (let i = 0; i < args.length; i++) args[i] = maybeDecay(maybeLoad(args[i]));
+        // Decay all array/function-typed arguments first; pointer-typed
+        // params and varargs alike receive pointer values, never arrays.
+        for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
         // Insert implicit casts on arguments. Mirrors the older annotateExpr
         // post-pass for ECall: fixed args wrap to their parameter type;
         // variadic args undergo float→double default-argument promotion.
@@ -5741,7 +5719,7 @@ class Parser {
         continue;
       }
       if (this.matchText("[")) {
-        let index = this.parseExpression();
+        const index = this.parseExpression();
         this.expect("]");
         const baseUt = expr.type.removeQualifiers();
         const idxUt = index.type.removeQualifiers();
@@ -5755,11 +5733,8 @@ class Parser {
         else if (baseUt.isRef()) {
           this.error(this.peek(-1), `subscript '[]' on reference type '${expr.type.toString()}' is not allowed (use __array(T) for indexable GC storage)`);
         }
-        // Index is always loaded (rvalue). Array decays unless GC.
-        index = maybeLoad(index);
-        const arrayOperand = baseUt.kind === Types.TypeKind.GC_ARRAY
-          ? maybeLoad(expr)
-          : maybeDecay(maybeLoad(expr));
+        // GC arrays don't decay; keep them as the array operand.
+        const arrayOperand = baseUt.kind === Types.TypeKind.GC_ARRAY ? expr : maybeDecay(expr);
         expr = new AST.ESubscript(elemType, arrayOperand, index);
         continue;
       }
@@ -5790,9 +5765,9 @@ class Parser {
           }
           continue;
         }
-        // The lhs of `->` is read as a pointer: load lvalue, decay
-        // array-to-pointer. After this, expr.type is a plain pointer.
-        expr = maybeDecay(maybeLoad(expr));
+        // The lhs of `->` is decayed array-to-pointer if needed; the
+        // existing path handles plain pointers directly.
+        expr = maybeDecay(expr);
         bt = expr.type.removeQualifiers();
         if (bt.kind === Types.TypeKind.POINTER) bt = bt.baseType;
         const { chain } = this.lookupMember(bt, name);
@@ -5863,13 +5838,11 @@ class Parser {
   // C99 6.3.1.1: integer promotions for bitfield expressions
   promoteExprType(e) {
     const t = e.type;
-    // Look through an ELValueLoad to inspect the underlying member access.
-    const inner = e instanceof AST.ELValueLoad ? e.operand : e;
     let bf = null;
-    if (inner instanceof AST.EMember && inner.memberDecl && inner.memberDecl.bitWidth >= 0) {
-      bf = inner.memberDecl;
-    } else if (inner instanceof AST.EArrow && inner.memberDecl && inner.memberDecl.bitWidth >= 0) {
-      bf = inner.memberDecl;
+    if (e instanceof AST.EMember && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+      bf = e.memberDecl;
+    } else if (e instanceof AST.EArrow && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+      bf = e.memberDecl;
     }
     if (bf) {
       const bw = bf.bitWidth;
@@ -5955,10 +5928,10 @@ class Parser {
         let thenExpr = this.parseExpression();
         this.expect(":");
         let elseExpr = this.parseBinaryExpression(3);
-        // Load lvalue branches and condition, then decay array/function.
-        left = maybeLoad(left);
-        thenExpr = maybeDecay(maybeLoad(thenExpr));
-        elseExpr = maybeDecay(maybeLoad(elseExpr));
+        // Decay array/function-typed branches; ternary results are
+        // always pointer-typed (or scalar/aggregate).
+        thenExpr = maybeDecay(thenExpr);
+        elseExpr = maybeDecay(elseExpr);
         const resType = this.computeTernaryType(thenExpr.type, elseExpr.type);
         // Both branches must produce the same type — wrap each in an
         // implicit cast to resType when needed.
@@ -6026,19 +5999,11 @@ class Parser {
            bop === "BOR_ASSIGN")) {
         this.error(opTok, `'${op}' on reference type is not allowed`);
       }
-      // For arithmetic/comparison/logical/bitwise binary ops, the operands
-      // are loaded as rvalues. ASSIGN's left is the target lvalue and is
-      // not loaded; compound assigns (+=, etc.) handle the read+write
-      // through emitLValue and likewise leave their left alone here.
-      const isAssignOp = bop === "ASSIGN" || bop.endsWith("_ASSIGN");
-      if (!isAssignOp) {
-        left = maybeLoad(left);
-      }
-      right = maybeLoad(right);
       // Decay array/function operands of arithmetic, comparison, and
       // pointer-target assignments so leftType/rightType below carry the
       // already-decayed pointer types. ASSIGN/compound-assign's left is
       // the lvalue target and is never decayed.
+      const isAssignOp = bop === "ASSIGN" || bop.endsWith("_ASSIGN");
       const isPtrArith = (bop === "ADD" || bop === "SUB") &&
         (left.type.isPointer() || right.type.isPointer() ||
          left.type.isArray() || right.type.isArray());
@@ -6163,9 +6128,8 @@ class Parser {
     if (this.matchKW(Lexer.Keyword.IF)) {
       const kwTok = this.peek(-1);
       this.expect("(");
-      let cond = this.parseExpression();
+      const cond = this.parseExpression();
       this._rejectRefAsCondition(cond, kwTok, "if");
-      cond = maybeLoad(cond);
       this.expect(")");
       const thenBranch = this.parseStatement();
       let elseBranch = null;
@@ -6177,9 +6141,8 @@ class Parser {
     if (this.matchKW(Lexer.Keyword.WHILE)) {
       const kwTok = this.peek(-1);
       this.expect("(");
-      let cond = this.parseExpression();
+      const cond = this.parseExpression();
       this._rejectRefAsCondition(cond, kwTok, "while");
-      cond = maybeLoad(cond);
       this.expect(")");
       return new AST.SWhile(cond, this.parseStatement());
     }
@@ -6190,9 +6153,8 @@ class Parser {
       const body = this.parseStatement();
       this.expectKW(Lexer.Keyword.WHILE);
       this.expect("(");
-      let cond = this.parseExpression();
+      const cond = this.parseExpression();
       this._rejectRefAsCondition(cond, kwTok, "do-while");
-      cond = maybeLoad(cond);
       this.expect(")");
       this.expect(";");
       return new AST.SDoWhile(body, cond);
@@ -6216,7 +6178,6 @@ class Parser {
       if (!this.matchText(";")) {
         cond = this.parseExpression();
         this._rejectRefAsCondition(cond, kwTok, "for");
-        cond = maybeLoad(cond);
         this.expect(";");
       }
       if (!this.atText(")")) incr = this.parseExpression();
@@ -6230,11 +6191,10 @@ class Parser {
     if (this.matchKW(Lexer.Keyword.SWITCH)) {
       const switchTok = this.peek(-1);
       this.expect("(");
-      let expr = this.parseExpression();
+      const expr = this.parseExpression();
       if (expr.type.removeQualifiers().isRef()) {
         this.error(switchTok, `cannot switch on reference type '${expr.type.toString()}'`);
       }
-      expr = maybeLoad(expr);
       this.expect(")");
       // Parse the body collecting case labels
       const cases = [];
@@ -6288,8 +6248,8 @@ class Parser {
       if (this.matchText(";")) return new AST.SReturn(null);
       let expr = this.parseExpression();
       this.expect(";");
-      // Load lvalue, decay array/function, then implicit-cast to return type.
-      expr = maybeDecay(maybeLoad(expr));
+      // Decay array/function before any return-type adjustment.
+      expr = maybeDecay(expr);
       // Forbid implicit int→ref on return (use __ref_null(T) instead).
       if (this.currentParsingFunc) {
         const retType = this.currentParsingFunc.type.getReturnType();
@@ -6411,8 +6371,8 @@ class Parser {
       this.expect(")");
       this.expect(";");
       const tag = this.findExceptionTag(tagName);
-      // Load lvalue throw args, then decay array/function values.
-      for (let i = 0; i < args.length; i++) args[i] = maybeDecay(maybeLoad(args[i]));
+      // Decay array/function-typed throw args; tag params are pointer types.
+      for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
       // Insert implicit casts on args matching the tag's parameter types
       // (when known). Unresolved tag names skip this — the diagnostic for
       // unknown tags fires later via {name: tagName}.
@@ -6601,8 +6561,7 @@ class Parser {
         // handle conversion per-element via normalizeInitList.
         if (dvar.initExpr && !type.isAggregate() &&
             !(dvar.initExpr instanceof AST.EInitList)) {
-          // Load lvalue rhs, then decay if target is pointer.
-          dvar.initExpr = maybeLoad(dvar.initExpr);
+          // Initializing a pointer from an array/function decays first.
           if (type.isPointer()) dvar.initExpr = maybeDecay(dvar.initExpr);
           dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
         }
@@ -6885,8 +6844,7 @@ class Parser {
         // handle conversion per-element via normalizeInitList.
         if (dvar.initExpr && !type.isAggregate() &&
             !(dvar.initExpr instanceof AST.EInitList)) {
-          // Load lvalue rhs, then decay if target is pointer.
-          dvar.initExpr = maybeLoad(dvar.initExpr);
+          // Initializing a pointer from an array/function decays first.
           if (type.isPointer()) dvar.initExpr = maybeDecay(dvar.initExpr);
           dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
         }
@@ -7230,35 +7188,6 @@ function maybeDecay(expr) {
   const t = expr.type;
   if (t.isArray() || t.isFunction()) return new AST.EDecay(t.decay(), expr);
   return expr;
-}
-
-// True iff the expression denotes an lvalue (an addressable storage
-// location): a named variable, struct/union member access, array
-// subscript, or pointer dereference. Compound literals are also lvalues
-// per C99 6.5.2.5.
-function isLvalueExpr(expr) {
-  return expr instanceof AST.EIdent ||
-         expr instanceof AST.EMember ||
-         expr instanceof AST.EArrow ||
-         expr instanceof AST.ESubscript ||
-         (expr instanceof AST.EUnary && expr.op === "OP_DEREF") ||
-         expr instanceof AST.ECompoundLiteral;
-}
-
-// Wrap an lvalue in ELValueLoad to make the read explicit. Skips:
-//  - non-lvalues (already an rvalue)
-//  - array/function types (handled by maybeDecay instead)
-//  - aggregate types (passed by address, not loaded as a scalar)
-//  - lvalue references to a function (decay handles them)
-function maybeLoad(expr) {
-  if (!isLvalueExpr(expr)) return expr;
-  const t = expr.type;
-  if (t.isArray() || t.isFunction()) return expr;
-  if (t.isAggregate()) return expr;
-  // EIdent of an enum constant or function decl is not a memory lvalue.
-  if (expr instanceof AST.EIdent && expr.decl &&
-      !(expr.decl instanceof AST.DVar)) return expr;
-  return new AST.ELValueLoad(expr);
 }
 
 // ========== setjmp/longjmp lowering ==========
@@ -8638,8 +8567,6 @@ function constEvalAddr(expr, policy) {
   // Decay wraps an array/function lvalue with the decayed pointer type;
   // its address-of value is the operand's base address.
   if (expr instanceof AST.EDecay) return constEvalAddr(expr.operand, policy);
-  // ELValueLoad in an address context is just a pass-through.
-  if (expr instanceof AST.ELValueLoad) return constEvalAddr(expr.operand, policy);
   // Cast from integer to pointer: (type*)intval
   if (expr instanceof AST.ECast || expr instanceof AST.EImplicitCast) {
     const inner = constEvalExpr(expr.expr, policy);
@@ -8897,7 +8824,6 @@ function constEvalExpr(expr, policy) {
       return null;
     }
     case AST.EDecay: return constEvalExpr(expr.operand, policy);
-    case AST.ELValueLoad: return constEvalExpr(expr.operand, policy);
     default: return null;
   }
 }
@@ -10299,9 +10225,6 @@ class CodeGenerator {
     if (expr instanceof AST.EImplicitCast || expr instanceof AST.ECast) {
       return this._isNullPointerConstantCG(expr.expr);
     }
-    if (expr instanceof AST.ELValueLoad) {
-      return this._isNullPointerConstantCG(expr.operand);
-    }
     return false;
   }
 
@@ -11177,13 +11100,6 @@ class CodeGenerator {
         // Operand has array or function type; emitting it produces the
         // base address (for arrays) or table index (for functions), which
         // is exactly the decayed pointer value.
-        this.emitExpr(expr.operand, ctx);
-        break;
-      }
-      case AST.ELValueLoad: {
-        // Marker that the lvalue operand is being read. Codegen for the
-        // operand already emits the value (since this position is a
-        // value context); the wrapper records it explicitly in the AST.
         this.emitExpr(expr.operand, ctx);
         break;
       }
