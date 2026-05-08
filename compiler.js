@@ -6507,6 +6507,13 @@ class Parser {
             normalizeInitList(dvar.initExpr, type);
           }
         }
+        // Insert an implicit cast for scalar inits whose source type
+        // doesn't match the declared type. Aggregate / EInitList inits
+        // handle conversion per-element via normalizeInitList.
+        if (dvar.initExpr && !type.isAggregate() &&
+            !(dvar.initExpr instanceof AST.EInitList)) {
+          dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
+        }
       }
 
       // Catch `auto x;` (no initializer).
@@ -6780,6 +6787,13 @@ class Parser {
           } else if (type.isAggregate()) {
             normalizeInitList(dvar.initExpr, type);
           }
+        }
+        // Insert an implicit cast for scalar inits whose source type
+        // doesn't match the declared type. Aggregate / EInitList inits
+        // handle conversion per-element via normalizeInitList.
+        if (dvar.initExpr && !type.isAggregate() &&
+            !(dvar.initExpr instanceof AST.EInitList)) {
+          dvar.initExpr = maybeImplicitCast(dvar.initExpr, type);
         }
       }
 
@@ -7178,13 +7192,10 @@ function annotateStmt(stmt, returnType) {
       if (stmt.expr) annotateExpr(stmt.expr);
       break;
     case AST.SDecl:
+      // Decl-init implicit casts are inserted inline at parse time;
+      // recurse for any remaining post-pass work on the wrapped exprs.
       for (const decl of stmt.declarations) {
-        if (decl instanceof AST.DVar && decl.initExpr) {
-          annotateExpr(decl.initExpr);
-          if (!decl.type.isAggregate() && !(decl.initExpr instanceof AST.EInitList)) {
-            wrapImplicitCast(decl.initExpr, decl.type, (e) => { decl.initExpr = e; });
-          }
-        }
+        if (decl instanceof AST.DVar && decl.initExpr) annotateExpr(decl.initExpr);
       }
       break;
     case AST.SCompound:
