@@ -10001,6 +10001,33 @@ class CodeGenerator {
 
   isUnsignedType(type) { return type.removeQualifiers().isUnsigned(); }
 
+  // --- Pointer scaling helpers ---
+  // Multiply the i32 value already on top of the stack by sizeof(elemType).
+  emitScaleByElemSize(elemType) {
+    const elemSize = this.sizeOf(elemType);
+    if (elemSize !== 1) {
+      this.body.i32Const(elemSize);
+      this.body.aop(WT_I32, ALU.OP_MUL);
+    }
+  }
+  // Divide the i32 value already on top of the stack by sizeof(elemType) (signed).
+  emitDivByElemSize(elemType) {
+    const elemSize = this.sizeOf(elemType);
+    if (elemSize !== 1) {
+      this.body.i32Const(elemSize);
+      this.body.aop(WT_I32, ALU.OP_DIV, true);
+    }
+  }
+  // Emit an integer expression as a byte offset for pointer arithmetic:
+  // emit, narrow i64→i32 if needed, then scale by sizeof(elemType).
+  emitPointerOffset(intExpr, elemType) {
+    this.emitExpr(intExpr);
+    if (wtEquals(this.getBinaryWasmType(intExpr.type), WT_I64)) {
+      this.body.aop(WT_I32, ALU.OP_WRAP_I64);
+    }
+    this.emitScaleByElemSize(elemType);
+  }
+
   // --- Load/Store ---
   emitLoad(type) {
     type = type.removeQualifiers();
@@ -10258,11 +10285,8 @@ class CodeGenerator {
           savedRefLocal: refLocal, savedIdxLocal: idxLocal,
         };
       }
-      const elemSize = this.sizeOf(expr.type);
       this.emitExpr(expr.array);
-      this.emitExpr(expr.index);
-      if (wtEquals(this.getBinaryWasmType(expr.index.type), WT_I64)) this.body.aop(WT_I32, ALU.OP_WRAP_I64);
-      if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+      this.emitPointerOffset(expr.index, expr.type);
       this.body.aop(WT_I32, ALU.OP_ADD);
       const lv = { kind: LV_MEMORY, type: expr.type, addrSource: LV_ADDR_LOCAL };
       lv.savedLocal = this.allocLocal(WT_I32);
@@ -10366,11 +10390,8 @@ class CodeGenerator {
       return;
     }
     if (expr instanceof AST.ESubscript) {
-      const elemSize = this.sizeOf(expr.type);
       this.emitExpr(expr.array);
-      this.emitExpr(expr.index);
-      if (wtEquals(this.getBinaryWasmType(expr.index.type), WT_I64)) this.body.aop(WT_I32, ALU.OP_WRAP_I64);
-      if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+      this.emitPointerOffset(expr.index, expr.type);
       this.body.aop(WT_I32, ALU.OP_ADD);
       return;
     }
@@ -10442,8 +10463,7 @@ class CodeGenerator {
       this.emitExpr(rhs);
       this.emitConversion(rhsType, opType);
       if (lhsType.isPointer() && (op === "ADD_ASSIGN" || op === "SUB_ASSIGN")) {
-        const elemSize = this.sizeOf(lhsType.baseType);
-        if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+        this.emitScaleByElemSize(lhsType.baseType);
       }
       this.emitCompoundOp(opWt, op, isUnsigned);
       if (opType !== lhsType) this.emitConversion(opType, lhsType);
@@ -10579,28 +10599,25 @@ class CodeGenerator {
         // Pointer arithmetic
         if (expr.op === "ADD" && (leftType.isPointer() || rightType.isPointer() || leftType.isArray() || rightType.isArray())) {
           let ptrExpr, intExpr, elemType;
-          if (leftType.isPointer()) { ptrExpr = expr.left; intExpr = expr.right; elemType = leftType.baseType; }
-          else if (leftType.isArray()) { ptrExpr = expr.left; intExpr = expr.right; elemType = leftType.baseType; }
-          else if (rightType.isPointer()) { ptrExpr = expr.right; intExpr = expr.left; elemType = rightType.baseType; }
-          else { ptrExpr = expr.right; intExpr = expr.left; elemType = rightType.baseType; }
-          const elemSize = this.sizeOf(elemType);
-          this.emitExpr(ptrExpr); this.emitExpr(intExpr);
-          if (wtEquals(this.getBinaryWasmType(intExpr.type), WT_I64)) this.body.aop(WT_I32, ALU.OP_WRAP_I64);
-          if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+          if (leftType.isPointer() || leftType.isArray()) {
+            ptrExpr = expr.left; intExpr = expr.right; elemType = leftType.baseType;
+          } else {
+            ptrExpr = expr.right; intExpr = expr.left; elemType = rightType.baseType;
+          }
+          this.emitExpr(ptrExpr);
+          this.emitPointerOffset(intExpr, elemType);
           this.body.aop(WT_I32, ALU.OP_ADD);
           break;
         }
         if (expr.op === "SUB" && (leftType.isPointer() || leftType.isArray())) {
-          const leftElemType = leftType.isArray() ? leftType.baseType : leftType.baseType;
-          this.emitExpr(expr.left); this.emitExpr(expr.right);
+          const leftElemType = leftType.baseType;
           if (rightType.isPointer() || rightType.isArray()) {
+            this.emitExpr(expr.left); this.emitExpr(expr.right);
             this.body.aop(WT_I32, ALU.OP_SUB);
-            const elemSize = this.sizeOf(leftElemType);
-            if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_DIV, true); }
+            this.emitDivByElemSize(leftElemType);
           } else {
-            if (wtEquals(this.getBinaryWasmType(rightType), WT_I64)) this.body.aop(WT_I32, ALU.OP_WRAP_I64);
-            const elemSize = this.sizeOf(leftElemType);
-            if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+            this.emitExpr(expr.left);
+            this.emitPointerOffset(expr.right, leftElemType);
             this.body.aop(WT_I32, ALU.OP_SUB);
           }
           break;
@@ -10965,11 +10982,8 @@ class CodeGenerator {
           break;
         }
         const elemType = expr.type;
-        const elemSize = this.sizeOf(elemType);
         this.emitExpr(expr.array);
-        this.emitExpr(expr.index);
-        if (wtEquals(this.getBinaryWasmType(expr.index.type), WT_I64)) this.body.aop(WT_I32, ALU.OP_WRAP_I64);
-        if (elemSize !== 1) { this.body.i32Const(elemSize); this.body.aop(WT_I32, ALU.OP_MUL); }
+        this.emitPointerOffset(expr.index, elemType);
         this.body.aop(WT_I32, ALU.OP_ADD);
         if (!elemType.isAggregate()) this.emitLoad(elemType);
         break;
