@@ -2729,7 +2729,7 @@ class Expr {
     constructor(expr, cases, body, loc) { super(Types.StmtKind.SWITCH); this.expr = expr; this.cases = cases; this.body = body; this.loc = loc || null; Object.seal(this); }
   }
   class SGoto extends Stmt {
-    constructor(label) { super(Types.StmtKind.GOTO); this.label = label; this.target = null; this.loc = null; this.brDepth = 0; Object.seal(this); }
+    constructor(label) { super(Types.StmtKind.GOTO); this.label = label; this.target = null; this.loc = null; Object.seal(this); }
   }
   class SLabel extends Stmt {
     constructor(name, enclosingBlock) { super(Types.StmtKind.LABEL); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
@@ -7480,190 +7480,6 @@ function lowerSetjmpLongjmp(unit, exceptionTagRegistry) {
   for (const f of unit.staticFunctions) lowerFunc(f);
 }
 
-// ====================
-// Goto lowering pass
-// ====================
-// Runs after label classification (during parsing) and before codegen.
-// For each function body it mirrors the exact block-depth accounting that
-// codegen performs, and annotates every SGoto with a pre-computed `brDepth`.
-// Out-of-scope gotos become clean user errors here instead of crashes in codegen.
-
-function lowerGotosInFunc(funcDef) {
-  const SK = Types.StmtKind;
-  const LK = Types.LabelKind;
-  const errors = [];
-  let depth = 0;
-  // SLabel → depth at which its block/loop was opened (mirrors gotoLabelDepths in codegen)
-  const labelDepths = new Map();
-  // Labels inside switch bodies managed by walkSwitch, not walkCompound
-  const switchLevelLabels = new Set();
-
-  function walkCompound(stmt) {
-    const forwardLabels = [];
-    for (const s of stmt.statements) {
-      if (s.kind === SK.LABEL && s.hasGotos && !switchLevelLabels.has(s)) {
-        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)
-          forwardLabels.push(s);
-      }
-    }
-    for (let i = forwardLabels.length - 1; i >= 0; i--) {
-      depth++;
-      labelDepths.set(forwardLabels[i], depth);
-    }
-    const openLoopLabels = [];
-    for (const s of stmt.statements) {
-      if (s.kind === SK.LABEL) {
-        if (!s.hasGotos || switchLevelLabels.has(s)) continue;
-        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH) {
-          for (let j = openLoopLabels.length - 1; j >= 0; j--) {
-            depth--; labelDepths.delete(openLoopLabels[j]);
-          }
-          openLoopLabels.length = 0;
-          depth--; labelDepths.delete(s);
-        }
-        if (s.labelKind === LK.LOOP || s.labelKind === LK.BOTH) {
-          depth++; labelDepths.set(s, depth); openLoopLabels.push(s);
-        }
-      } else {
-        walk(s);
-      }
-    }
-    for (let j = openLoopLabels.length - 1; j >= 0; j--) {
-      depth--; labelDepths.delete(openLoopLabels[j]);
-    }
-  }
-
-  function walkSwitch(sw) {
-    const switchFwdLabels = [];
-    for (let si = 0; si < sw.body.statements.length; si++) {
-      const s = sw.body.statements[si];
-      if (s.kind === SK.LABEL && s.hasGotos) {
-        if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH)
-          switchFwdLabels.push({ label: s, stmtPos: si });
-      }
-      if (s.kind === SK.COMPOUND) {
-        for (const cs of s.statements) {
-          if (cs.kind === SK.LABEL && cs.hasGotos) {
-            if (cs.labelKind === LK.FORWARD || cs.labelKind === LK.BOTH) {
-              switchFwdLabels.push({ label: cs, stmtPos: si });
-              switchLevelLabels.add(cs);
-              cs.isSwitchLevel = true; // consumed by codegen COMPOUND
-            }
-          }
-        }
-      }
-    }
-    const numCases = sw.cases.length;
-    depth++; // break block
-    const blockEntries = [];
-    for (let i = 0; i < numCases; i++)
-      blockEntries.push({ pos: sw.cases[i].stmtIndex, isForward: false, fwdIdx: -1 });
-    for (let i = 0; i < switchFwdLabels.length; i++)
-      blockEntries.push({ pos: switchFwdLabels[i].stmtPos, isForward: true, fwdIdx: i });
-    blockEntries.sort((a, b) => {
-      if (a.pos !== b.pos) return b.pos - a.pos;
-      if (a.isForward !== b.isForward) return a.isForward ? -1 : 1;
-      return 0;
-    });
-    for (const e of blockEntries) {
-      depth++;
-      if (e.isForward) labelDepths.set(switchFwdLabels[e.fwdIdx].label, depth);
-    }
-    const openLoopLabels = [];
-    for (let i = 0; i < numCases; i++) {
-      depth--;
-      const startIdx = sw.cases[i].stmtIndex;
-      const endIdx = i + 1 < numCases ? sw.cases[i + 1].stmtIndex : sw.body.statements.length;
-      for (let j = startIdx; j < endIdx; j++) {
-        const s = sw.body.statements[j];
-        if (s.kind === SK.LABEL) {
-          if (!s.hasGotos) continue;
-          if (s.labelKind === LK.FORWARD || s.labelKind === LK.BOTH) {
-            for (let k = openLoopLabels.length - 1; k >= 0; k--) {
-              depth--; labelDepths.delete(openLoopLabels[k]);
-            }
-            openLoopLabels.length = 0;
-            depth--; labelDepths.delete(s);
-          }
-          if (s.labelKind === LK.LOOP || s.labelKind === LK.BOTH) {
-            depth++; labelDepths.set(s, depth); openLoopLabels.push(s);
-          }
-        } else {
-          walk(s);
-        }
-      }
-    }
-    for (let k = openLoopLabels.length - 1; k >= 0; k--) {
-      depth--; labelDepths.delete(openLoopLabels[k]);
-    }
-    for (const fl of switchFwdLabels) labelDepths.delete(fl.label);
-    depth--; // close break block
-  }
-
-  function walkTryCatch(tc) {
-    depth++; // end block
-    for (let i = 0; i < tc.catches.length; i++) depth++; // one per catch
-    depth++; // try_table
-    walk(tc.tryBody);
-    depth--; // end try_table
-    for (let i = 0; i < tc.catches.length; i++) {
-      depth--;
-      walk(tc.catches[i].body);
-    }
-    depth--; // close end block
-  }
-
-  function walk(stmt) {
-    if (!stmt) return;
-    switch (stmt.kind) {
-      case SK.COMPOUND:  walkCompound(stmt); break;
-      case SK.IF:
-        depth++;
-        walk(stmt.thenBranch);
-        if (stmt.elseBranch) walk(stmt.elseBranch);
-        depth--;
-        break;
-      case SK.WHILE:
-        depth += 2; walk(stmt.body); depth -= 2; break;
-      case SK.DO_WHILE:
-        depth += 3; walk(stmt.body); depth -= 3; break;
-      case SK.FOR:
-        depth += 3; walk(stmt.body); depth -= 3; break;
-      case SK.SWITCH:    walkSwitch(stmt); break;
-      case SK.TRY_CATCH: walkTryCatch(stmt); break;
-      case SK.GOTO: {
-        const target = stmt.target;
-        if (!target) break;
-        const d = labelDepths.get(target);
-        if (d === undefined) {
-          const loc = stmt.loc || {};
-          errors.push(new Lexer.LexError(
-            `goto '${stmt.label}': target label not in scope (in function '${funcDef.name || '?'}') ` +
-            `(label may be in a nested block, or a loop label's scope was closed by a forward label)`,
-            loc.filename || '?', loc.line || 0
-          ));
-          stmt.brDepth = -1;
-        } else {
-          stmt.brDepth = depth - d;
-        }
-        break;
-      }
-    }
-  }
-
-  if (funcDef.body) walk(funcDef.body);
-  return errors;
-}
-
-function lowerGotos(unit) {
-  const errors = [];
-  for (const func of [...(unit.definedFunctions || []), ...(unit.staticFunctions || [])]) {
-    const fdef = func.definition || func;
-    if (fdef === func && fdef.body) errors.push(...lowerGotosInFunc(fdef));
-  }
-  return errors;
-}
-
 function annotateImplicitCasts(unit) {
   const annotateFunc = (func) => {
     if (!func.body) return;
@@ -7678,7 +7494,7 @@ return {
   dumpAst, parseTokens, parseSource,
   filterUnusedDeclarations, gcSectionsPass,
   linkTranslationUnits,
-  lowerSetjmpLongjmp, lowerGotos,
+  lowerSetjmpLongjmp,
   annotateImplicitCasts, annotateExpr, annotateStmt,
 };
 })();
@@ -9055,6 +8871,13 @@ class CodeGenerator {
     this.blockDepth = 0;
     this.breakTarget = 0;
     this.continueTarget = 0;
+    // SLabel → blockDepth at which its block was opened. Maintained by
+    // emitStmt's COMPOUND / SWITCH cases as they emit `block()`/`loop()`
+    // for forward and loop labels; the GOTO case looks up the target's
+    // depth and emits `br(blockDepth - targetDepth)`. Targets out of
+    // scope produce a goto error appended to `gotoErrors`.
+    this.gotoLabelDepths = new Map();
+    this.gotoErrors = []; // {message, filename, line}
     this.exceptionToWasmTagIdx = new Map();
     this.currentFuncDef = null;
     this.vaArgsLocalIdx = 0;
@@ -9683,6 +9506,7 @@ class CodeGenerator {
     this.structRetDeferred = 0;
     this.callNesting = 0;
     this.blockDepth = 0;
+    this.gotoLabelDepths.clear();
 
     this._recordSourceLoc(funcDef.loc);
 
@@ -9781,7 +9605,8 @@ class CodeGenerator {
       case Types.StmtKind.COMPOUND: {
         this.pushLocalScope();
         const stmts = stmt.statements;
-        // Open forward-label blocks
+        // Open forward-label blocks. Forward labels' scope = from the start
+        // of the compound up to the label statement itself.
         const forwardLabels = [];
         for (const s of stmts) {
           if (s.kind === Types.StmtKind.LABEL && s.hasGotos && !s.isSwitchLevel) {
@@ -9792,6 +9617,7 @@ class CodeGenerator {
         for (let i = forwardLabels.length - 1; i >= 0; i--) {
           this.body.block();
           this.blockDepth++;
+          this.gotoLabelDepths.set(forwardLabels[i], this.blockDepth);
         }
         const openLoopLabels = [];
         for (const s of stmts) {
@@ -9799,16 +9625,19 @@ class CodeGenerator {
             if (!s.hasGotos) continue;
             if (s.labelKind === Types.LabelKind.FORWARD || s.labelKind === Types.LabelKind.BOTH) {
               for (let j = openLoopLabels.length - 1; j >= 0; j--) {
+                this.gotoLabelDepths.delete(openLoopLabels[j]);
                 this.blockDepth--;
                 this.body.end();
               }
               openLoopLabels.length = 0;
+              this.gotoLabelDepths.delete(s);
               this.blockDepth--;
               this.body.end();
             }
             if (s.labelKind === Types.LabelKind.LOOP || s.labelKind === Types.LabelKind.BOTH) {
               this.body.loop();
               this.blockDepth++;
+              this.gotoLabelDepths.set(s, this.blockDepth);
               openLoopLabels.push(s);
             }
           } else {
@@ -9816,6 +9645,7 @@ class CodeGenerator {
           }
         }
         for (let j = openLoopLabels.length - 1; j >= 0; j--) {
+          this.gotoLabelDepths.delete(openLoopLabels[j]);
           this.blockDepth--;
           this.body.end();
         }
@@ -9984,6 +9814,10 @@ class CodeGenerator {
               if (cs.kind === Types.StmtKind.LABEL && cs.hasGotos) {
                 if (cs.labelKind === Types.LabelKind.FORWARD || cs.labelKind === Types.LabelKind.BOTH) {
                   switchFwdLabels.push({ label: cs, stmtPos: si });
+                  // Mark so the inner COMPOUND emit doesn't open its own
+                  // forward-label block — the switch-level block we're
+                  // about to open subsumes it.
+                  cs.isSwitchLevel = true;
                 }
               }
             }
@@ -10023,6 +9857,9 @@ class CodeGenerator {
         });
         for (const e of blockEntries) {
           this.body.block(); this.blockDepth++;
+          if (e.isForward) {
+            this.gotoLabelDepths.set(switchFwdLabels[e.idx].label, this.blockDepth);
+          }
         }
 
         // Dispatch
@@ -10089,13 +9926,16 @@ class CodeGenerator {
               if (!s.hasGotos) continue;
               if (s.labelKind === Types.LabelKind.FORWARD || s.labelKind === Types.LabelKind.BOTH) {
                 for (let k = openLoopLabels.length - 1; k >= 0; k--) {
+                  this.gotoLabelDepths.delete(openLoopLabels[k]);
                   this.blockDepth--; this.body.end();
                 }
                 openLoopLabels.length = 0;
+                this.gotoLabelDepths.delete(s);
                 this.blockDepth--; this.body.end();
               }
               if (s.labelKind === Types.LabelKind.LOOP || s.labelKind === Types.LabelKind.BOTH) {
                 this.body.loop(); this.blockDepth++;
+                this.gotoLabelDepths.set(s, this.blockDepth);
                 openLoopLabels.push(s);
               }
             } else {
@@ -10104,16 +9944,36 @@ class CodeGenerator {
           }
         }
         for (let k = openLoopLabels.length - 1; k >= 0; k--) {
+          this.gotoLabelDepths.delete(openLoopLabels[k]);
           this.blockDepth--; this.body.end();
         }
+        // Any switch-level forward labels still in the map (their case
+        // body fell through without crossing a forward-label statement)
+        // go out of scope when we close the break block.
+        for (const fl of switchFwdLabels) this.gotoLabelDepths.delete(fl.label);
         this.blockDepth--; this.body.end();
         this.breakTarget = savedBreak;
         break;
       }
-      case Types.StmtKind.GOTO:
-        if (stmt.brDepth < 0) this.body.unreachable(); // invalid goto, error already reported by lowerGotos
-        else this.body.br(stmt.brDepth);
+      case Types.StmtKind.GOTO: {
+        const target = stmt.target;
+        const depth = target ? this.gotoLabelDepths.get(target) : undefined;
+        if (depth === undefined) {
+          // Out-of-scope or unresolved goto. Emit `unreachable` so the
+          // wasm validator is satisfied; surface a clean error to stderr.
+          const loc = stmt.loc || {};
+          this.gotoErrors.push({
+            message: `goto '${stmt.label}': target label not in scope (in function '${this.currentFuncDef?.name || '?'}') ` +
+                     `(label may be in a nested block, or a loop label's scope was closed by a forward label)`,
+            filename: loc.filename || '?',
+            line: loc.line || 0,
+          });
+          this.body.unreachable();
+        } else {
+          this.body.br(this.blockDepth - depth);
+        }
         break;
+      }
       case Types.StmtKind.LABEL: break; // handled in COMPOUND
       case Types.StmtKind.EMPTY: break;
       case Types.StmtKind.THROW: {
@@ -11790,6 +11650,16 @@ function generateCode(units, outputFile, options) {
       if (fdef !== func) continue;
       cg.emitFunctionBody(fdef);
     }
+  }
+
+  // Surface goto errors collected during emit. Out-of-scope gotos already
+  // produced wasm `unreachable` opcodes inline; we just write the
+  // diagnostics and exit. (Mirrors how the parser pass surfaces them.)
+  if (cg.gotoErrors.length > 0) {
+    for (const err of cg.gotoErrors) {
+      process.stderr.write(`${err.filename}:${err.line}: error: ${err.message}\n`);
+    }
+    if (typeof process !== 'undefined' && process.exit) process.exit(1);
   }
 
   // Finalize memory
@@ -16239,16 +16109,11 @@ function parseAllUnits(fs, pp, inputFiles, options) {
         pendingRequiredSources.push(req);
       }
     }
-    // Per-TU passes (before linking)
+    // Per-TU passes (before linking). Goto resolution lives in the codegen
+    // now: out-of-scope diagnostics are emitted by Codegen.generateCode as
+    // it walks the AST, so there's no separate pre-pass.
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
     Parser.annotateImplicitCasts(unit);
-    const gotoErrors = Parser.lowerGotos(unit);
-    if (gotoErrors.length > 0) {
-      hasErrors = true;
-      for (const err of gotoErrors) {
-        writeErr(`${err.filename}:${err.line}: error: ${err.message}\n`);
-      }
-    }
     if (!options?.compilerOptions?.noUndefined) Parser.filterUnusedDeclarations(unit);
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
