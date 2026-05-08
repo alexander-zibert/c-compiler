@@ -2649,7 +2649,32 @@ class Expr {
     constructor(type, condition, thenExpr, elseExpr) { super(type); this.condition = condition; this.thenExpr = thenExpr; this.elseExpr = elseExpr; Object.seal(this); }
   }
   class ECall extends Expr {
-    constructor(type, callee, args, funcDecl) { super(type); this.callee = callee; this.arguments = args; this.funcDecl = funcDecl || null; Object.seal(this); }
+    // The result type is the function's return type (after array/function
+    // decay on the callee). For "this isn't actually callable" cases the
+    // parser also accepts (no separate diagnostic today), fall back to int —
+    // some downstream pass will report the real diagnostic.
+    //
+    // funcDecl is the DFunc that's directly being called, if the callee is
+    // a plain identifier resolving to one. For function-pointer expressions,
+    // funcDecl is null and the codegen emits an indirect call.
+    constructor(callee, args) {
+      let calleeType = callee.type;
+      if (calleeType.kind === Types.TypeKind.ARRAY ||
+          calleeType.kind === Types.TypeKind.FUNCTION) {
+        calleeType = calleeType.decay();
+      }
+      let returnType = Types.TINT;
+      if (calleeType.kind === Types.TypeKind.POINTER &&
+          calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
+        returnType = calleeType.baseType.returnType;
+      }
+      super(returnType);
+      this.callee = callee;
+      this.arguments = args;
+      this.funcDecl = (callee instanceof EIdent && callee.decl instanceof DFunc)
+        ? callee.decl : null;
+      Object.seal(this);
+    }
   }
   class ESubscript extends Expr {
     constructor(type, array, index) { super(type); this.array = array; this.index = index; Object.seal(this); }
@@ -5616,15 +5641,14 @@ class Parser {
         }
         this.expect(")");
 
-        let resultType = Types.TINT;
+        // Decay arrays/functions, then if the callee resolves to a function
+        // type extract its FunctionType for argument-validation below. (The
+        // ECall constructor does its own decay to derive the result type;
+        // this is just for the local arg-check pass.)
         let calleeType = expr.type;
         if (calleeType.kind === Types.TypeKind.ARRAY || calleeType.kind === Types.TypeKind.FUNCTION) calleeType = calleeType.decay();
         let calleeFuncType = null;
-        if (calleeType.kind === Types.TypeKind.FUNCTION) {
-          resultType = calleeType.returnType;
-          calleeFuncType = calleeType;
-        } else if (calleeType.kind === Types.TypeKind.POINTER && calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
-          resultType = calleeType.baseType.returnType;
+        if (calleeType.kind === Types.TypeKind.POINTER && calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
           calleeFuncType = calleeType.baseType;
         }
         // Forbid implicit int→ref on call arguments. Only check declared
@@ -5645,12 +5669,7 @@ class Parser {
           }
         }
 
-        let funcDecl = null;
-        if (expr instanceof AST.EIdent && expr.decl && expr.decl instanceof AST.DFunc) {
-          funcDecl = expr.decl;
-        }
-
-        expr = new AST.ECall(resultType, expr, args, funcDecl);
+        expr = new AST.ECall(expr, args);
         continue;
       }
       if (this.matchText("[")) {
