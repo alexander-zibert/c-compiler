@@ -5669,6 +5669,30 @@ class Parser {
           }
         }
 
+        // Insert implicit casts on arguments. Mirrors the older annotateExpr
+        // post-pass for ECall: fixed args wrap to their parameter type;
+        // variadic args undergo float→double default-argument promotion.
+        // K&R-style `int f()` (hasUnspecifiedParams) has no paramTypes to
+        // wrap against; the loop iterates zero times.
+        if (calleeFuncType) {
+          const paramTypes = calleeFuncType.getParamTypes();
+          const numFixed = paramTypes.length;
+          if (calleeFuncType.isVarArg) {
+            for (let i = 0; i < numFixed && i < args.length; i++) {
+              args[i] = maybeImplicitCast(args[i], paramTypes[i]);
+            }
+            for (let i = numFixed; i < args.length; i++) {
+              if (args[i].type.removeQualifiers() === Types.TFLOAT) {
+                args[i] = maybeImplicitCast(args[i], Types.TDOUBLE);
+              }
+            }
+          } else {
+            for (let i = 0; i < args.length && i < numFixed; i++) {
+              args[i] = maybeImplicitCast(args[i], paramTypes[i]);
+            }
+          }
+        }
+
         expr = new AST.ECall(expr, args);
         continue;
       }
@@ -7102,33 +7126,10 @@ function annotateExpr(expr) {
     return;
   }
   if (expr instanceof AST.ECall) {
+    // Call argument implicit casts are inserted inline at parse time by
+    // parsePostfixTail; recurse for any remaining post-pass work.
     annotateExpr(expr.callee);
     for (const arg of expr.arguments) annotateExpr(arg);
-    // Resolve function type
-    let calleeType = expr.callee.type;
-    if (calleeType.isArray() || calleeType.isFunction()) calleeType = calleeType.decay();
-    if (calleeType.isPointer()) calleeType = calleeType.baseType;
-    if (!calleeType || !calleeType.isFunction()) return;
-    const paramTypes = calleeType.getParamTypes();
-    if (calleeType.isVarArg) {
-      // Fixed params
-      for (let i = 0; i < paramTypes.length && i < expr.arguments.length; i++) {
-        const idx = i;
-        wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
-      }
-      // Varargs: default argument promotion (float→double)
-      for (let i = paramTypes.length; i < expr.arguments.length; i++) {
-        const idx = i;
-        if (expr.arguments[idx].type.removeQualifiers() === Types.TFLOAT) {
-          wrapImplicitCast(expr.arguments[idx], Types.TDOUBLE, (e) => { expr.arguments[idx] = e; });
-        }
-      }
-    } else {
-      for (let i = 0; i < expr.arguments.length && i < paramTypes.length; i++) {
-        const idx = i;
-        wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
-      }
-    }
     return;
   }
   if (expr instanceof AST.ETernary) {
