@@ -1967,21 +1967,6 @@ const AllocClass = Object.freeze({ REGISTER: "register", MEMORY: "memory" });
 
 const LabelKind = Object.freeze({ FORWARD: "forward", LOOP: "loop", BOTH: "both" });
 
-const StmtKind = Object.freeze({
-  EXPR: "expression-statement", DECL: "declaration-statement",
-  COMPOUND: "compound-statement", IF: "if-statement",
-  WHILE: "while-statement", DO_WHILE: "do-while-statement",
-  FOR: "for-statement", BREAK: "break-statement",
-  CONTINUE: "continue-statement", RETURN: "return-statement",
-  SWITCH: "switch-statement", GOTO: "goto-statement",
-  LABEL: "label-statement", EMPTY: "empty-statement",
-  TRY_CATCH: "try-catch-statement", THROW: "throw-statement",
-});
-
-const DeclKind = Object.freeze({
-  VAR: "variable", FUNC: "function", TAG: "tag", ENUM_CONST: "enum-constant",
-});
-
 const IntrinsicKind = Object.freeze({
   VA_START: "va_start", VA_ARG: "va_arg", VA_END: "va_end", VA_COPY: "va_copy",
   MEMORY_SIZE: "memory_size", MEMORY_GROW: "memory_grow",
@@ -2481,7 +2466,7 @@ function usualArithmeticConversions(a, b) {
 
 return {
   TypeKind, TagKind, StorageClass, AllocClass, LabelKind,
-  StmtKind, DeclKind, IntrinsicKind, BopStr, UopStr,
+  IntrinsicKind, BopStr, UopStr,
   TypeInfo,
   TUNKNOWN, TVOID, TBOOL, TCHAR, TSCHAR, TUCHAR, TSHORT, TUSHORT,
   TINT, TUINT, TLONG, TULONG, TLLONG, TULLONG, TFLOAT, TDOUBLE, TLDOUBLE, TEXTERNREF, TREFEXTERN, TEQREF, TAUTO,
@@ -2545,14 +2530,12 @@ class Expr {
     }
   }
   class Stmt {
-    constructor(kind) {
-      this.kind = kind;
+    constructor() {
       this.loc = null;
     }
   }
   class Decl {
-    constructor(declKind) {
-      this.declKind = declKind;
+    constructor() {
       this.id = nextDeclId++;
     }
   }
@@ -2560,7 +2543,7 @@ class Expr {
   // --- Decl subclasses ---
   class DVar extends Decl {
     constructor(loc, name, type, storageClass, initExpr) {
-      super(Types.DeclKind.VAR);
+      super();
       this.loc = loc; this.name = name; this.type = type;
       this.storageClass = storageClass || Types.StorageClass.NONE;
       this.allocClass = Types.AllocClass.REGISTER;
@@ -2573,7 +2556,7 @@ class Expr {
   }
   class DFunc extends Decl {
     constructor(loc, name, type, params, storageClass, isInline, body) {
-      super(Types.DeclKind.FUNC);
+      super();
       this.loc = loc; this.name = name; this.type = type;
       this.parameters = params || [];
       this.storageClass = storageClass || Types.StorageClass.NONE;
@@ -2588,7 +2571,7 @@ class Expr {
   }
   class DTag extends Decl {
     constructor(loc, tagKind, name, isComplete, members) {
-      super(Types.DeclKind.TAG);
+      super();
       this.loc = loc; this.tagKind = tagKind; this.name = name;
       this.isComplete = isComplete || false;
       this.isPacked = false;
@@ -2598,7 +2581,7 @@ class Expr {
   }
   class DEnumConst extends Decl {
     constructor(loc, name, value) {
-      super(Types.DeclKind.ENUM_CONST);
+      super();
       this.loc = loc; this.name = name; this.value = value;
       Object.seal(this);
     }
@@ -2682,52 +2665,52 @@ class Expr {
 
   // --- Stmt subclasses ---
   class SExpr extends Stmt {
-    constructor(expr) { super(Types.StmtKind.EXPR); this.expr = expr; Object.seal(this); }
+    constructor(expr) { super(); this.expr = expr; Object.seal(this); }
   }
   class SDecl extends Stmt {
-    constructor(declarations) { super(Types.StmtKind.DECL); this.declarations = declarations; Object.seal(this); }
+    constructor(declarations) { super(); this.declarations = declarations; Object.seal(this); }
   }
   class SCompound extends Stmt {
-    constructor(statements, labels) { super(Types.StmtKind.COMPOUND); this.statements = statements; this.labels = labels || []; Object.seal(this); }
+    constructor(statements, labels) { super(); this.statements = statements; this.labels = labels || []; Object.seal(this); }
   }
   class SIf extends Stmt {
-    constructor(condition, thenBranch, elseBranch) { super(Types.StmtKind.IF); this.condition = condition; this.thenBranch = thenBranch; this.elseBranch = elseBranch || null; Object.seal(this); }
+    constructor(condition, thenBranch, elseBranch) { super(); this.condition = condition; this.thenBranch = thenBranch; this.elseBranch = elseBranch || null; Object.seal(this); }
   }
   class SWhile extends Stmt {
-    constructor(condition, body) { super(Types.StmtKind.WHILE); this.condition = condition; this.body = body; Object.seal(this); }
+    constructor(condition, body) { super(); this.condition = condition; this.body = body; Object.seal(this); }
   }
   class SDoWhile extends Stmt {
-    constructor(body, condition) { super(Types.StmtKind.DO_WHILE); this.body = body; this.condition = condition; Object.seal(this); }
+    constructor(body, condition) { super(); this.body = body; this.condition = condition; Object.seal(this); }
   }
   class SFor extends Stmt {
-    constructor(init, condition, increment, body) { super(Types.StmtKind.FOR); this.init = init; this.condition = condition; this.increment = increment; this.body = body; Object.seal(this); }
+    constructor(init, condition, increment, body) { super(); this.init = init; this.condition = condition; this.increment = increment; this.body = body; Object.seal(this); }
   }
   class SBreak extends Stmt {
-    constructor() { super(Types.StmtKind.BREAK); Object.seal(this); }
+    constructor() { super(); Object.seal(this); }
   }
   class SContinue extends Stmt {
-    constructor() { super(Types.StmtKind.CONTINUE); Object.seal(this); }
+    constructor() { super(); Object.seal(this); }
   }
   class SReturn extends Stmt {
-    constructor(expr) { super(Types.StmtKind.RETURN); this.expr = expr || null; Object.seal(this); }
+    constructor(expr) { super(); this.expr = expr || null; Object.seal(this); }
   }
   class SSwitch extends Stmt {
-    constructor(expr, cases, body, loc) { super(Types.StmtKind.SWITCH); this.expr = expr; this.cases = cases; this.body = body; this.loc = loc || null; Object.seal(this); }
+    constructor(expr, cases, body, loc) { super(); this.expr = expr; this.cases = cases; this.body = body; this.loc = loc || null; Object.seal(this); }
   }
   class SGoto extends Stmt {
-    constructor(label) { super(Types.StmtKind.GOTO); this.label = label; this.target = null; this.loc = null; Object.seal(this); }
+    constructor(label) { super(); this.label = label; this.target = null; this.loc = null; Object.seal(this); }
   }
   class SLabel extends Stmt {
-    constructor(name, enclosingBlock) { super(Types.StmtKind.LABEL); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
+    constructor(name, enclosingBlock) { super(); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
   }
   class SEmpty extends Stmt {
-    constructor() { super(Types.StmtKind.EMPTY); Object.seal(this); }
+    constructor() { super(); Object.seal(this); }
   }
   class STryCatch extends Stmt {
-    constructor(tryBody, catches) { super(Types.StmtKind.TRY_CATCH); this.tryBody = tryBody; this.catches = catches; Object.seal(this); }
+    constructor(tryBody, catches) { super(); this.tryBody = tryBody; this.catches = catches; Object.seal(this); }
   }
   class SThrow extends Stmt {
-    constructor(tag, args) { super(Types.StmtKind.THROW); this.tag = tag; this.args = args; Object.seal(this); }
+    constructor(tag, args) { super(); this.tag = tag; this.args = args; Object.seal(this); }
   }
 
 // TUnit constructor
@@ -3006,7 +2989,7 @@ function dumpExpr(expr, ctx, indent) {
 
 function dumpStmt(stmt, ctx, indent) {
   let ret = ind(indent);
-  ret += "Stmt " + stmt.kind + ":";
+  ret += "Stmt " + stmt.constructor.name + ":";
   switch (stmt.constructor) {
     case AST.SExpr:
       ret += dumpExpr(stmt.expr, ctx, indent + 1);
@@ -3083,7 +3066,7 @@ function dumpStmt(stmt, ctx, indent) {
 
 function dumpDecl(decl, ctx, indent) {
   let ret = ind(indent);
-  ret += "Decl " + decl.declKind + " " + ctx.formatDeclId(decl);
+  ret += "Decl " + decl.constructor.name + " " + ctx.formatDeclId(decl);
   const defnStr = ctx.formatDeclIdOfDefinition(decl);
   if (defnStr !== ctx.formatDeclId(decl)) {
     ret += " (def=" + defnStr + ")";
@@ -3248,7 +3231,7 @@ function linkTranslationUnits(units, compilerOptions) {
 
   function checkCompatibility(a, b) {
     const locs = [a.loc, b.loc].filter(l => l?.filename);
-    if (a.declKind !== b.declKind) {
+    if (a.constructor !== b.constructor) {
       addError(`declaration and definition kinds do not match for symbol '${getName(a)}'`, locs);
       return;
     }
@@ -3259,7 +3242,7 @@ function linkTranslationUnits(units, compilerOptions) {
   }
 
   function setDefinition(decl, definition) {
-    if (decl.declKind !== definition.declKind) return;
+    if (decl.constructor !== definition.constructor) return;
     if (decl instanceof AST.DVar) {
       decl.definition = definition;
       // Propagate allocClass
@@ -10005,7 +9988,7 @@ class CodeGenerator {
         break;
       }
       default:
-        throw new Error(`emitStmt: unhandled statement kind ${stmt.kind}`);
+        throw new Error(`emitStmt: unhandled statement ${stmt.constructor.name}`);
     }
   }
 
@@ -17099,8 +17082,6 @@ var _exports = {
   TypeKind: Types.TypeKind,
   TagKind: Types.TagKind,
   StorageClass: Types.StorageClass,
-  StmtKind: Types.StmtKind,
-  DeclKind: Types.DeclKind,
   TypeInfo: Types.TypeInfo,
   LabelKind: Types.LabelKind,
   usualArithmeticConversions: Types.usualArithmeticConversions,
