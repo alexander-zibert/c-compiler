@@ -11846,7 +11846,9 @@ return {
 //
 // guc.js is loaded lazily — only when this backend is actually invoked.
 // The default-backend path never touches it, so users can ship compiler.js
-// without guc.js as long as they don't ask for --backend=guc.
+// without guc.js as long as they don't ask for --backend=guc. The canonical
+// guc.js lives in the sibling guc/ repo; we resolve to /Users/jku/git/guc
+// to avoid maintaining a duplicate copy here.
 
 const GucBackend = (() => {
 
@@ -11854,12 +11856,11 @@ let _GUC = null;
 function loadGuc() {
   if (_GUC) return _GUC;
   try {
-    _GUC = require('./guc.js');
+    _GUC = require('/Users/jku/git/guc/guc.js');
   } catch (e) {
     if (e && e.code === 'MODULE_NOT_FOUND') {
       throw new Error(
-        "--backend=guc requires guc.js next to compiler.js. " +
-        "Copy guc.js into the same directory and re-run."
+        "--backend=guc requires guc.js at /Users/jku/git/guc/guc.js."
       );
     }
     throw e;
