@@ -2738,11 +2738,11 @@ class Expr {
   }
   // Lvalue→rvalue conversion: read the value at an lvalue. Wraps an lvalue
   // expression (EIdent, EMember, EArrow, ESubscript, *ptr) when it appears
-  // in a context that consumes its value rather than its address. Type
-  // matches the operand's type.
+  // in a context that consumes its value rather than its address. The type
+  // is the operand's type — loading an lvalue doesn't change the type.
   class ELValueLoad extends Expr {
-    constructor(type, operand) {
-      super(type);
+    constructor(operand) {
+      super(operand.type);
       this.operand = operand;
       Object.seal(this);
     }
@@ -7258,7 +7258,7 @@ function maybeLoad(expr) {
   // EIdent of an enum constant or function decl is not a memory lvalue.
   if (expr instanceof AST.EIdent && expr.decl &&
       !(expr.decl instanceof AST.DVar)) return expr;
-  return new AST.ELValueLoad(t, expr);
+  return new AST.ELValueLoad(expr);
 }
 
 // ========== setjmp/longjmp lowering ==========
