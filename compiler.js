@@ -6209,12 +6209,14 @@ class Parser {
     if (this.matchKW(Lexer.Keyword.RETURN)) {
       const retTok = this.peek(-1);
       if (this.matchText(";")) return new AST.SReturn(null);
-      const expr = this.parseExpression();
+      let expr = this.parseExpression();
       this.expect(";");
       // Forbid implicit int→ref on return (use __ref_null(T) instead).
       if (this.currentParsingFunc) {
         const retType = this.currentParsingFunc.type.getReturnType();
         this._rejectIntToRef(retType, expr, retTok);
+        // Wrap in implicit cast to the function's return type.
+        expr = maybeImplicitCast(expr, retType);
       }
       return new AST.SReturn(expr);
     }
@@ -7171,10 +7173,9 @@ function annotateStmt(stmt, returnType) {
       annotateExpr(stmt.expr);
       break;
     case AST.SReturn:
-      if (stmt.expr) {
-        annotateExpr(stmt.expr);
-        wrapImplicitCast(stmt.expr, returnType, (e) => { stmt.expr = e; });
-      }
+      // Return-value implicit cast is inserted inline at parse time;
+      // recurse for any remaining post-pass work on the wrapped expr.
+      if (stmt.expr) annotateExpr(stmt.expr);
       break;
     case AST.SDecl:
       for (const decl of stmt.declarations) {
