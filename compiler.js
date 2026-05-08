@@ -7026,103 +7026,82 @@ function wrapImplicitCast(expr, targetType, setter) {
 
 function annotateExpr(expr) {
   if (!expr) return;
-  switch (expr.kind) {
-    case Types.ExprKind.BINARY: {
-      annotateExpr(expr.left);
-      annotateExpr(expr.right);
-      // Skip assignment ops
-      if (expr.op === "ASSIGN" || expr.op.endsWith("_ASSIGN")) break;
-      // Skip logical ops
-      if (expr.op === "LAND" || expr.op === "LOR") break;
-      const leftType = expr.left.type;
-      const rightType = expr.right.type;
-      // Skip pointer/array arithmetic
-      if ((expr.op === "ADD" || expr.op === "SUB") &&
-          (leftType.isPointer() || rightType.isPointer() ||
-           leftType.isArray() || rightType.isArray())) break;
-      if (leftType.removeQualifiers().isRef() || rightType.removeQualifiers().isRef()) break;
-      const isComparison = ["EQ","NE","LT","GT","LE","GE"].includes(expr.op);
-      const opType = isComparison ? Types.usualArithmeticConversions(leftType, rightType) : expr.type;
-      wrapImplicitCast(expr.left, opType, (e) => { expr.left = e; });
-      wrapImplicitCast(expr.right, opType, (e) => { expr.right = e; });
-      break;
-    }
-    case Types.ExprKind.CALL: {
-      annotateExpr(expr.callee);
-      for (const arg of expr.arguments) annotateExpr(arg);
-      // Resolve function type
-      let calleeType = expr.callee.type;
-      if (calleeType.isArray() || calleeType.isFunction()) calleeType = calleeType.decay();
-      if (calleeType.isPointer()) calleeType = calleeType.baseType;
-      if (!calleeType || !calleeType.isFunction()) break;
-      const paramTypes = calleeType.getParamTypes();
-      if (calleeType.isVarArg) {
-        // Fixed params
-        for (let i = 0; i < paramTypes.length && i < expr.arguments.length; i++) {
-          const idx = i;
-          wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
-        }
-        // Varargs: default argument promotion (float→double)
-        for (let i = paramTypes.length; i < expr.arguments.length; i++) {
-          const idx = i;
-          if (expr.arguments[idx].type.removeQualifiers() === Types.TFLOAT) {
-            wrapImplicitCast(expr.arguments[idx], Types.TDOUBLE, (e) => { expr.arguments[idx] = e; });
-          }
-        }
-      } else {
-        for (let i = 0; i < expr.arguments.length && i < paramTypes.length; i++) {
-          const idx = i;
-          wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
+  if (expr instanceof AST.EBinary) {
+    annotateExpr(expr.left);
+    annotateExpr(expr.right);
+    // Skip assignment ops
+    if (expr.op === "ASSIGN" || expr.op.endsWith("_ASSIGN")) return;
+    // Skip logical ops
+    if (expr.op === "LAND" || expr.op === "LOR") return;
+    const leftType = expr.left.type;
+    const rightType = expr.right.type;
+    // Skip pointer/array arithmetic
+    if ((expr.op === "ADD" || expr.op === "SUB") &&
+        (leftType.isPointer() || rightType.isPointer() ||
+         leftType.isArray() || rightType.isArray())) return;
+    if (leftType.removeQualifiers().isRef() || rightType.removeQualifiers().isRef()) return;
+    const isComparison = ["EQ","NE","LT","GT","LE","GE"].includes(expr.op);
+    const opType = isComparison ? Types.usualArithmeticConversions(leftType, rightType) : expr.type;
+    wrapImplicitCast(expr.left, opType, (e) => { expr.left = e; });
+    wrapImplicitCast(expr.right, opType, (e) => { expr.right = e; });
+    return;
+  }
+  if (expr instanceof AST.ECall) {
+    annotateExpr(expr.callee);
+    for (const arg of expr.arguments) annotateExpr(arg);
+    // Resolve function type
+    let calleeType = expr.callee.type;
+    if (calleeType.isArray() || calleeType.isFunction()) calleeType = calleeType.decay();
+    if (calleeType.isPointer()) calleeType = calleeType.baseType;
+    if (!calleeType || !calleeType.isFunction()) return;
+    const paramTypes = calleeType.getParamTypes();
+    if (calleeType.isVarArg) {
+      // Fixed params
+      for (let i = 0; i < paramTypes.length && i < expr.arguments.length; i++) {
+        const idx = i;
+        wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
+      }
+      // Varargs: default argument promotion (float→double)
+      for (let i = paramTypes.length; i < expr.arguments.length; i++) {
+        const idx = i;
+        if (expr.arguments[idx].type.removeQualifiers() === Types.TFLOAT) {
+          wrapImplicitCast(expr.arguments[idx], Types.TDOUBLE, (e) => { expr.arguments[idx] = e; });
         }
       }
-      break;
+    } else {
+      for (let i = 0; i < expr.arguments.length && i < paramTypes.length; i++) {
+        const idx = i;
+        wrapImplicitCast(expr.arguments[idx], paramTypes[idx], (e) => { expr.arguments[idx] = e; });
+      }
     }
-    case Types.ExprKind.TERNARY:
-      annotateExpr(expr.condition);
-      annotateExpr(expr.thenExpr);
-      annotateExpr(expr.elseExpr);
-      wrapImplicitCast(expr.thenExpr, expr.type, (e) => { expr.thenExpr = e; });
-      wrapImplicitCast(expr.elseExpr, expr.type, (e) => { expr.elseExpr = e; });
-      break;
-    case Types.ExprKind.UNARY:
-      annotateExpr(expr.operand);
-      break;
-    case Types.ExprKind.SUBSCRIPT:
-      annotateExpr(expr.array);
-      annotateExpr(expr.index);
-      break;
-    case Types.ExprKind.MEMBER:
-    case Types.ExprKind.ARROW:
-      annotateExpr(expr.base);
-      break;
-    case Types.ExprKind.CAST:
-      annotateExpr(expr.expr);
-      break;
-    case Types.ExprKind.COMMA:
-      for (const e of expr.expressions) annotateExpr(e);
-      break;
-    case Types.ExprKind.INIT_LIST:
-      for (const e of expr.elements) annotateExpr(e);
-      break;
-    case Types.ExprKind.INTRINSIC:
-      for (const arg of expr.args) annotateExpr(arg);
-      break;
-    case Types.ExprKind.WASM:
-      for (const arg of expr.args) annotateExpr(arg);
-      break;
-    case Types.ExprKind.COMPOUND_LITERAL:
-      if (expr.initList) for (const e of expr.initList.elements) annotateExpr(e);
-      break;
-    case Types.ExprKind.SIZEOF_EXPR:
-    case Types.ExprKind.ALIGNOF_EXPR:
-      annotateExpr(expr.expr);
-      break;
-    case Types.ExprKind.IMPLICIT_CAST:
-      annotateExpr(expr.expr);
-      break;
-    default:
-      break; // INT, FLOAT, STRING, IDENT, SIZEOF_TYPE, ALIGNOF_TYPE — leaf nodes
+    return;
   }
+  if (expr instanceof AST.ETernary) {
+    annotateExpr(expr.condition);
+    annotateExpr(expr.thenExpr);
+    annotateExpr(expr.elseExpr);
+    wrapImplicitCast(expr.thenExpr, expr.type, (e) => { expr.thenExpr = e; });
+    wrapImplicitCast(expr.elseExpr, expr.type, (e) => { expr.elseExpr = e; });
+    return;
+  }
+  if (expr instanceof AST.EUnary)     { annotateExpr(expr.operand); return; }
+  if (expr instanceof AST.ESubscript) { annotateExpr(expr.array); annotateExpr(expr.index); return; }
+  if (expr instanceof AST.EMember || expr instanceof AST.EArrow) { annotateExpr(expr.base); return; }
+  if (expr instanceof AST.ECast)         { annotateExpr(expr.expr); return; }
+  if (expr instanceof AST.EImplicitCast) { annotateExpr(expr.expr); return; }
+  if (expr instanceof AST.EComma)        { for (const e of expr.expressions) annotateExpr(e); return; }
+  if (expr instanceof AST.EInitList)     { for (const e of expr.elements) annotateExpr(e); return; }
+  if (expr instanceof AST.EIntrinsic)    { for (const arg of expr.args) annotateExpr(arg); return; }
+  if (expr instanceof AST.EWasm)         { for (const arg of expr.args) annotateExpr(arg); return; }
+  if (expr instanceof AST.ECompoundLiteral) {
+    if (expr.initList) for (const e of expr.initList.elements) annotateExpr(e);
+    return;
+  }
+  if (expr instanceof AST.ESizeofExpr || expr instanceof AST.EAlignofExpr) {
+    annotateExpr(expr.expr);
+    return;
+  }
+  // EInt, EFloat, EString, EIdent, ESizeofType, EAlignofType — leaf nodes
 }
 
 function annotateStmt(stmt, returnType) {
@@ -8591,15 +8570,15 @@ function constEvalAddr(expr, policy) {
 
 function constEvalExpr(expr, policy) {
   if (!expr) return null;
-  switch (expr.kind) {
-    case Types.ExprKind.INT: return { kind: "int", intVal: expr.value };
-    case Types.ExprKind.FLOAT: return { kind: "float", floatVal: expr.value };
-    case Types.ExprKind.STRING: {
+  switch (expr.constructor) {
+    case AST.EInt: return { kind: "int", intVal: expr.value };
+    case AST.EFloat: return { kind: "float", floatVal: expr.value };
+    case AST.EString: {
       const addr = policy.getStringAddr(expr.value);
       if (addr === null || addr === undefined) return null;
       return { kind: "addr", addrVal: addr };
     }
-    case Types.ExprKind.IDENT: {
+    case AST.EIdent: {
       if (expr.decl && expr.decl.declKind === Types.DeclKind.ENUM_CONST) {
         return { kind: "int", intVal: BigInt(expr.decl.value) };
       }
@@ -8615,7 +8594,7 @@ function constEvalExpr(expr, policy) {
       }
       return null;
     }
-    case Types.ExprKind.UNARY: {
+    case AST.EUnary: {
       if (expr.op === "OP_ADDR") {
         const inner = expr.operand;
         // &var → address
@@ -8670,7 +8649,7 @@ function constEvalExpr(expr, policy) {
       }
       return null;
     }
-    case Types.ExprKind.BINARY: {
+    case AST.EBinary: {
       // Short-circuit LAND/LOR
       if (expr.op === "LAND") {
         const l = constEvalExpr(expr.left, policy);
@@ -8782,7 +8761,7 @@ function constEvalExpr(expr, policy) {
       }
       return null;
     }
-    case Types.ExprKind.TERNARY: {
+    case AST.ETernary: {
       const cond = constEvalExpr(expr.condition, policy);
       if (!cond) return null;
       let cv;
@@ -8791,8 +8770,8 @@ function constEvalExpr(expr, policy) {
       else return null;
       return constEvalExpr(cv ? expr.thenExpr : expr.elseExpr, policy);
     }
-    case Types.ExprKind.CAST:
-    case Types.ExprKind.IMPLICIT_CAST: {
+    case AST.ECast:
+    case AST.EImplicitCast: {
       const v = constEvalExpr(expr.expr, policy);
       if (!v) return null;
       const t = expr.type.removeQualifiers();
@@ -8807,11 +8786,11 @@ function constEvalExpr(expr, policy) {
       }
       return v;
     }
-    case Types.ExprKind.SIZEOF_EXPR: return { kind: "int", intVal: BigInt(expr.expr.type.size) };
-    case Types.ExprKind.SIZEOF_TYPE: return { kind: "int", intVal: BigInt(expr.operandType.size) };
-    case Types.ExprKind.ALIGNOF_EXPR: return { kind: "int", intVal: BigInt(expr.expr.type.align) };
-    case Types.ExprKind.ALIGNOF_TYPE: return { kind: "int", intVal: BigInt(expr.operandType.align) };
-    case Types.ExprKind.COMPOUND_LITERAL: {
+    case AST.ESizeofExpr: return { kind: "int", intVal: BigInt(expr.expr.type.size) };
+    case AST.ESizeofType: return { kind: "int", intVal: BigInt(expr.operandType.size) };
+    case AST.EAlignofExpr: return { kind: "int", intVal: BigInt(expr.expr.type.align) };
+    case AST.EAlignofType: return { kind: "int", intVal: BigInt(expr.operandType.align) };
+    case AST.ECompoundLiteral: {
       // For scalar compound literals like (int){42}, extract the value
       if (!expr.type.isAggregate() && !expr.type.isArray() && expr.initList &&
           expr.initList.elements.length > 0) {
@@ -10570,8 +10549,8 @@ class CodeGenerator {
   // --- Expression emission ---
   emitExpr(expr, ctx) {
     if (!ctx) ctx = EXPR_VALUE;
-    switch (expr.kind) {
-      case Types.ExprKind.INT: {
+    switch (expr.constructor) {
+      case AST.EInt: {
         const type = expr.type;
         if (type.kind === Types.TypeKind.LLONG || type.kind === Types.TypeKind.ULLONG) {
           this.body.i64Const(expr.value);
@@ -10580,17 +10559,17 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.FLOAT: {
+      case AST.EFloat: {
         if (expr.type.removeQualifiers() === Types.TFLOAT) this.body.f32Const(expr.value);
         else this.body.f64Const(expr.value);
         break;
       }
-      case Types.ExprKind.STRING: {
+      case AST.EString: {
         const addr = this.getStringAddress(expr.value);
         this.body.i32Const(addr);
         break;
       }
-      case Types.ExprKind.IDENT: {
+      case AST.EIdent: {
         if (expr.decl.declKind === Types.DeclKind.VAR) {
           const varDecl = expr.decl.definition || expr.decl;
           const gait = this.globalArrayAddrs.get(varDecl);
@@ -10627,7 +10606,7 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.BINARY: {
+      case AST.EBinary: {
         if (expr.op.endsWith("ASSIGN")) {
           this.emitAssignment(expr, ctx);
           return;
@@ -10719,7 +10698,7 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.UNARY: {
+      case AST.EUnary: {
         const operandType = expr.operand.type;
         switch (expr.op) {
           case "OP_NEG": {
@@ -10761,7 +10740,7 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.CALL: {
+      case AST.ECall: {
         const funcDecl = expr.funcDecl;
         if (funcDecl) {
           const funcDef = funcDecl.definition || funcDecl;
@@ -11011,7 +10990,7 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.SUBSCRIPT: {
+      case AST.ESubscript: {
         const arrType = expr.array.type.removeQualifiers();
         if (arrType.isGCArray()) {
           const typeIdx = getOrCreateGCWasmTypeIdx(this.wmod, arrType);
@@ -11034,7 +11013,7 @@ class CodeGenerator {
         if (!elemType.isAggregate()) this.emitLoad(elemType);
         break;
       }
-      case Types.ExprKind.MEMBER: {
+      case AST.EMember: {
         const baseType = expr.base.type.removeQualifiers();
         if (baseType.isGCStruct()) {
           const typeIdx = getOrCreateGCWasmTypeIdx(this.wmod, baseType);
@@ -11054,7 +11033,7 @@ class CodeGenerator {
         else if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
         break;
       }
-      case Types.ExprKind.ARROW: {
+      case AST.EArrow: {
         this.emitExpr(expr.base);
         const field = expr.memberDecl;
         const ptrType = expr.base.type.decay();
@@ -11066,26 +11045,26 @@ class CodeGenerator {
         else if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
         break;
       }
-      case Types.ExprKind.SIZEOF_EXPR:
+      case AST.ESizeofExpr:
         this.body.i32Const(this.sizeOf(expr.expr.type)); break;
-      case Types.ExprKind.SIZEOF_TYPE:
+      case AST.ESizeofType:
         this.body.i32Const(this.sizeOf(expr.operandType)); break;
-      case Types.ExprKind.ALIGNOF_EXPR:
+      case AST.EAlignofExpr:
         this.body.i32Const(this.alignOf(expr.expr.type)); break;
-      case Types.ExprKind.ALIGNOF_TYPE:
+      case AST.EAlignofType:
         this.body.i32Const(this.alignOf(expr.operandType)); break;
-      case Types.ExprKind.IMPLICIT_CAST: {
+      case AST.EImplicitCast: {
         if (ctx === EXPR_DROP) { this.emitExpr(expr.expr, EXPR_DROP); return; }
         this.emitExpr(expr.expr);
         this.emitConversion(expr.expr.type, expr.type, expr.expr);
         break;
       }
-      case Types.ExprKind.CAST: {
+      case AST.ECast: {
         this.emitExpr(expr.expr);
         this.emitConversion(expr.expr.type, expr.targetType);
         break;
       }
-      case Types.ExprKind.TERNARY: {
+      case AST.ETernary: {
         const resultType = cToWasmType(expr.type, this.wmod);
         this.emitExpr(expr.condition);
         this.emitConditionToI32(expr.condition.type);
@@ -11098,7 +11077,7 @@ class CodeGenerator {
         this.body.end();
         break;
       }
-      case Types.ExprKind.INTRINSIC: {
+      case AST.EIntrinsic: {
         switch (expr.intrinsicKind) {
           case Types.IntrinsicKind.VA_START:
             this.emitAddressOf(expr.args[0]);
@@ -11333,19 +11312,19 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.WASM: {
+      case AST.EWasm: {
         for (const arg of expr.args) this.emitExpr(arg);
         for (const b of expr.bytes) this.body.push(b);
         break;
       }
-      case Types.ExprKind.COMMA: {
+      case AST.EComma: {
         for (let i = 0; i < expr.expressions.length; i++) {
           const isLast = i + 1 === expr.expressions.length;
           this.emitExpr(expr.expressions[i], isLast ? ctx : EXPR_DROP);
         }
         return;
       }
-      case Types.ExprKind.COMPOUND_LITERAL: {
+      case AST.ECompoundLiteral: {
         const fsAddr = this.fileScopeCompoundLiteralAddrs.get(expr);
         if (fsAddr !== undefined) {
           this.body.i32Const(fsAddr);
@@ -11357,7 +11336,7 @@ class CodeGenerator {
         }
         break;
       }
-      case Types.ExprKind.GC_NEW: {
+      case AST.EGCNew: {
         const t = expr.type;
         const typeIdx = getOrCreateGCWasmTypeIdx(this.wmod, t);
         if (t.isGCStruct()) {
