@@ -3398,7 +3398,7 @@ function constEvalInt(expr) {
       if (expr.op === "OP_ADDR") {
         // Support offsetof pattern: &((type*)0)->member
         const inner = expr.operand;
-        if ((inner.kind === Types.ExprKind.ARROW || inner.kind === Types.ExprKind.MEMBER) && inner.memberDecl) {
+        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
           const base = constEvalInt(inner.base);
           if (base !== null) return base + BigInt(inner.memberDecl.byteOffset);
         }
@@ -3517,7 +3517,7 @@ function normalizeInitList(initList, containerType) {
   // Ensure output[index] is a sub-EInitList for an aggregate child
   function ensureSubList(list, index, subType) {
     ensureSlot(list, index);
-    if (!list.elements[index] || list.elements[index].kind !== Types.ExprKind.INIT_LIST) {
+    if (!list.elements[index] || !(list.elements[index] instanceof AST.EInitList)) {
       const cc = childCount(subType);
       const elems = [];
       if (cc !== 0x7FFFFFFF && cc > 0) {
@@ -3641,7 +3641,7 @@ function normalizeInitList(initList, containerType) {
       ensureSlot(top.output, top.index);
       const slotType = childType(top.type, top.index, top.output);
 
-      if (src[srcIdx].kind === Types.ExprKind.INIT_LIST) {
+      if (src[srcIdx] instanceof AST.EInitList) {
         // Braced sub-init-list: place and recurse
         top.output.elements[top.index] = src[srcIdx];
         normalizeInitList(top.output.elements[top.index], slotType);
@@ -3649,7 +3649,7 @@ function normalizeInitList(initList, containerType) {
         if (top.index + 1 > maxExtent) maxExtent = top.index + 1;
         advanceCursor();
         break;
-      } else if (src[srcIdx].kind === Types.ExprKind.STRING && slotType.isArray()) {
+      } else if (src[srcIdx] instanceof AST.EString && slotType.isArray()) {
         // String literal for char array
         top.output.elements[top.index] = src[srcIdx];
         srcIdx++;
@@ -3702,7 +3702,7 @@ function normalizeInitList(initList, containerType) {
           } else {
             list.elements[i] = makeZero(elemType);
           }
-        } else if (list.elements[i].kind === Types.ExprKind.INIT_LIST) {
+        } else if (list.elements[i] instanceof AST.EInitList) {
           fillZeros(list.elements[i], elemType);
         }
       }
@@ -3722,7 +3722,7 @@ function normalizeInitList(initList, containerType) {
             } else {
               list.elements[i] = makeZero(mt);
             }
-          } else if (list.elements[i].kind === Types.ExprKind.INIT_LIST) {
+          } else if (list.elements[i] instanceof AST.EInitList) {
             fillZeros(list.elements[i], mt);
           }
         }
@@ -3742,7 +3742,7 @@ function normalizeInitList(initList, containerType) {
               list.elements[0] = makeZero(mt);
             }
           }
-        } else if (list.elements[0].kind === Types.ExprKind.INIT_LIST) {
+        } else if (list.elements[0] instanceof AST.EInitList) {
           const members = getVarMembers(tag);
           const umi = list.unionMemberIndex;
           if (umi >= 0 && umi < members.length) {
@@ -4691,7 +4691,7 @@ class Parser {
           const initList = this.parseInitList(castType);
           // Handle string-initialized char array
           if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
-              initList.elements.length === 1 && initList.elements[0]?.kind === Types.ExprKind.STRING) {
+              initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
             castType = initList.elements[0].type;
             initList.type = castType;
           } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
@@ -5385,7 +5385,7 @@ class Parser {
       this.error(declTok, `'auto ${name}' requires an initializer`);
       return Types.TINT;
     }
-    if (initExpr.kind === Types.ExprKind.INIT_LIST) {
+    if (initExpr instanceof AST.EInitList) {
       this.error(declTok, `'auto ${name}' cannot be initialized from a braced initializer list`);
       return Types.TINT;
     }
@@ -5404,10 +5404,10 @@ class Parser {
   // helpful pointer to __ref_null.
   _isNullPointerConstant(expr) {
     if (!expr) return false;
-    if (expr.kind === Types.ExprKind.INT && expr.value === 0n) return true;
+    if (expr instanceof AST.EInt && expr.value === 0n) return true;
     // Strip implicit casts and re-check (handles things like ((void*)0) which
     // our preprocessor may surface as a CAST expression around 0).
-    if (expr.kind === Types.ExprKind.IMPLICIT_CAST || expr.kind === Types.ExprKind.CAST) {
+    if (expr instanceof AST.EImplicitCast || expr instanceof AST.ECast) {
       return this._isNullPointerConstant(expr.expr);
     }
     return false;
@@ -5454,13 +5454,13 @@ class Parser {
 
   markAddressTaken(expr) {
     if (!expr) return;
-    if (expr.kind === Types.ExprKind.IDENT) {
+    if (expr instanceof AST.EIdent) {
       if (expr.decl && expr.decl.declKind === Types.DeclKind.VAR) {
         expr.decl.allocClass = Types.AllocClass.MEMORY;
       }
-    } else if (expr.kind === Types.ExprKind.MEMBER) {
+    } else if (expr instanceof AST.EMember) {
       this.markAddressTaken(expr.base);
-    } else if (expr.kind === Types.ExprKind.SUBSCRIPT) {
+    } else if (expr instanceof AST.ESubscript) {
       if (expr.array.type && expr.array.type.isArray()) {
         this.markAddressTaken(expr.array);
       }
@@ -5483,16 +5483,16 @@ class Parser {
     }
     if (this.matchText("&")) {
       const e = this.parseCastExpression();
-      if ((e.kind === Types.ExprKind.MEMBER || e.kind === Types.ExprKind.ARROW) && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+      if ((e instanceof AST.EMember || e instanceof AST.EArrow) && e.memberDecl && e.memberDecl.bitWidth >= 0) {
         this.error(this.peek(-1), `Cannot take address of bit-field member '${e.memberDecl.name}'`);
       }
       if (e.type && e.type.removeQualifiers().isRef()) {
         this.error(this.peek(-1), `Cannot take address of ${e.type.removeQualifiers().kind} variable`);
       }
-      if (e.kind === Types.ExprKind.MEMBER && e.base && e.base.type && e.base.type.removeQualifiers().isGCStruct()) {
+      if (e instanceof AST.EMember && e.base && e.base.type && e.base.type.removeQualifiers().isGCStruct()) {
         this.error(this.peek(-1), `cannot take address of GC struct field`);
       }
-      if (e.kind === Types.ExprKind.SUBSCRIPT && e.array && e.array.type && e.array.type.removeQualifiers().isGCArray()) {
+      if (e instanceof AST.ESubscript && e.array && e.array.type && e.array.type.removeQualifiers().isGCArray()) {
         this.error(this.peek(-1), `cannot take address of GC array element`);
       }
       this.markAddressTaken(e); return new AST.EUnary(Types.computeUnaryType("OP_ADDR", e.type), "OP_ADDR", e);
@@ -5553,7 +5553,7 @@ class Parser {
             const initList = this.parseInitList(castType);
             // Handle string-initialized char array
             if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
-                initList.elements.length === 1 && initList.elements[0]?.kind === Types.ExprKind.STRING) {
+                initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
               castType = initList.elements[0].type;
               initList.type = castType;
             } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
@@ -5638,7 +5638,7 @@ class Parser {
         }
 
         let funcDecl = null;
-        if (expr.kind === Types.ExprKind.IDENT && expr.decl && expr.decl.declKind === Types.DeclKind.FUNC) {
+        if (expr instanceof AST.EIdent && expr.decl && expr.decl.declKind === Types.DeclKind.FUNC) {
           funcDecl = expr.decl;
         }
 
@@ -5761,9 +5761,9 @@ class Parser {
   promoteExprType(e) {
     const t = e.type;
     let bf = null;
-    if (e.kind === Types.ExprKind.MEMBER && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+    if (e instanceof AST.EMember && e.memberDecl && e.memberDecl.bitWidth >= 0) {
       bf = e.memberDecl;
-    } else if (e.kind === Types.ExprKind.ARROW && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+    } else if (e instanceof AST.EArrow && e.memberDecl && e.memberDecl.bitWidth >= 0) {
       bf = e.memberDecl;
     }
     if (bf) {
@@ -5806,16 +5806,16 @@ class Parser {
 
   inferArraySizeFromInit(arrayType, initExpr) {
     const elemSize = arrayType.baseType.size || 1;
-    if (initExpr.kind === Types.ExprKind.STRING) {
+    if (initExpr instanceof AST.EString) {
       return Types.arrayOf(arrayType.baseType, initExpr.value.length / elemSize);
     }
-    if (initExpr.kind === Types.ExprKind.INIT_LIST) {
+    if (initExpr instanceof AST.EInitList) {
       // For char/short/int arrays initialized with a single string literal
       const bt = arrayType.baseType.removeQualifiers();
       if ((bt === Types.TCHAR || bt === Types.TSCHAR || bt === Types.TUCHAR ||
            bt === Types.TSHORT || bt === Types.TUSHORT || bt === Types.TINT || bt === Types.TUINT) &&
           initExpr.elements.length === 1 &&
-          initExpr.elements[0].kind === Types.ExprKind.STRING) {
+          initExpr.elements[0] instanceof AST.EString) {
         return Types.arrayOf(arrayType.baseType, initExpr.elements[0].value.length / elemSize);
       }
       return Types.arrayOf(arrayType.baseType, initExpr.elements.length);
@@ -6407,12 +6407,12 @@ class Parser {
         }
         // Handle string-initialized char array
         if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
-            dvar.initExpr.kind === Types.ExprKind.STRING) {
+            dvar.initExpr instanceof AST.EString) {
           type = dvar.initExpr.type;
           dvar.type = type;
         }
         // Normalize init list
-        if (dvar.initExpr && dvar.initExpr.kind === Types.ExprKind.INIT_LIST) {
+        if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
           if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
             normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
@@ -6681,12 +6681,12 @@ class Parser {
         }
         // Handle string-initialized char array
         if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
-            dvar.initExpr.kind === Types.ExprKind.STRING) {
+            dvar.initExpr instanceof AST.EString) {
           type = Types.arrayOf(type.baseType, dvar.initExpr.type.arraySize);
           dvar.type = type;
         }
         // Normalize init list
-        if (dvar.initExpr && dvar.initExpr.kind === Types.ExprKind.INIT_LIST) {
+        if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
           if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
             normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
@@ -7141,7 +7141,7 @@ function annotateStmt(stmt, returnType) {
       for (const decl of stmt.declarations) {
         if (decl.declKind === Types.DeclKind.VAR && decl.initExpr) {
           annotateExpr(decl.initExpr);
-          if (!decl.type.isAggregate() && decl.initExpr.kind !== Types.ExprKind.INIT_LIST) {
+          if (!decl.type.isAggregate() && !(decl.initExpr instanceof AST.EInitList)) {
             wrapImplicitCast(decl.initExpr, decl.type, (e) => { decl.initExpr = e; });
           }
         }
@@ -7195,9 +7195,9 @@ function annotateStmt(stmt, returnType) {
 
 // Check if an expression is a call to a named function, return the ECall or null
 function getNamedCall(expr, name) {
-  if (expr.kind !== Types.ExprKind.CALL) return null;
+  if (!(expr instanceof AST.ECall)) return null;
   const callee = expr.callee;
-  if (callee.kind !== Types.ExprKind.IDENT) return null;
+  if (!(callee instanceof AST.EIdent)) return null;
   if (callee.name !== name) return null;
   return expr;
 }
@@ -7205,21 +7205,21 @@ function getNamedCall(expr, name) {
 // Detect setjmp patterns in an if-condition.
 // Returns {call, zeroIsTrue} or {call: null}
 function extractSetjmpCall(cond) {
-  if (cond.kind === Types.ExprKind.BINARY) {
+  if (cond instanceof AST.EBinary) {
     if (cond.op === "EQ") {
       let call = getNamedCall(cond.left, "setjmp");
-      if (call && cond.right.kind === Types.ExprKind.INT && cond.right.value === 0n)
+      if (call && cond.right instanceof AST.EInt && cond.right.value === 0n)
         return { call, zeroIsTrue: true };
       call = getNamedCall(cond.right, "setjmp");
-      if (call && cond.left.kind === Types.ExprKind.INT && cond.left.value === 0n)
+      if (call && cond.left instanceof AST.EInt && cond.left.value === 0n)
         return { call, zeroIsTrue: true };
     }
     if (cond.op === "NE") {
       let call = getNamedCall(cond.left, "setjmp");
-      if (call && cond.right.kind === Types.ExprKind.INT && cond.right.value === 0n)
+      if (call && cond.right instanceof AST.EInt && cond.right.value === 0n)
         return { call, zeroIsTrue: false };
       call = getNamedCall(cond.right, "setjmp");
-      if (call && cond.left.kind === Types.ExprKind.INT && cond.left.value === 0n)
+      if (call && cond.left instanceof AST.EInt && cond.left.value === 0n)
         return { call, zeroIsTrue: false };
     }
   }
@@ -7227,7 +7227,7 @@ function extractSetjmpCall(cond) {
   const directCall = getNamedCall(cond, "setjmp");
   if (directCall) return { call: directCall, zeroIsTrue: false };
   // Pattern: !setjmp(buf)
-  if (cond.kind === Types.ExprKind.UNARY && cond.op === "OP_LNOT") {
+  if (cond instanceof AST.EUnary && cond.op === "OP_LNOT") {
     const negCall = getNamedCall(cond.operand, "setjmp");
     if (negCall) return { call: negCall, zeroIsTrue: true };
   }
@@ -8567,14 +8567,14 @@ const NULL_ADDR_POLICY = {
 function constEvalAddr(expr, policy) {
   if (!expr) return null;
   // Cast from integer to pointer: (type*)intval
-  if (expr.kind === Types.ExprKind.CAST || expr.kind === Types.ExprKind.IMPLICIT_CAST) {
+  if (expr instanceof AST.ECast || expr instanceof AST.EImplicitCast) {
     const inner = constEvalExpr(expr.expr, policy);
     if (inner && inner.kind === "int") return Number(inner.intVal);
     if (inner && inner.kind === "addr") return inner.addrVal;
     return null;
   }
   // Arrow: base->member → addr(base) + offset, where base is pointer
-  if (expr.kind === Types.ExprKind.ARROW && expr.memberDecl) {
+  if (expr instanceof AST.EArrow && expr.memberDecl) {
     const baseVal = constEvalExpr(expr.base, policy);
     if (baseVal && (baseVal.kind === "addr" || baseVal.kind === "int")) {
       const baseAddr = baseVal.kind === "addr" ? baseVal.addrVal : Number(baseVal.intVal);
@@ -8619,7 +8619,7 @@ function constEvalExpr(expr, policy) {
       if (expr.op === "OP_ADDR") {
         const inner = expr.operand;
         // &var → address
-        if (inner.kind === Types.ExprKind.IDENT && inner.decl) {
+        if (inner instanceof AST.EIdent && inner.decl) {
           if (inner.decl.declKind === Types.DeclKind.VAR) {
             const varDecl = inner.decl.definition || inner.decl;
             const addr = policy.getGlobalAddr(varDecl);
@@ -8632,14 +8632,14 @@ function constEvalExpr(expr, policy) {
           }
         }
         // &(base->member) or &(base.member) → base_addr + member offset
-        if ((inner.kind === Types.ExprKind.ARROW || inner.kind === Types.ExprKind.MEMBER) && inner.memberDecl) {
+        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
           const baseAddr = constEvalAddr(inner.base, policy);
           if (baseAddr !== null) {
             return { kind: "addr", addrVal: baseAddr + inner.memberDecl.byteOffset };
           }
         }
         // &(base[index]) → base_addr + index * elemSize
-        if (inner.kind === Types.ExprKind.SUBSCRIPT) {
+        if (inner instanceof AST.ESubscript) {
           const baseAddr = constEvalAddr(inner.array, policy);
           const idx = constEvalExpr(inner.index, policy);
           if (baseAddr !== null && idx && idx.kind === "int") {
@@ -8648,7 +8648,7 @@ function constEvalExpr(expr, policy) {
           }
         }
         // &(compound_literal) → address of file-scope compound literal
-        if (inner.kind === Types.ExprKind.COMPOUND_LITERAL) {
+        if (inner instanceof AST.ECompoundLiteral) {
           const addr = policy.getCompoundLitAddr(inner);
           if (addr !== null && addr !== undefined) return { kind: "addr", addrVal: addr };
         }
@@ -8986,7 +8986,7 @@ class CodeGenerator {
   }
 
   computeFAMExtraSize(type, initExpr) {
-    if (!type.isTag() || !initExpr || initExpr.kind !== Types.ExprKind.INIT_LIST) return 0;
+    if (!type.isTag() || !initExpr || !(initExpr instanceof AST.EInitList)) return 0;
     const tag = type.tagDecl;
     if (!tag || tag.tagKind !== Types.TagKind.STRUCT) return 0;
     const members = tag.members.filter(m => m.declKind === Types.DeclKind.VAR);
@@ -9001,8 +9001,8 @@ class CodeGenerator {
     const famElem = initExpr.elements[famIdx];
     const elemType = famMember.type.baseType;
     const elemSize = this.sizeOf(elemType);
-    if (famElem.kind === Types.ExprKind.STRING) return famElem.value.length * elemSize;
-    if (famElem.kind === Types.ExprKind.INIT_LIST) return famElem.elements.length * elemSize;
+    if (famElem instanceof AST.EString) return famElem.value.length * elemSize;
+    if (famElem instanceof AST.EInitList) return famElem.elements.length * elemSize;
     return elemSize;
   }
 
@@ -9116,9 +9116,9 @@ class CodeGenerator {
       for (let i = 0; i < initList.elements.length; i++) {
         const elemOffset = baseOffset + i * elemSize;
         const elem = initList.elements[i];
-        if (elem.kind === Types.ExprKind.INIT_LIST) {
+        if (elem instanceof AST.EInitList) {
           this.populateInitListStatic(elem, elemType, elemOffset);
-        } else if (elem.kind === Types.ExprKind.STRING && elemType.isArray()) {
+        } else if (elem instanceof AST.EString && elemType.isArray()) {
           this.writeStringLiteralToStatic(elem.value, elemType, elemOffset);
         } else {
           const val = this._constEvalExpr(elem);
@@ -9150,9 +9150,9 @@ class CodeGenerator {
                 unit = (unit & ~(mask << bo)) | (bits << bo);
                 for (let b = 0; b < unitSize; b++) this.staticData[fieldOffset + b] = (unit >>> (b * 8)) & 0xFF;
               }
-            } else if (elem.kind === Types.ExprKind.INIT_LIST) {
+            } else if (elem instanceof AST.EInitList) {
               this.populateInitListStatic(elem, member.type, fieldOffset);
-            } else if (elem.kind === Types.ExprKind.STRING && member.type.isArray()) {
+            } else if (elem instanceof AST.EString && member.type.isArray()) {
               this.writeStringLiteralToStatic(elem.value, member.type, fieldOffset);
             } else {
               const val = this._constEvalExpr(elem);
@@ -9170,9 +9170,9 @@ class CodeGenerator {
             if (member.declKind !== Types.DeclKind.VAR) continue;
             if (varIdx++ !== targetIdx) continue;
             const elem = initList.elements[0];
-            if (elem.kind === Types.ExprKind.INIT_LIST) {
+            if (elem instanceof AST.EInitList) {
               this.populateInitListStatic(elem, member.type, baseOffset);
-            } else if (elem.kind === Types.ExprKind.STRING && member.type.isArray()) {
+            } else if (elem instanceof AST.EString && member.type.isArray()) {
               this.writeStringLiteralToStatic(elem.value, member.type, baseOffset);
             } else {
               const val = this._constEvalExpr(elem);
@@ -9201,7 +9201,7 @@ class CodeGenerator {
       for (let i = 0; i < initList.elements.length; i++) {
         const elemOffset = baseOffset + i * elemSize;
         const elem = initList.elements[i];
-        if (elem.kind === Types.ExprKind.INIT_LIST) {
+        if (elem instanceof AST.EInitList) {
           this.emitInitListRuntimeStores(elem, elemType, baseLocalIdx, elemOffset);
         } else {
           const val = this._constEvalExpr(elem);
@@ -9242,7 +9242,7 @@ class CodeGenerator {
                 this.emitConversion(elem.type, member.type);
                 this.emitBitFieldStore(member);
               }
-            } else if (elem.kind === Types.ExprKind.INIT_LIST) {
+            } else if (elem instanceof AST.EInitList) {
               this.emitInitListRuntimeStores(elem, member.type, baseLocalIdx, fieldOffset);
             } else {
               const val = this._constEvalExpr(elem);
@@ -9273,7 +9273,7 @@ class CodeGenerator {
             if (member.declKind !== Types.DeclKind.VAR) continue;
             if (varIdx++ !== targetIdx) continue;
             const elem = initList.elements[0];
-            if (elem.kind === Types.ExprKind.INIT_LIST) {
+            if (elem instanceof AST.EInitList) {
               this.emitInitListRuntimeStores(elem, member.type, baseLocalIdx, baseOffset);
             } else {
               const val = this._constEvalExpr(elem);
@@ -9318,13 +9318,13 @@ class CodeGenerator {
     }
   }
   emitInitToFrameSlot(type, initExpr, frameOffset) {
-    if (type.isArray() && initExpr.kind === Types.ExprKind.STRING) {
+    if (type.isArray() && initExpr instanceof AST.EString) {
       this.emitStringToFrameSlot(initExpr.value, type, frameOffset);
       return;
     }
-    if (type.isAggregate() && initExpr.kind === Types.ExprKind.INIT_LIST) {
+    if (type.isAggregate() && initExpr instanceof AST.EInitList) {
       const il = initExpr;
-      if (type.isArray() && il.elements.length === 1 && il.elements[0].kind === Types.ExprKind.STRING) {
+      if (type.isArray() && il.elements.length === 1 && il.elements[0] instanceof AST.EString) {
         this.emitStringToFrameSlot(il.elements[0].value, type, frameOffset);
         return;
       }
@@ -10192,8 +10192,8 @@ class CodeGenerator {
   // --- Type conversion ---
   _isNullPointerConstantCG(expr) {
     if (!expr) return false;
-    if (expr.kind === Types.ExprKind.INT && expr.value === 0n) return true;
-    if (expr.kind === Types.ExprKind.IMPLICIT_CAST || expr.kind === Types.ExprKind.CAST) {
+    if (expr instanceof AST.EInt && expr.value === 0n) return true;
+    if (expr instanceof AST.EImplicitCast || expr instanceof AST.ECast) {
       return this._isNullPointerConstantCG(expr.expr);
     }
     return false;
@@ -10259,7 +10259,7 @@ class CodeGenerator {
 
   // --- LValue ---
   emitLValue(expr) {
-    if (expr.kind === Types.ExprKind.IDENT && expr.decl && expr.decl.declKind === Types.DeclKind.VAR) {
+    if (expr instanceof AST.EIdent && expr.decl && expr.decl.declKind === Types.DeclKind.VAR) {
       const varDecl = expr.decl.definition || expr.decl;
       const lit = this.localVarToWasmLocalIdx.get(varDecl);
       const git = this.globalVarToWasmGlobalIdx.get(varDecl);
@@ -10274,7 +10274,7 @@ class CodeGenerator {
       if (pait !== undefined) return { kind: LV_MEMORY, type: varDecl.type, addrSource: LV_ADDR_FRAME, addrImmediate: pait };
       throw new Error(`emitLValue: variable '${varDecl.name}' not found`);
     }
-    if (expr.kind === Types.ExprKind.MEMBER) {
+    if (expr instanceof AST.EMember) {
       const baseT = expr.base.type.removeQualifiers();
       if (baseT.isGCStruct()) {
         const refWt = this.getBinaryWasmType(baseT);
@@ -10294,14 +10294,14 @@ class CodeGenerator {
       this.body.localSet(lv.savedLocal);
       return lv;
     }
-    if (expr.kind === Types.ExprKind.ARROW) {
+    if (expr instanceof AST.EArrow) {
       this.emitAddressOf(expr);
       const lv = { kind: LV_MEMORY, type: expr.type, bitField: (expr.memberDecl && expr.memberDecl.bitWidth >= 0) ? expr.memberDecl : null, addrSource: LV_ADDR_LOCAL };
       lv.savedLocal = this.allocLocal(WT_I32);
       this.body.localSet(lv.savedLocal);
       return lv;
     }
-    if (expr.kind === Types.ExprKind.SUBSCRIPT) {
+    if (expr instanceof AST.ESubscript) {
       const arrT = expr.array.type.removeQualifiers();
       if (arrT.isGCArray()) {
         const refWt = this.getBinaryWasmType(arrT);
@@ -10329,7 +10329,7 @@ class CodeGenerator {
       this.body.localSet(lv.savedLocal);
       return lv;
     }
-    if (expr.kind === Types.ExprKind.UNARY && expr.op === "OP_DEREF") {
+    if (expr instanceof AST.EUnary && expr.op === "OP_DEREF") {
       this.emitExpr(expr.operand);
       const lv = { kind: LV_MEMORY, type: expr.type, addrSource: LV_ADDR_LOCAL };
       lv.savedLocal = this.allocLocal(WT_I32);
@@ -10391,7 +10391,7 @@ class CodeGenerator {
 
   // --- Address-of ---
   emitAddressOf(expr) {
-    if (expr.kind === Types.ExprKind.IDENT) {
+    if (expr instanceof AST.EIdent) {
       if (expr.decl.declKind === Types.DeclKind.FUNC) {
         const func = expr.decl.definition || expr.decl;
         const tIdx = this.funcDefToTableIdx.get(func);
@@ -10409,14 +10409,14 @@ class CodeGenerator {
         throw new Error(`Cannot take address of REGISTER variable '${varDecl.name}'`);
       }
     }
-    if (expr.kind === Types.ExprKind.MEMBER) {
+    if (expr instanceof AST.EMember) {
       this.emitAddressOf(expr.base);
       const tag = expr.base.type.tagDecl;
       const offset = this.getFieldOffset(tag, expr.memberDecl);
       if (offset) { this.body.i32Const(offset); this.body.aop(WT_I32, ALU.OP_ADD); }
       return;
     }
-    if (expr.kind === Types.ExprKind.ARROW) {
+    if (expr instanceof AST.EArrow) {
       this.emitExpr(expr.base);
       const ptrType = expr.base.type.decay();
       const baseType = ptrType.baseType;
@@ -10425,7 +10425,7 @@ class CodeGenerator {
       if (offset) { this.body.i32Const(offset); this.body.aop(WT_I32, ALU.OP_ADD); }
       return;
     }
-    if (expr.kind === Types.ExprKind.SUBSCRIPT) {
+    if (expr instanceof AST.ESubscript) {
       const elemSize = this.sizeOf(expr.type);
       this.emitExpr(expr.array);
       this.emitExpr(expr.index);
@@ -10434,11 +10434,11 @@ class CodeGenerator {
       this.body.aop(WT_I32, ALU.OP_ADD);
       return;
     }
-    if (expr.kind === Types.ExprKind.UNARY && expr.op === "OP_DEREF") {
+    if (expr instanceof AST.EUnary && expr.op === "OP_DEREF") {
       this.emitExpr(expr.operand);
       return;
     }
-    if (expr.kind === Types.ExprKind.COMPOUND_LITERAL) {
+    if (expr instanceof AST.ECompoundLiteral) {
       const fsAddr = this.fileScopeCompoundLiteralAddrs.get(expr);
       if (fsAddr !== undefined) { this.body.i32Const(fsAddr); }
       else {
@@ -11515,7 +11515,7 @@ function generateCode(units, outputFile, options) {
     for (const cl of (unit.fileScopeCompoundLiterals || [])) {
       const addr = cg.fileScopeCompoundLiteralAddrs.get(cl);
       const baseOffset = addr - (cg.stackPages * 65536);
-      if (cl.type.isArray() && cl.initList.elements.length === 1 && cl.initList.elements[0].kind === Types.ExprKind.STRING) {
+      if (cl.type.isArray() && cl.initList.elements.length === 1 && cl.initList.elements[0] instanceof AST.EString) {
         cg.writeStringLiteralToStatic(cl.initList.elements[0].value, cl.type, baseOffset);
       } else if (cl.type.isAggregate() || cl.type.isArray()) {
         cg.populateInitListStatic(cl.initList, cl.type, baseOffset);
@@ -11532,11 +11532,11 @@ function generateCode(units, outputFile, options) {
     if (varDef.allocClass === Types.AllocClass.MEMORY) {
       const addr = cg.globalArrayAddrs.get(varDef);
       const baseOffset = addr - (cg.stackPages * 65536);
-      if (varDef.initExpr && varDef.initExpr.kind === Types.ExprKind.INIT_LIST) {
+      if (varDef.initExpr && varDef.initExpr instanceof AST.EInitList) {
         cg.populateInitListStatic(varDef.initExpr, varDef.type, baseOffset);
-      } else if (varDef.initExpr && varDef.initExpr.kind === Types.ExprKind.COMPOUND_LITERAL && varDef.type.isAggregate()) {
+      } else if (varDef.initExpr && varDef.initExpr instanceof AST.ECompoundLiteral && varDef.type.isAggregate()) {
         cg.populateInitListStatic(varDef.initExpr.initList, varDef.type, baseOffset);
-      } else if (varDef.initExpr && varDef.type.isArray() && varDef.initExpr.kind === Types.ExprKind.STRING) {
+      } else if (varDef.initExpr && varDef.type.isArray() && varDef.initExpr instanceof AST.EString) {
         const str = varDef.initExpr.value;
         const copySize = cg.sizeOf(varDef.type);
         const len = Math.min(copySize, str.length);
@@ -11555,9 +11555,9 @@ function generateCode(units, outputFile, options) {
       // for global ref types — user must initialize in main / a startup fn.
       if (varDef.initExpr) {
         const isNullConst = (e) =>
-          (e.kind === Types.ExprKind.INT && e.value === 0n) ||
-          (e.kind === Types.ExprKind.IMPLICIT_CAST && isNullConst(e.expr)) ||
-          (e.kind === Types.ExprKind.CAST && isNullConst(e.expr));
+          (e instanceof AST.EInt && e.value === 0n) ||
+          (e instanceof AST.EImplicitCast && isNullConst(e.expr)) ||
+          (e instanceof AST.ECast && isNullConst(e.expr));
         if (!isNullConst(varDef.initExpr)) {
           throw new Error(
             `global '${varDef.name}': reference-typed globals can only be initialized to null/0 ` +
@@ -11586,16 +11586,16 @@ function generateCode(units, outputFile, options) {
       const wt = cToWasmType(varDef.type, wmod);
       // Determine initial value
       let globalIdx;
-      if (varDef.initExpr && varDef.initExpr.kind === Types.ExprKind.INT) {
+      if (varDef.initExpr && varDef.initExpr instanceof AST.EInt) {
         const val = Types.truncateConstInt(varDef.initExpr.value, varDef.type);
         if (wtEquals(wt, WT_F32)) globalIdx = wmod.addGlobalF32(Number(val), true);
         else if (wtEquals(wt, WT_F64)) globalIdx = wmod.addGlobalF64(Number(val), true);
         else if (wtEquals(wt, WT_I64)) globalIdx = wmod.addGlobalI64(val, true);
         else globalIdx = wmod.addGlobalI32(Number(val), true);
-      } else if (varDef.initExpr && varDef.initExpr.kind === Types.ExprKind.FLOAT) {
+      } else if (varDef.initExpr && varDef.initExpr instanceof AST.EFloat) {
         if (wtEquals(wt, WT_F32)) globalIdx = wmod.addGlobalF32(varDef.initExpr.value, true);
         else globalIdx = wmod.addGlobalF64(varDef.initExpr.value, true);
-      } else if (varDef.initExpr && varDef.initExpr.kind === Types.ExprKind.STRING) {
+      } else if (varDef.initExpr && varDef.initExpr instanceof AST.EString) {
         const addr = cg.getStringAddress(varDef.initExpr.value);
         globalIdx = wmod.addGlobalI32(addr, true);
       } else if (varDef.initExpr) {
