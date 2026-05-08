@@ -13141,6 +13141,18 @@ class Translator {
   // chained, e.g. `a = b = c`).
   translateAssign(lhsAst, rhsIR, loc) {
     const { T, IR } = this.GUC;
+    // The C-level rhs may have a different type from the lvalue (chain
+    // assignments like `l2 = s2 = -1;` where each link's value has the
+    // type of its LHS, but no implicit-cast pass wraps the chained rhs).
+    // Convert before storing so SetVars / Store / TeeVars get matching types.
+    const lhsCT = lhsAst.type;
+    const lhsIRT = this.cTypeToIR(lhsCT);
+    const rhsIRT = (rhsIR.types && rhsIR.types.length === 1) ? rhsIR.types[0] : null;
+    if (rhsIRT && lhsIRT && rhsIRT !== lhsIRT) {
+      rhsIR = this.emitConversion(loc, rhsIRT, lhsIRT, rhsIR,
+        { kind: Types.ExprKind.IMPLICIT_CAST, type: lhsCT,
+          expr: { type: lhsCT } });
+    }
     if (lhsAst.kind === Types.ExprKind.IDENT) {
       const local = this.cVarToLocal.get(lhsAst.decl);
       if (local) return new IR.TeeVars(loc, [local], rhsIR);
