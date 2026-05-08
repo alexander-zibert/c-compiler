@@ -6332,6 +6332,14 @@ class Parser {
       this.expect(")");
       this.expect(";");
       const tag = this.findExceptionTag(tagName);
+      // Insert implicit casts on args matching the tag's parameter types
+      // (when known). Unresolved tag names skip this — the diagnostic for
+      // unknown tags fires later via {name: tagName}.
+      if (tag && tag.paramTypes) {
+        for (let i = 0; i < args.length && i < tag.paramTypes.length; i++) {
+          args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
+        }
+      }
       return new AST.SThrow(tag || { name: tagName }, args);
     }
 
@@ -7229,13 +7237,9 @@ function annotateStmt(stmt, returnType) {
       for (const cc of stmt.catches) annotateStmt(cc.body, returnType);
       break;
     case AST.SThrow:
-      for (let i = 0; i < stmt.args.length; i++) {
-        annotateExpr(stmt.args[i]);
-        if (stmt.tag && stmt.tag.paramTypes && i < stmt.tag.paramTypes.length) {
-          const idx = i;
-          wrapImplicitCast(stmt.args[idx], stmt.tag.paramTypes[idx], (e) => { stmt.args[idx] = e; });
-        }
-      }
+      // Throw-arg implicit casts are inserted inline at parse time and
+      // by the setjmp/longjmp lowering helper; recurse only.
+      for (const arg of stmt.args) annotateExpr(arg);
       break;
     default:
       break;
@@ -7301,7 +7305,15 @@ function makeSetBufIdStmt(bufExpr, counterVar) {
 
 // Build: __throw tag(idExpr, valExpr)
 function makeThrowLongJump(tag, idExpr, valExpr) {
-  return new AST.SThrow(tag, [idExpr, valExpr]);
+  // tag.paramTypes are [int, int]; idExpr / valExpr are already int in
+  // practice but maybeImplicitCast is a no-op when types match anyway.
+  const args = [idExpr, valExpr];
+  if (tag && tag.paramTypes) {
+    for (let i = 0; i < args.length && i < tag.paramTypes.length; i++) {
+      args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
+    }
+  }
+  return new AST.SThrow(tag, args);
 }
 
 // Build catch body: { if (id != buf[0]) rethrow; <userBody> }
