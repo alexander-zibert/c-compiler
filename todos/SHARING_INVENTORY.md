@@ -93,7 +93,32 @@ helpers** that need no abstraction:
 - i32-narrow i64 indices in pointer arithmetic (SUBSCRIPT, ADD/SUB,
   compound assignment).
 
-**GUC parity: 256 → 287 (+31). Default backend: 420/420 (no regression).**
+### Additional fixes (continuation)
+
+- Compound assignment integer promotion (default's `usualArithmeticConversions`
+  pattern, with `_truncateToCType` after the op for narrow types).
+- `_truncateToCType` helper for masking / sign-extending i32-slot values
+  to a narrow C type's width — used after compound assign, after
+  increment/decrement, in same-slot CASTs that narrow, and in
+  `translateAssign`.
+- `translateAssign` now converts rhs IR type to lhs IR type (chain
+  assignments like `l2 = s2 = -1;` no longer crash IR validation).
+- `emitConversion` same-slot branch handles narrow-target truncation
+  for both Literal sources (re-canonicalize the value) and computed
+  sources (route through `_truncateToCType`).
+- Vararg path: stores narrow integer args at full int width
+  (`i32.store` instead of `i32.store8`), matching default's
+  `emitVaArgStore`.
+- Per-statement preamble mechanism: a `_currentPreamble` array that
+  multi-stmt DECLs (e.g. `int arr[3] = {…}` which expands to
+  MemoryFill + per-element Stores) push into. `_translateCompound`
+  splices the preamble into the parent COMPOUND scope BEFORE the
+  stmt's IR. This avoids wrapping in a Block, which would let the
+  Block claim the user MEMORY-class StackSlot — causing codegen layout
+  to alias it with sibling FrameNodes (vacalls etc.) and corrupt the
+  variable's storage.
+
+**GUC parity: 256 → 305 (+49). Default backend: 420/420 (no regression).**
 
 Phase B (later): factor out the static init-list traversal and bitfield
 algorithms.
