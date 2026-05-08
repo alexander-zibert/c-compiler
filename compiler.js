@@ -2589,13 +2589,52 @@ class Expr {
 
   // --- Expr subclasses ---
   class EInt extends Expr {
-    constructor(type, value) { super(type); this.value = value; Object.seal(this); }
+    constructor(type, value) {
+      if (!(type instanceof Types.TypeInfo) || !type.isInteger()) {
+        throw new Error(`EInt: type must be integral; got ${type}`);
+      }
+      if (typeof value !== 'bigint') {
+        throw new Error(`EInt: value must be a BigInt; got ${typeof value}`);
+      }
+      super(type);
+      this.value = value;
+      Object.seal(this);
+    }
   }
   class EFloat extends Expr {
-    constructor(type, value) { super(type); this.value = value; Object.seal(this); }
+    constructor(type, value) {
+      if (!(type instanceof Types.TypeInfo) || !type.isFloatingPoint()) {
+        throw new Error(`EFloat: type must be floating-point; got ${type}`);
+      }
+      if (typeof value !== 'number') {
+        throw new Error(`EFloat: value must be a number; got ${typeof value}`);
+      }
+      super(type);
+      this.value = value;
+      Object.seal(this);
+    }
   }
   class EString extends Expr {
-    constructor(type, value) { super(type); this.value = value; Object.seal(this); }
+    constructor(type, value) {
+      if (!(type instanceof Types.TypeInfo) || !type.isArray()) {
+        throw new Error(`EString: type must be an array; got ${type}`);
+      }
+      const elemKind = type.baseType?.kind;
+      const validElem =
+        elemKind === Types.TypeKind.CHAR || elemKind === Types.TypeKind.SCHAR ||
+        elemKind === Types.TypeKind.UCHAR || elemKind === Types.TypeKind.SHORT ||
+        elemKind === Types.TypeKind.USHORT || elemKind === Types.TypeKind.INT ||
+        elemKind === Types.TypeKind.UINT;
+      if (!validElem) {
+        throw new Error(`EString: element type must be a character/integer kind suitable for a string literal; got ${type.baseType}`);
+      }
+      if (!Array.isArray(value)) {
+        throw new Error(`EString: value must be an Array of byte numbers; got ${value?.constructor?.name ?? typeof value}`);
+      }
+      super(type);
+      this.value = value;
+      Object.seal(this);
+    }
   }
   class EIdent extends Expr {
     constructor(type, name, decl) { super(type); this.name = name; this.decl = decl; Object.seal(this); }
