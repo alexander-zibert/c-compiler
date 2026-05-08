@@ -13348,8 +13348,15 @@ class Translator {
     const oldLocal = new IR.LocalVariable(loc, /*mutable*/ true, '_idc_old', irT);
     this.extraLocals.push(oldLocal);
     const stmts = [new IR.SetVars(loc, [oldLocal], [oldVal])];
-    const newExpr = new IR.BinOp(loc, isDec ? 'sub' : 'add',
+    let newExpr = new IR.BinOp(loc, isDec ? 'sub' : 'add',
       new IR.GetVars(loc, [oldLocal]), stepLit);
+    // For narrow integer types (u8/u16/i8/i16), the BinOp ran at the i32
+    // slot's full width — wraparound happens at 32 bits, not at the C
+    // type's width. Truncate explicitly so `unsigned char u = 0; u--;` ends
+    // up at 255, not -1. (Pointers naturally fit i32, no truncation needed.)
+    if (!operandT.isPointer || !operandT.isPointer()) {
+      newExpr = this._truncateToCType(newExpr, operandT, loc);
+    }
     // Store newExpr back to the lvalue via translateAssign-like path.
     stmts.push(new IR.Drop(loc, this.translateAssign(expr.operand, newExpr, loc)));
     if (isPost) {
