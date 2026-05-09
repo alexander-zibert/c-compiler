@@ -1951,6 +1951,14 @@ const TypeKind = Object.freeze({
   GC_STRUCT: "gc_struct", GC_ARRAY: "gc_array",
   EQREF: "eqref",
   AUTO: "auto",  // C23 type-inference sentinel (set during parse, resolved at init)
+  // The bottom type for error recovery. After a parser diagnostic
+  // (undeclared identifier, missing struct field, unknown exception
+  // tag, etc.) we synthesize a placeholder decl typed DIVERGENT so the
+  // parse can continue without nulls leaking downstream. DIVERGENT
+  // absorbs in arithmetic/conversion contexts so further operations on
+  // it stay well-typed. Codegen never sees it — `hasErrors` halts the
+  // pipeline before then.
+  DIVERGENT: "divergent",
 });
 
 const TagKind = Object.freeze({
@@ -2155,6 +2163,10 @@ class TypeInfo {
   isArray() { return this.kind === TypeKind.ARRAY; }
   isFunction() { return this.kind === TypeKind.FUNCTION; }
   isVoid() { return this.kind === TypeKind.VOID; }
+  // The bottom-type marker used during error recovery. Operations that
+  // join types (usual-arithmetic, computeBinaryType, maybeImplicitCast)
+  // treat any divergent operand as absorbing — the result is divergent.
+  isDivergent() { return this.kind === TypeKind.DIVERGENT; }
   isTag() { return this.kind === TypeKind.TAG; }
   isStruct() { return this.kind === TypeKind.TAG && this.tagKind === TagKind.STRUCT; }
   isUnion() { return this.kind === TypeKind.TAG && this.tagKind === TagKind.UNION; }
@@ -2235,6 +2247,8 @@ class TypeInfo {
 // Primitive type singletons
 const TUNKNOWN = new TypeInfo(TypeKind.UNKNOWN, 0, 0, false);
 const TVOID = new TypeInfo(TypeKind.VOID, 0, 0, false);
+// Divergent: bottom type for error recovery (see TypeKind.DIVERGENT).
+const TDIVERGENT = new TypeInfo(TypeKind.DIVERGENT, 0, 0, false);
 const TBOOL = new TypeInfo(TypeKind.BOOL, 1, 1, true);
 const TCHAR = new TypeInfo(TypeKind.CHAR, 1, 1, true);
 const TSCHAR = new TypeInfo(TypeKind.SCHAR, 1, 1, true);
@@ -2429,6 +2443,9 @@ function usualArithmeticConversions(a, b) {
   // C99 6.3.1.8: strip qualifiers so 'const double' matches TDOUBLE etc.
   a = a.removeQualifiers();
   b = b.removeQualifiers();
+  // Divergent absorbs — the result of mixing in a recovery type stays
+  // divergent so further operations don't blow up either.
+  if (a.isDivergent() || b.isDivergent()) return TDIVERGENT;
   if (a.isFloatingPoint() || b.isFloatingPoint()) {
     if (a === TLDOUBLE || b === TLDOUBLE) return TLDOUBLE;
     if (a === TDOUBLE || b === TDOUBLE) return TDOUBLE;
@@ -2470,6 +2487,7 @@ return {
   TypeInfo,
   TUNKNOWN, TVOID, TBOOL, TCHAR, TSCHAR, TUCHAR, TSHORT, TUSHORT,
   TINT, TUINT, TLONG, TULONG, TLLONG, TULLONG, TFLOAT, TDOUBLE, TLDOUBLE, TEXTERNREF, TREFEXTERN, TEQREF, TAUTO,
+  TDIVERGENT,
   arrayOf, functionType, getOrCreateTagType,
   getOrCreateGCStructType, gcArrayOf,
   computeStructLayout, computeUnionLayout, computeUnaryType,
@@ -2745,13 +2763,17 @@ class Expr {
   // Variable / function / enum constant reference. Pure UNRESTRICTED at
   // this AST level: the load itself has no side effects, and reading a
   // named decl twice in adjacent positions yields the same value (we
-  // don't model volatile, signal handlers, or threads).
+  // don't model volatile, signal handlers, or threads). `decl` is
+  // required (use makeIdent for name-based lookup) — get the source
+  // identifier via `this.decl.name`.
   class EIdent extends Expr {
-    constructor(loc, type, name, decl) {
+    constructor(loc, type, decl) {
+      if (!decl) throw new Error(`EIdent: decl is required (use makeIdent for name-based lookup)`);
       super(loc, type, [], Linearity.UNRESTRICTED);
-      this.name = name; this.decl = decl;
+      this.decl = decl;
       Object.freeze(this);
     }
+    get name() { return this.decl.name; }
   }
   class EBinary extends Expr {
     constructor(loc, type, op, left, right) {
@@ -3098,6 +3120,8 @@ function maybeImplicitCast(expr, targetType) {
   const srcType = expr.type.removeQualifiers();
   if (srcType === targetType) return expr;
   if (targetType.isVoid() || srcType.isVoid()) return expr;
+  // Divergent (recovery from a parser error) absorbs — don't wrap.
+  if (srcType.isDivergent() || targetType.isDivergent()) return expr;
   return new EImplicitCast(expr.loc, targetType, expr);
 }
 
@@ -3157,6 +3181,8 @@ function promoteExprType(e) {
 // (so array types never reach here) and bitfield-promoted (so small
 // types are already TINT/TUINT).
 function computeBinaryType(op, leftType, rightType) {
+  // Divergent absorbs — propagate so further ops on it stay sound.
+  if (leftType.isDivergent() || rightType.isDivergent()) return Types.TDIVERGENT;
   // Comparison and logical operators return int.
   if (["EQ","NE","LT","GT","LE","GE","LAND","LOR"].includes(op)) return Types.TINT;
   // Assignment operators return left type.
@@ -3396,14 +3422,25 @@ function lookupMemberChain(type, name) {
   return null;
 }
 
+// Synthesize a placeholder DVar for error recovery. Used by makeIdent /
+// makeMember / makeArrow when the name doesn't resolve — we report the
+// diagnostic, then return a placeholder so downstream construction can
+// continue without nulls. The placeholder's type is divergent so any
+// operations on it stay well-typed.
+function _placeholderDVar(loc, name) {
+  return new DVar(loc, name, Types.TDIVERGENT, Types.StorageClass.NONE, null);
+}
+
 // Build a member-access expression `base.name`. Looks up the field
-// (handling anonymous-nested chains), reports a fatal error if it
-// doesn't exist, and constructs the chain of EMember nodes. After this
-// returns, every EMember has a non-null memberDecl by construction.
+// (handling anonymous-nested chains). On miss, reports a recoverable
+// diagnostic and constructs the EMember with a synthesized placeholder
+// DVar (divergent-typed) so the parse can continue. After this returns,
+// EMember always has a non-null memberDecl.
 function makeMember(loc, base, name) {
   const chain = lookupMemberChain(base.type, name);
   if (!chain) {
-    fatalError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+    reportError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+    return new EMember(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
   }
   let result = base;
   for (const m of chain) {
@@ -3415,8 +3452,7 @@ function makeMember(loc, base, name) {
 // Build a pointer-arrow expression `base->name`. For GC struct refs
 // (one-indirection by design), this is equivalent to `.` and builds an
 // EMember chain. For other pointer-to-struct types, decay the base if
-// needed and build EArrow + EMember chain (deref pointer once, then
-// walk anonymous-nested fields).
+// needed and build EArrow + EMember chain.
 function makeArrow(loc, base, name) {
   let bt = base.type.removeQualifiers();
   if (bt.kind === Types.TypeKind.GC_STRUCT) {
@@ -3427,16 +3463,30 @@ function makeArrow(loc, base, name) {
   if (bt.kind === Types.TypeKind.POINTER) bt = bt.baseType;
   const chain = lookupMemberChain(bt, name);
   if (!chain) {
-    fatalError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+    reportError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+    return new EArrow(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
   }
-  // Outermost is the EArrow (deref); subsequent levels are EMember
-  // (walking through the dereferenced struct's anonymous fields).
   const first = chain[0];
   let result = new EArrow(loc, first.type, base, first);
   for (let i = 1; i < chain.length; i++) {
     result = new EMember(loc, chain[i].type, result, chain[i]);
   }
   return result;
+}
+
+// Build an EIdent from a name resolved through a scope. On miss, reports
+// a recoverable diagnostic and synthesizes a placeholder DVar so
+// EIdent.decl is always non-null.
+//
+// `scope` is anything with `.get(name)` returning a DVar / DFunc /
+// DEnumConst / null — typically the parser's varScope.
+function makeIdent(loc, name, scope) {
+  const decl = scope.get(name);
+  if (decl instanceof DVar)       return new EIdent(loc, decl.type, decl);
+  if (decl instanceof DFunc)      return new EIdent(loc, decl.type, decl);
+  if (decl instanceof DEnumConst) return new EIdent(loc, Types.TINT, decl);
+  reportError(loc, `Undeclared identifier '${name}'`);
+  return new EIdent(loc, Types.TDIVERGENT, _placeholderDVar(loc, name));
 }
 
 // Build an ESubscript, applying C semantics:
@@ -3562,7 +3612,7 @@ return {
   maybeImplicitCast, maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
   promoteExprType, computeBinaryType, markAddressTaken,
   makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
-  makeMember, makeArrow, lookupMemberChain,
+  makeMember, makeArrow, makeIdent, lookupMemberChain,
   // Linearity tagging for optimizer correctness checks
   Linearity, joinLinearity,
   // Generic traversal / substitution for AST→AST passes
@@ -5987,28 +6037,20 @@ class Parser {
         bytes.push(0);
         return new AST.EString(loc, Types.arrayOf(Types.TCHAR, bytes.length), bytes);
       }
-      const decl = this.varScope.get(name);
-      if (!decl) {
-        // Implicit function declaration: C89 allowed calling undeclared functions.
-        // Gated behind --allow-implicit-function-decl / --allow-old-c.
-        if (this._allowImplicitFunctionDecl && this.atText("(")) {
-          const ftype = Types.functionType(Types.TINT, [], false);
-          const fdecl = new AST.DFunc({ filename: t.filename, line: t.line }, name, ftype, [], Types.StorageClass.EXTERN, false, null);
-          this.varScope.set(name, fdecl);
-          if (this.currentParsingFunc) this.currentParsingFunc.usedSymbols.add(fdecl);
-          else this.globalUsedSymbols.add(fdecl);
-          return new AST.EIdent(loc, ftype, name, fdecl);
-        }
-        this.recoverableError(t, `Undeclared identifier '${name}'`);
-        return new AST.EIdent(loc, Types.TINT, name, null);
+      // Implicit function declaration: C89 allowed calling undeclared functions.
+      // Gated behind --allow-implicit-function-decl / --allow-old-c. We
+      // create the decl ourselves here so makeIdent's lookup succeeds.
+      if (!this.varScope.get(name) && this._allowImplicitFunctionDecl && this.atText("(")) {
+        const ftype = Types.functionType(Types.TINT, [], false);
+        const fdecl = new AST.DFunc({ filename: t.filename, line: t.line }, name, ftype, [], Types.StorageClass.EXTERN, false, null);
+        this.varScope.set(name, fdecl);
       }
-      if (this.currentParsingFunc) this.currentParsingFunc.usedSymbols.add(decl);
-      else this.globalUsedSymbols.add(decl);
-
-      if (decl instanceof AST.DVar) return new AST.EIdent(loc, decl.type, name, decl);
-      if (decl instanceof AST.DFunc) return new AST.EIdent(loc, decl.type, name, decl);
-      if (decl instanceof AST.DEnumConst) return new AST.EIdent(loc, Types.TINT, name, decl);
-      return new AST.EIdent(loc, Types.TINT, name, decl);
+      const ident = AST.makeIdent(loc, name, this.varScope);
+      if (ident.decl) {
+        if (this.currentParsingFunc) this.currentParsingFunc.usedSymbols.add(ident.decl);
+        else this.globalUsedSymbols.add(ident.decl);
+      }
+      return ident;
     }
 
     // Parenthesized expression or compound literal
@@ -7317,6 +7359,7 @@ class Parser {
 
     // __throw
     if (this.matchKW(Lexer.Keyword.X_THROW)) {
+      const throwTok = this.peek(-1);
       const tagName = this.expectKind(Lexer.TokenKind.IDENT).text;
       this.expect("(");
       const args = [];
@@ -7326,18 +7369,22 @@ class Parser {
       }
       this.expect(")");
       this.expect(";");
-      const tag = this.findExceptionTag(tagName);
       // Decay array/function-typed throw args; tag params are pointer types.
       for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
-      // Insert implicit casts on args matching the tag's parameter types
-      // (when known). Unresolved tag names skip this — the diagnostic for
-      // unknown tags fires later via {name: tagName}.
-      if (tag && tag.paramTypes) {
-        for (let i = 0; i < args.length && i < tag.paramTypes.length; i++) {
-          args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
-        }
+      let tag = this.findExceptionTag(tagName);
+      if (!tag) {
+        // Recovery: synthesize a placeholder tag with divergent param
+        // types so SThrow has the uniform tag shape downstream code
+        // expects (name, paramTypes, definition).
+        this.recoverableError(throwTok, `Unknown exception tag '${tagName}'`);
+        tag = { name: tagName, paramTypes: args.map(() => Types.TDIVERGENT), definition: null };
+        tag.definition = tag;
       }
-      return new AST.SThrow(loc, tag || { name: tagName }, args);
+      // Insert implicit casts on args matching the tag's parameter types.
+      for (let i = 0; i < args.length && i < tag.paramTypes.length; i++) {
+        args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
+      }
+      return new AST.SThrow(loc, tag, args);
     }
 
     // _Static_assert inside function body
@@ -8184,7 +8231,7 @@ function makeBufIdExpr(bufExpr) {
 function makeSetBufIdStmt(bufExpr, counterVar) {
   const loc = bufExpr.loc;
   const lhs = makeBufIdExpr(bufExpr);
-  const counterRef = new AST.EIdent(loc, Types.TINT, counterVar.name, counterVar);
+  const counterRef = new AST.EIdent(loc, Types.TINT, counterVar);
   const rhs = new AST.EUnary(loc, Types.TINT, "OP_PRE_INC", counterRef);
   const assign = new AST.EBinary(loc, Types.TINT, "ASSIGN", lhs, rhs);
   return new AST.SExpr(loc, assign);
@@ -8206,12 +8253,12 @@ function makeThrowLongJump(tag, idExpr, valExpr) {
 // Build catch body: { if (id != buf[0]) rethrow; <userBody> }
 function makeCatchBody(tag, idVar, valVar, bufExpr, userBody) {
   const loc = bufExpr.loc;
-  const idRef = new AST.EIdent(loc, Types.TINT, idVar.name, idVar);
+  const idRef = new AST.EIdent(loc, Types.TINT, idVar);
   const myIdExpr = makeBufIdExpr(bufExpr);
   const cond = new AST.EBinary(loc, Types.TINT, "NE", idRef, myIdExpr);
 
-  const idRef2 = new AST.EIdent(loc, Types.TINT, idVar.name, idVar);
-  const valRef = new AST.EIdent(loc, Types.TINT, valVar.name, valVar);
+  const idRef2 = new AST.EIdent(loc, Types.TINT, idVar);
+  const valRef = new AST.EIdent(loc, Types.TINT, valVar);
   const rethrow = makeThrowLongJump(tag, idRef2, valRef);
 
   const rethrowIf = new AST.SIf(loc, cond, rethrow, null);
