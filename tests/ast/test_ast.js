@@ -769,6 +769,99 @@ test('DExceptionTag is a real Decl class', () => {
 });
 
 // =============================================================================
+// typesAreAssignmentCompatible: C99 6.5.16.1 + extensions
+// =============================================================================
+
+const TAC = AST.typesAreAssignmentCompatible;
+
+test('TAC: same type is compatible', () => {
+  assert(TAC(Types.TINT, Types.TINT));
+});
+test('TAC: arithmetic ↔ arithmetic is compatible', () => {
+  assert(TAC(Types.TINT, Types.TDOUBLE));
+  assert(TAC(Types.TFLOAT, Types.TLONG));
+  assert(TAC(Types.TCHAR, Types.TLLONG));
+  assert(TAC(Types.TBOOL, Types.TINT));
+});
+test('TAC: int → pointer is rejected (without null-pointer constant)', () => {
+  const intPtr = Types.TINT.pointer();
+  // No expr passed — we don't know it's NPC, so reject.
+  assert(!TAC(Types.TINT, intPtr));
+});
+test('TAC: pointer → int is rejected', () => {
+  const intPtr = Types.TINT.pointer();
+  assert(!TAC(intPtr, Types.TINT));
+});
+test('TAC: void* ↔ T* is compatible', () => {
+  const voidPtr = Types.TVOID.pointer();
+  const intPtr = Types.TINT.pointer();
+  assert(TAC(voidPtr, intPtr), 'void* → int*');
+  assert(TAC(intPtr, voidPtr), 'int* → void*');
+});
+test('TAC: pointer-to-T → pointer-to-T is compatible', () => {
+  const a = Types.TINT.pointer();
+  const b = Types.TINT.pointer();
+  assert(TAC(a, b));
+});
+test('TAC: pointer can ADD const at the pointee', () => {
+  const charPtr = Types.TCHAR.pointer();
+  const constCharPtr = Types.TCHAR.addConst().pointer();
+  assert(TAC(charPtr, constCharPtr), 'char* → const char* (adding const) OK');
+});
+test('TAC: pointer can NOT DROP const at the pointee', () => {
+  const charPtr = Types.TCHAR.pointer();
+  const constCharPtr = Types.TCHAR.addConst().pointer();
+  assert(!TAC(constCharPtr, charPtr), 'const char* → char* (dropping const) rejected');
+});
+test('TAC: pointer-to-int → pointer-to-unsigned-int is rejected', () => {
+  const ip = Types.TINT.pointer();
+  const up = Types.TUINT.pointer();
+  assert(!TAC(ip, up), 'int* → unsigned int* rejected (incompatible base)');
+});
+test('TAC: _Bool ← pointer is compatible', () => {
+  const intPtr = Types.TINT.pointer();
+  assert(TAC(intPtr, Types.TBOOL));
+});
+test('TAC: divergent absorbs', () => {
+  assert(TAC(Types.TDIVERGENT, Types.TINT));
+  assert(TAC(Types.TINT, Types.TDIVERGENT));
+});
+test('TAC: void absorbs (caller already errored elsewhere)', () => {
+  assert(TAC(Types.TVOID, Types.TINT));
+  assert(TAC(Types.TINT, Types.TVOID));
+});
+test('TAC: __refextern widens to __externref', () => {
+  assert(TAC(Types.TREFEXTERN, Types.TEXTERNREF));
+});
+test('TAC: __externref does NOT narrow to __refextern', () => {
+  assert(!TAC(Types.TEXTERNREF, Types.TREFEXTERN));
+});
+test('TAC: NPC (literal 0) flows into pointer type', () => {
+  const intPtr = Types.TINT.pointer();
+  const zero = new AST.EInt(LOC, Types.TINT, 0n);
+  assert(TAC(Types.TINT, intPtr, zero), 'literal 0 → int* via NPC rule');
+});
+test('TAC: literal 1 does NOT flow into pointer type', () => {
+  const intPtr = Types.TINT.pointer();
+  const one = new AST.EInt(LOC, Types.TINT, 1n);
+  assert(!TAC(Types.TINT, intPtr, one), 'literal 1 → int* rejected');
+});
+test('TAC: dropping const at the immediate pointee is rejected', () => {
+  // const char *const * → const char ** : strict C99 rejects (the
+  // immediate pointee const is being dropped). Other compilers warn
+  // but allow; we error. The Lua codebase used to trip this; the fix
+  // turned out to be in the parser (T *const param qualifier was being
+  // silently consumed) — once that's fixed, source and target are equal.
+  const constChar = Types.TCHAR.addConst();
+  const constCharPtr = constChar.pointer();
+  const constCharConstPtr = constCharPtr.addConst();
+  const src = constCharConstPtr.pointer();
+  const tgt = constCharPtr.pointer();
+  assert(!TAC(src, tgt),
+    'const char *const * → const char ** drops const at the inner pointer; reject');
+});
+
+// =============================================================================
 // BinOp / UnOp registries
 // =============================================================================
 

@@ -3358,9 +3358,90 @@ function substituteParams(expr, paramMap) {
 // don't throw — they report and proceed with the best-effort node, so
 // callers can decide whether errors are fatal or recoverable.
 
+// True if `srcType` flows into `targetType` under C99 §6.5.16.1
+// (simple-assignment compatibility — the "as if by assignment" rules
+// the spec invokes for function args, return values, and init exprs).
+//
+// Covers:
+//   - same type (post qualifier strip)
+//   - both arithmetic (numeric promotion / narrowing)
+//   - target _Bool + source pointer
+//   - both pointers, with compatible bases OR either is void*
+//   - target pointer + source null-pointer constant
+//   - both struct/union of compatible types
+//   - ref-target rules (same ref, NPC → ref, arithmetic → __eqref boxing)
+//   - divergent absorbs (error recovery)
+//
+// `expr` is consulted only for the null-pointer-constant cases; pass
+// it when the source expression is available, otherwise null.
+function typesAreAssignmentCompatible(srcType, targetType, expr) {
+  const s = srcType.removeQualifiers();
+  const t = targetType.removeQualifiers();
+  if (s === t) return true;
+  // Divergent (parser error recovery) absorbs — don't cascade complaints.
+  if (s.isDivergent() || t.isDivergent()) return true;
+  // Voids: assignment to void shouldn't happen at well-formed sites,
+  // but tolerate so we don't double-error after a real error elsewhere.
+  if (s.isVoid() || t.isVoid()) return true;
+  // TAUTO is the C23 placeholder type; auto-resolution should have
+  // replaced it before we reach a flow site, but `const auto` slips
+  // past one branch of the resolver — tolerate it here so the user
+  // sees the actual auto-related error rather than a confusing cast
+  // error on the placeholder.
+  if (s === Types.TAUTO || t === Types.TAUTO) return true;
+  // C99 6.5.16.1: arithmetic types convert freely under assignment.
+  if (s.isArithmetic() && t.isArithmetic()) return true;
+  // _Bool ← any pointer (truthiness).
+  if (t === Types.TBOOL && s.isPointer()) return true;
+  // Pointers ↔ pointers (C99 6.5.16.1): the target's pointee must carry
+  // every qualifier the source's pointee has (you can ADD const, not
+  // drop it), and unqualified pointee types must match structurally.
+  if (s.isPointer() && t.isPointer()) {
+    const sBase = s.baseType, tBase = t.baseType;
+    if (sBase.isVoid() || tBase.isVoid()) return true;
+    if (sBase.isConst && !tBase.isConst) return false;
+    if (sBase.isVolatile && !tBase.isVolatile) return false;
+    if (sBase.removeQualifiers().isCompatibleWith(tBase.removeQualifiers())) return true;
+    return false;
+  }
+  // Pointer target ← null pointer constant (literal 0, casts of 0).
+  if (t.isPointer() && expr && isNullPointerConstant(expr)) return true;
+  // Struct/union ← compatible struct/union.
+  if ((s.isStruct() || s.isUnion()) && (t.isStruct() || t.isUnion())) {
+    return s.isCompatibleWith(t);
+  }
+  // Ref-target rules. (rejectNonZeroToRef enforces a subset; we mirror
+  // it here so the predicate is the single gate.)
+  if (t.isRef()) {
+    if (s.isRef()) {
+      if (s.isCompatibleWith(t)) return true;
+      // refextern (non-nullable) widens to externref (nullable). Going
+      // the other direction would erase the nullability invariant.
+      if (s === Types.TREFEXTERN && t === Types.TEXTERNREF) return true;
+      // GC struct inheritance: a Dog ref flows into an Animal ref if
+      // Animal is an ancestor in the parentType chain.
+      if (s.isGCStruct() && t.isGCStruct()) {
+        for (let p = s.parentType; p; p = p.parentType) {
+          if (p === t) return true;
+        }
+      }
+      // Any GC ref widens to __eqref (top of the GC lattice).
+      if (t === Types.TEQREF && (s.isGCStruct() || s.isGCArray())) return true;
+      return false;
+    }
+    if (expr && isNullPointerConstant(expr)) return true;
+    if (t === Types.TEQREF && s.isArithmetic()) return true;
+    return false;
+  }
+  // Anything left: ref → non-ref, mismatched aggregates, etc. — reject.
+  return false;
+}
+
 // Wrap an expression in EImplicitCast at the target type. Pass-through
-// when the source already matches the target after qualifier strip, or
-// when either side is void.
+// when the source already matches the target after qualifier strip,
+// or when either side is void / divergent. Validates assignment
+// compatibility — `reportError` (not fatal) on mismatch and pass the
+// expression through unwrapped, so cascading damage is bounded.
 function maybeImplicitCast(expr, targetType) {
   targetType = targetType.removeQualifiers();
   const srcType = expr.type.removeQualifiers();
@@ -3368,6 +3449,18 @@ function maybeImplicitCast(expr, targetType) {
   if (targetType.isVoid() || srcType.isVoid()) return expr;
   // Divergent (recovery from a parser error) absorbs — don't wrap.
   if (srcType.isDivergent() || targetType.isDivergent()) return expr;
+  if (!typesAreAssignmentCompatible(srcType, targetType, expr)) {
+    // Specialize the message for non-ref → ref (the old rejectNonZeroToRef
+    // case) — the user almost certainly wants either __cast or __ref_null.
+    if (targetType.isRef() && !srcType.isRef()) {
+      reportError(expr.loc,
+        `cannot convert '${srcType.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+    } else {
+      reportError(expr.loc,
+        `incompatible types: cannot implicitly convert '${srcType.toString()}' to '${targetType.toString()}'`);
+    }
+    return expr;
+  }
   return new EImplicitCast(expr.loc, targetType, expr);
 }
 
@@ -3486,10 +3579,6 @@ function makeBinary(loc, op, left, right) {
       }
     }
   }
-  // ASSIGN to ref: only null-pointer-constant allowed as non-ref source.
-  if (op === "ASSIGN" && lIsRef && !rIsRef) {
-    rejectNonZeroToRef(left.type, right, loc);
-  }
   // Compound assignment on ref: not allowed.
   if (lIsRef && meta.isAssign && op !== "ASSIGN") {
     fatalError(loc, `'${opText}' on reference type is not allowed`);
@@ -3506,19 +3595,34 @@ function makeBinary(loc, op, left, right) {
   } else if (op === "ASSIGN" && left.type.isPointer()) {
     right = maybeDecay(right);
   }
+  // ASSIGN: validate RHS is assignment-compatible with LHS. EImplicitCast
+  // isn't inserted on ASSIGN (codegen does the conversion), but we still
+  // need to enforce the rules — otherwise `ref = 5` etc. silently miscompiles.
+  if (op === "ASSIGN" &&
+      !typesAreAssignmentCompatible(right.type, left.type, right)) {
+    if (left.type.removeQualifiers().isRef() && !right.type.removeQualifiers().isRef()) {
+      reportError(loc,
+        `cannot convert '${right.type.toString()}' to reference type '${left.type.toString()}' (use __cast(${left.type.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+    } else {
+      reportError(loc,
+        `incompatible types in assignment: cannot convert '${right.type.toString()}' to '${left.type.toString()}'`);
+    }
+  }
   // Apply C99 6.3.1.1 integer promotions for bitfield operands.
   const resType = computeBinaryType(op, promoteExprType(left), promoteExprType(right));
   // Insert implicit casts on operands to the common op type. Skipped for:
   //   - assignment ops (handled by lvalue context, not arithmetic)
   //   - logical && / || (boolean coercion is per-operand, not common)
   //   - pointer arithmetic (operand types are deliberately mixed)
+  //   - pointer comparisons (no implicit qualifier-stripping on pointee)
   //   - ref operands (== / != on refs is identity, no conversion)
   if (!meta.isAssign && !meta.isLogical) {
     const leftType = left.type;
     const rightType = right.type;
     const involvesRef = leftType.removeQualifiers().isRef() ||
                         rightType.removeQualifiers().isRef();
-    if (!isPtrArith && !involvesRef) {
+    const involvesPtr = leftType.isPointer() || rightType.isPointer();
+    if (!isPtrArith && !involvesRef && !(meta.isCompare && involvesPtr)) {
       const opType = meta.isCompare
         ? Types.usualArithmeticConversions(leftType, rightType)
         : resType;
@@ -3613,7 +3717,6 @@ function makeReturn(loc, expr, retType) {
   if (!expr) return new SReturn(loc, null);
   expr = maybeDecay(expr);
   if (retType) {
-    rejectNonZeroToRef(retType, expr, loc);
     expr = maybeImplicitCast(expr, retType);
   }
   return new SReturn(loc, expr);
@@ -3779,10 +3882,6 @@ function makeCall(loc, callee, args) {
     const numFixed = paramTypes.length;
     // Validation: only meaningful when the prototype declared its params.
     if (!funcType.hasUnspecifiedParams) {
-      const n = Math.min(args.length, numFixed);
-      for (let i = 0; i < n; i++) {
-        rejectNonZeroToRef(paramTypes[i], args[i], loc);
-      }
       if (funcType.isVarArg) {
         for (let i = numFixed; i < args.length; i++) {
           if (args[i].type.removeQualifiers().isRef()) {
@@ -3843,7 +3942,8 @@ return {
   STryCatch, SThrow,
   makeTUnit,
   // C-semantics-aware builders
-  maybeImplicitCast, maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
+  maybeImplicitCast, typesAreAssignmentCompatible,
+  maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
   promoteExprType, computeBinaryType, markAddressTaken,
   makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
   makeMember, makeArrow, makeIdent, lookupMemberChain,
@@ -7253,7 +7353,19 @@ class Parser {
     if (tIsRef && eIsRef) return thenType;
     if (tIsRef) return thenType;          // (ref ? ref : 0) → ref (null branch)
     if (eIsRef) return elseType;
-    if (thenType.isPointer() && elseType.isPointer()) return thenType;
+    if (thenType.isPointer() && elseType.isPointer()) {
+      // C99 6.5.15.6: result is a pointer to a type with the union of
+      // qualifiers from both operands. Picking either side as-is can
+      // drop const/volatile and silently miscompile (e.g. lua's ternary
+      // `(line == 0) ? "main" : pushfstring(...)`).
+      const tBase = thenType.baseType, eBase = elseType.baseType;
+      const wantConst = tBase.isConst || eBase.isConst;
+      const wantVolatile = tBase.isVolatile || eBase.isVolatile;
+      let base = tBase.removeQualifiers();
+      if (wantConst) base = base.addConst();
+      if (wantVolatile) base = base.toggleVolatile();
+      return base.pointer();
+    }
     if (thenType.isPointer()) return thenType;
     if (elseType.isPointer()) return elseType;
     return Types.usualArithmeticConversions(thenType, elseType);
@@ -7807,7 +7919,6 @@ class Parser {
             // Re-evaluate allocClass: aggregates need MEMORY storage.
             if (type.isAggregate()) dvar.allocClass = Types.AllocClass.MEMORY;
           }
-          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok));
         }
         // Handle string-initialized char array
         if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
@@ -8081,7 +8192,6 @@ class Parser {
           dvar.initExpr = this.parseInitList(type);
         } else {
           dvar.initExpr = this.parseAssignmentExpression();
-          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok));
           // File-scope ref-typed globals: WASM constant init expressions
           // can only emit ref.null. Allocation (e.g. boxing a primitive)
           // is not allowed at module-init time.
@@ -8232,10 +8342,16 @@ class Parser {
               }
               // Parse parameter declarator
               let pName = null;
-              // Handle pointer prefix
+              // Handle pointer prefix. Qualifiers after `*` apply to the
+              // pointer itself: `T *const` is a const pointer to T.
               while (this.matchText("*")) {
                 pType = pType.pointer();
-                while (this.matchKW(Lexer.Keyword.CONST) || this.matchKW(Lexer.Keyword.VOLATILE) || this.matchKW(Lexer.Keyword.RESTRICT)) {}
+                while (true) {
+                  if (this.matchKW(Lexer.Keyword.CONST)) pType = pType.addConst();
+                  else if (this.matchKW(Lexer.Keyword.VOLATILE)) pType = pType.toggleVolatile();
+                  else if (this.matchKW(Lexer.Keyword.RESTRICT)) { /* restrict is a hint; we don't model it */ }
+                  else break;
+                }
               }
               // Handle parenthesized: void (*callback)(...)
               if (this.atText("(") && !this.isStartOfParamList()) {
