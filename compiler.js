@@ -3032,6 +3032,113 @@ function makeBinary(loc, op, left, right) {
   return new EBinary(loc, resType, op, left, right);
 }
 
+// Mark `expr` as having its address taken — promotes the underlying
+// DVar from REGISTER to MEMORY allocation. Walks through EMember and
+// (for array elements) ESubscript to find the root storage.
+function markAddressTaken(expr) {
+  if (!expr) return;
+  if (expr instanceof EIdent) {
+    if (expr.decl && expr.decl instanceof DVar) {
+      expr.decl.allocClass = Types.AllocClass.MEMORY;
+    }
+  } else if (expr instanceof EMember) {
+    markAddressTaken(expr.base);
+  } else if (expr instanceof ESubscript) {
+    if (expr.array.type && expr.array.type.isArray()) {
+      markAddressTaken(expr.array);
+    }
+  }
+}
+
+// Build an EUnary, applying C semantics. Dispatches on `op`:
+//   OP_PRE_INC / OP_PRE_DEC / OP_POST_INC / OP_POST_DEC: reject ref operand
+//   OP_ADDR: reject bitfield-member, ref, GC struct field, GC array elem;
+//            mark the underlying decl as memory-allocated
+//   OP_DEREF: reject ref operand; decay array/function operand
+//   OP_POS / OP_NEG / OP_BNOT: reject ref operand
+//   OP_LNOT: ref allowed (boolean coercion sugar = __ref_is_null)
+function makeUnary(loc, op, operand) {
+  const isRef = operand.type && operand.type.removeQualifiers().isRef();
+  switch (op) {
+    case "OP_PRE_INC": case "OP_POST_INC":
+      if (isRef) fatalError(loc, `'++' on reference type is not allowed`);
+      break;
+    case "OP_PRE_DEC": case "OP_POST_DEC":
+      if (isRef) fatalError(loc, `'--' on reference type is not allowed`);
+      break;
+    case "OP_ADDR":
+      if ((operand instanceof EMember || operand instanceof EArrow) &&
+          operand.memberDecl && operand.memberDecl.bitWidth >= 0) {
+        fatalError(loc, `Cannot take address of bit-field member '${operand.memberDecl.name}'`);
+      }
+      if (isRef) {
+        fatalError(loc, `Cannot take address of ${operand.type.removeQualifiers().kind} variable`);
+      }
+      if (operand instanceof EMember && operand.base && operand.base.type &&
+          operand.base.type.removeQualifiers().isGCStruct()) {
+        fatalError(loc, `cannot take address of GC struct field`);
+      }
+      if (operand instanceof ESubscript && operand.array && operand.array.type &&
+          operand.array.type.removeQualifiers().isGCArray()) {
+        fatalError(loc, `cannot take address of GC array element`);
+      }
+      markAddressTaken(operand);
+      break;
+    case "OP_DEREF":
+      if (isRef) {
+        fatalError(loc, `unary '*' on reference type '${operand.type.toString()}' is not allowed (use '->' for fields, or just access the ref directly)`);
+      }
+      operand = maybeDecay(operand);
+      break;
+    case "OP_POS":
+      if (isRef) fatalError(loc, `unary '+' on reference type is not allowed`);
+      break;
+    case "OP_NEG":
+      if (isRef) fatalError(loc, `unary '-' on reference type is not allowed`);
+      break;
+    case "OP_BNOT":
+      if (isRef) fatalError(loc, `unary '~' on reference type is not allowed`);
+      break;
+    case "OP_LNOT":
+      // !ref is allowed (sugar for __ref_is_null).
+      break;
+  }
+  return new EUnary(loc, Types.computeUnaryType(op, operand.type), op, operand);
+}
+
+// Build an SReturn, applying C semantics:
+//   - decay array/function expression
+//   - reject non-null int → ref when return type is a ref
+//   - implicit-cast to the function's return type
+// retType may be null (e.g., void function — caller passes null and the
+// expr is just attached as-is). expr may also be null for `return;`.
+function makeReturn(loc, expr, retType) {
+  if (!expr) return new SReturn(loc, null);
+  expr = maybeDecay(expr);
+  if (retType) {
+    rejectNonZeroToRef(retType, expr, loc);
+    expr = maybeImplicitCast(expr, retType);
+  }
+  return new SReturn(loc, expr);
+}
+
+// Build an ECast (explicit cast `(T)expr`), applying C semantics:
+//   - decay array/function operand
+//   - reject ref↔non-ref except (refT)0 / (refT)NULL
+function makeCast(loc, targetType, expr) {
+  expr = maybeDecay(expr);
+  const tIsRef = targetType.removeQualifiers().isRef();
+  const sIsRef = expr.type && expr.type.removeQualifiers().isRef();
+  if (tIsRef || sIsRef) {
+    if (tIsRef && !sIsRef && isNullPointerConstant(expr)) {
+      // (refT)0 / (refT)NULL — typed null pointer constant.
+      return new ECast(loc, targetType, targetType, expr);
+    }
+    fatalError(loc, "Cannot cast to or from a reference type; use __cast(T, x) (or __ref_cast for GC ref downcast)");
+  }
+  return new ECast(loc, targetType, targetType, expr);
+}
+
 // Build an ESubscript, applying C semantics:
 //   - reject commutative form `0[arr]` (we choose not to support it)
 //   - reject subscript on a reference type
@@ -3153,8 +3260,8 @@ return {
   makeTUnit,
   // C-semantics-aware builders
   maybeImplicitCast, maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
-  promoteExprType, computeBinaryType,
-  makeCall, makeSubscript, makeBinary,
+  promoteExprType, computeBinaryType, markAddressTaken,
+  makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
 };
 })();
 
@@ -5095,7 +5202,7 @@ class Parser {
           else this.currentParsingFunc.compoundLiterals.push(cl);
           return cl;
         }
-        return new AST.ECast(startLoc, castType, castType, maybeDecay(expr));
+        return AST.makeCast(startLoc, castType, expr);
       }
       // Regular parenthesized expression
       this.pos = saved;
@@ -5818,93 +5925,28 @@ class Parser {
     return { type: Types.TINT, decl: null, chain: null };
   }
 
-  markAddressTaken(expr) {
-    if (!expr) return;
-    if (expr instanceof AST.EIdent) {
-      if (expr.decl && expr.decl instanceof AST.DVar) {
-        expr.decl.allocClass = Types.AllocClass.MEMORY;
-      }
-    } else if (expr instanceof AST.EMember) {
-      this.markAddressTaken(expr.base);
-    } else if (expr instanceof AST.ESubscript) {
-      if (expr.array.type && expr.array.type.isArray()) {
-        this.markAddressTaken(expr.array);
-      }
-    }
-  }
-
   // Matches CC's parseUnaryExpression (compiler.cc ~line 10538)
   parseUnaryExpression() {
-    if (this.matchText("++")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseUnaryExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `'++' on reference type is not allowed`);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_PRE_INC", e.type), "OP_PRE_INC", e);
-    }
-    if (this.matchText("--")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseUnaryExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `'--' on reference type is not allowed`);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_PRE_DEC", e.type), "OP_PRE_DEC", e);
+    const PREFIX_OPS = {
+      "++": "OP_PRE_INC", "--": "OP_PRE_DEC",
+      "+": "OP_POS", "-": "OP_NEG", "~": "OP_BNOT", "!": "OP_LNOT",
+    };
+    for (const [text, op] of Object.entries(PREFIX_OPS)) {
+      if (this.matchText(text)) {
+        const loc = Lexer.Loc.fromTok(this.peek(-1));
+        // ++/-- recurse into parseUnaryExpression; everything else into parseCastExpression.
+        const e = (op === "OP_PRE_INC" || op === "OP_PRE_DEC")
+          ? this.parseUnaryExpression() : this.parseCastExpression();
+        return AST.makeUnary(loc, op, e);
+      }
     }
     if (this.matchText("&")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseCastExpression();
-      if ((e instanceof AST.EMember || e instanceof AST.EArrow) && e.memberDecl && e.memberDecl.bitWidth >= 0) {
-        this.error(this.peek(-1), `Cannot take address of bit-field member '${e.memberDecl.name}'`);
-      }
-      if (e.type && e.type.removeQualifiers().isRef()) {
-        this.error(this.peek(-1), `Cannot take address of ${e.type.removeQualifiers().kind} variable`);
-      }
-      if (e instanceof AST.EMember && e.base && e.base.type && e.base.type.removeQualifiers().isGCStruct()) {
-        this.error(this.peek(-1), `cannot take address of GC struct field`);
-      }
-      if (e instanceof AST.ESubscript && e.array && e.array.type && e.array.type.removeQualifiers().isGCArray()) {
-        this.error(this.peek(-1), `cannot take address of GC array element`);
-      }
-      this.markAddressTaken(e); return new AST.EUnary(loc, Types.computeUnaryType("OP_ADDR", e.type), "OP_ADDR", e);
+      const loc = Lexer.Loc.fromTok(this.peek(-1));
+      return AST.makeUnary(loc, "OP_ADDR", this.parseCastExpression());
     }
     if (this.matchText("*")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      let e = this.parseCastExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) {
-        this.error(tok, `unary '*' on reference type '${e.type.toString()}' is not allowed (use '->' for fields, or just access the ref directly)`);
-      }
-      // *arr is *(decay(arr)) — array operand decays to pointer first.
-      e = maybeDecay(e);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_DEREF", e.type), "OP_DEREF", e);
-    }
-    if (this.matchText("+")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseCastExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '+' on reference type is not allowed`);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_POS", e.type), "OP_POS", e);
-    }
-    if (this.matchText("-")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseCastExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '-' on reference type is not allowed`);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_NEG", e.type), "OP_NEG", e);
-    }
-    if (this.matchText("~")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseCastExpression();
-      if (e.type && e.type.removeQualifiers().isRef()) this.error(tok, `unary '~' on reference type is not allowed`);
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_BNOT", e.type), "OP_BNOT", e);
-    }
-    if (this.matchText("!")) {
-      const tok = this.peek(-1);
-      const loc = Lexer.Loc.fromTok(tok);
-      const e = this.parseCastExpression();
-      // `!ref` is equivalent to __ref_is_null(ref). Allowed as sugar.
-      return new AST.EUnary(loc, Types.computeUnaryType("OP_LNOT", e.type), "OP_LNOT", e);
+      const loc = Lexer.Loc.fromTok(this.peek(-1));
+      return AST.makeUnary(loc, "OP_DEREF", this.parseCastExpression());
     }
 
     if (this.atKW(Lexer.Keyword.SIZEOF)) return this.parsePrimaryExpression(); // handled there
@@ -5957,19 +5999,7 @@ class Parser {
             else this.currentParsingFunc.compoundLiterals.push(cl);
             return this.parsePostfixTail(cl);
           }
-          if (castType.removeQualifiers().isRef() || (expr.type && expr.type.removeQualifiers().isRef())) {
-            // Allow `(refT)0` / `(refT)NULL` — typed null pointer constant
-            // is a long-standing C idiom and unambiguous.
-            if (castType.removeQualifiers().isRef() &&
-                !(expr.type && expr.type.removeQualifiers().isRef()) &&
-                AST.isNullPointerConstant(expr)) {
-              return new AST.ECast(startLoc, castType, castType, expr);
-            }
-            this.error(this.peek(-1), "Cannot cast to or from a reference type; use __cast(T, x) (or __ref_cast for GC ref downcast)");
-          }
-          // Decay array/function operand before the cast — (T*)arr is
-          // really (T*)(decay(arr)).
-          return new AST.ECast(startLoc, castType, castType, maybeDecay(expr));
+          return AST.makeCast(startLoc, castType, expr);
         }
       }
       this.pos = saved;
@@ -6050,15 +6080,11 @@ class Parser {
         continue;
       }
       if (this.matchText("++")) {
-        const tok = this.peek(-1);
-        if (expr.type && expr.type.removeQualifiers().isRef()) this.error(tok, `'++' on reference type is not allowed`);
-        expr = new AST.EUnary(Lexer.Loc.fromTok(tok), expr.type, "OP_POST_INC", expr);
+        expr = AST.makeUnary(Lexer.Loc.fromTok(this.peek(-1)), "OP_POST_INC", expr);
         continue;
       }
       if (this.matchText("--")) {
-        const tok = this.peek(-1);
-        if (expr.type && expr.type.removeQualifiers().isRef()) this.error(tok, `'--' on reference type is not allowed`);
-        expr = new AST.EUnary(Lexer.Loc.fromTok(tok), expr.type, "OP_POST_DEC", expr);
+        expr = AST.makeUnary(Lexer.Loc.fromTok(this.peek(-1)), "OP_POST_DEC", expr);
         continue;
       }
       break;
@@ -6391,20 +6417,11 @@ class Parser {
 
     // return
     if (this.matchKW(Lexer.Keyword.RETURN)) {
-      const retTok = this.peek(-1);
-      if (this.matchText(";")) return new AST.SReturn(loc, null);
-      let expr = this.parseExpression();
+      if (this.matchText(";")) return AST.makeReturn(loc, null, null);
+      const expr = this.parseExpression();
       this.expect(";");
-      // Decay array/function before any return-type adjustment.
-      expr = maybeDecay(expr);
-      // Forbid implicit int→ref on return (use __ref_null(T) instead).
-      if (this.currentParsingFunc) {
-        const retType = this.currentParsingFunc.type.getReturnType();
-        AST.rejectNonZeroToRef(retType, expr, Lexer.Loc.fromTok(retTok));
-        // Wrap in implicit cast to the function's return type.
-        expr = maybeImplicitCast(expr, retType);
-      }
-      return new AST.SReturn(loc, expr);
+      const retType = this.currentParsingFunc?.type.getReturnType() || null;
+      return AST.makeReturn(loc, expr, retType);
     }
 
     // goto
