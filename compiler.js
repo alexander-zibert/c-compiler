@@ -2581,6 +2581,43 @@ class Scope {
 
 let nextDeclId = 1;
 
+// TreeBag: a tree-shaped read-only set/multiset. Each node owns an
+// array of items (not a Set — guc.js uses Set, but the user prefers
+// arrays for insertion-order traversal and lower constant overhead),
+// and references its children's bags. Items are NEVER copied into
+// ancestors: iteration / `has` walk the children tree on demand, so
+// memory stays O(N) regardless of depth.
+//
+// Used as a structural-share container for bubble-up metadata on Expr
+// and Stmt. A node's `referencedFunctions` (or any future bag) is
+// computed once at construction as `new TreeBag(ownItems, ...children
+// .map(c => c.bag))` — no eager union, no rebuild on subtree change.
+//
+// Suitable for one-shot iteration / membership tests. If a caller
+// queries the same bag many times, snapshot the iteration result.
+class TreeBag {
+  constructor(own, ...children) {
+    this._own = (own && own.length > 0) ? own.slice() : null;
+    this._children = children.filter(c => c.size > 0);
+    let n = this._own ? this._own.length : 0;
+    for (const c of this._children) n += c.size;
+    this.size = n;
+    Object.freeze(this._children);
+    Object.freeze(this);
+  }
+  *[Symbol.iterator]() {
+    if (this._own) yield* this._own;
+    for (const child of this._children) yield* child;
+  }
+  has(value) {
+    if (this._own && this._own.includes(value)) return true;
+    for (const child of this._children) if (child.has(value)) return true;
+    return false;
+  }
+  forEach(fn) { for (const item of this) fn(item); }
+}
+const _EMPTY_TREE_BAG = new TreeBag(null);
+
 // Linearity (substructural typing, à la guc.js):
 //   LINEAR        — must be evaluated in source order (side effects, traps,
 //                   memory reads/writes, control flow). Cannot be discarded
@@ -2633,6 +2670,16 @@ class Expr {
       this.children = children;
       this.linearity = joinLinearity(opLinearity, ...children);
     }
+    // Bubble-up bags are computed on demand from current children.
+    // The getter form (rather than a precomputed field) tolerates the
+    // seal-only escapees (EInitList, ECompoundLiteral) whose `children`
+    // arrays are mutated by post-construction passes — the bag stays
+    // consistent with whatever `children` currently looks like.
+    // EIdent of a DFunc overrides to add itself.
+    get referencedFunctions() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedFunctions));
+    }
     // Rebuild this node with replaced children, in the same order as
     // `this.children`. Leaf subclasses (no children) inherit this
     // identity-return; non-leaf subclasses must override.
@@ -2643,12 +2690,30 @@ class Expr {
         `(node has ${this.children.length} children)`);
     }
   }
+  // Stmt parallels Expr: takes a `children` array (mixed Expr and Stmt
+  // subtrees in evaluation/control order), exposes generic traversal,
+  // and bubbles up `referencedFunctions` from children. Subclasses
+  // additionally store named field aliases (`condition`, `body`, etc.)
+  // for ergonomic access — same pattern as Expr.
   class Stmt {
-    constructor(loc) {
+    constructor(loc, children = []) {
       if (!loc) {
         throw new Error(`Stmt: loc is required (use Lexer.Loc.fromTok / Loc.generated for synthesized nodes)`);
       }
       this.loc = loc;
+      this.children = children;
+    }
+    // Bubble-up bag, computed on demand. See Expr.referencedFunctions
+    // for rationale (handles parser-mutated children arrays cleanly).
+    get referencedFunctions() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedFunctions));
+    }
+    _withChildren(newChildren) {
+      if (newChildren.length === 0) return this;
+      throw new Error(
+        `${this.constructor.name} must implement _withChildren ` +
+        `(node has ${this.children.length} children)`);
     }
   }
   class Decl {
@@ -2788,6 +2853,13 @@ class Expr {
       Object.freeze(this);
     }
     get name() { return this.decl.name; }
+    // A reference to a function (direct or address-take) contributes
+    // to the bubble-up bag. Calls go through here too: ECall's callee
+    // is an EDecay/EIdent chain whose EIdent adds the DFunc to the bag.
+    get referencedFunctions() {
+      if (this.decl instanceof DFunc) return new TreeBag([this.decl]);
+      return _EMPTY_TREE_BAG;
+    }
   }
   class EBinary extends Expr {
     constructor(loc, type, op, left, right) {
@@ -3019,25 +3091,83 @@ class Expr {
   // Most are frozen at construction. SLabel / SGoto stay seal-only because
   // their fields get filled in during the parser's goto-resolution pass.
   class SExpr extends Stmt {
-    constructor(loc, expr) { super(loc); this.expr = expr; Object.freeze(this); }
+    constructor(loc, expr) { super(loc, [expr]); this.expr = expr; Object.freeze(this); }
+    _withChildren([expr]) { return new SExpr(this.loc, expr); }
   }
+  // SDecl bubble-up needs to reach into each DVar's initExpr — the
+  // declarations array isn't structurally `children` (DVars aren't
+  // Expr/Stmt) but their initializers can reference functions.
   class SDecl extends Stmt {
-    constructor(loc, declarations) { super(loc); this.declarations = declarations; Object.freeze(this); }
+    constructor(loc, declarations) {
+      const initExprs = [];
+      for (const d of declarations) {
+        if (d instanceof DVar && d.initExpr) initExprs.push(d.initExpr);
+      }
+      super(loc, initExprs);
+      this.declarations = declarations;
+      Object.freeze(this);
+    }
+    _withChildren(_) { return this; /* DVars are mutated in place; children mirror initExprs */ }
   }
   class SCompound extends Stmt {
-    constructor(loc, statements, labels) { super(loc); this.statements = statements; this.labels = labels || []; Object.freeze(this); }
+    constructor(loc, statements, labels) {
+      super(loc, statements);
+      this.statements = statements;
+      this.labels = labels || [];
+      Object.freeze(this);
+    }
+    _withChildren(newChildren) { return new SCompound(this.loc, newChildren, this.labels); }
   }
   class SIf extends Stmt {
-    constructor(loc, condition, thenBranch, elseBranch) { super(loc); this.condition = condition; this.thenBranch = thenBranch; this.elseBranch = elseBranch || null; Object.freeze(this); }
+    constructor(loc, condition, thenBranch, elseBranch) {
+      const kids = [condition, thenBranch];
+      if (elseBranch) kids.push(elseBranch);
+      super(loc, kids);
+      this.condition = condition;
+      this.thenBranch = thenBranch;
+      this.elseBranch = elseBranch || null;
+      Object.freeze(this);
+    }
+    _withChildren(newChildren) {
+      const [cond, then_, else_] = newChildren;
+      return new SIf(this.loc, cond, then_, else_ || null);
+    }
   }
   class SWhile extends Stmt {
-    constructor(loc, condition, body) { super(loc); this.condition = condition; this.body = body; Object.freeze(this); }
+    constructor(loc, condition, body) {
+      super(loc, [condition, body]);
+      this.condition = condition; this.body = body;
+      Object.freeze(this);
+    }
+    _withChildren([cond, body]) { return new SWhile(this.loc, cond, body); }
   }
   class SDoWhile extends Stmt {
-    constructor(loc, body, condition) { super(loc); this.body = body; this.condition = condition; Object.freeze(this); }
+    constructor(loc, body, condition) {
+      super(loc, [body, condition]);
+      this.body = body; this.condition = condition;
+      Object.freeze(this);
+    }
+    _withChildren([body, cond]) { return new SDoWhile(this.loc, body, cond); }
   }
   class SFor extends Stmt {
-    constructor(loc, init, condition, increment, body) { super(loc); this.init = init; this.condition = condition; this.increment = increment; this.body = body; Object.freeze(this); }
+    constructor(loc, init, condition, increment, body) {
+      const kids = [];
+      if (init) kids.push(init);
+      if (condition) kids.push(condition);
+      if (increment) kids.push(increment);
+      kids.push(body);
+      super(loc, kids);
+      this.init = init || null;
+      this.condition = condition || null;
+      this.increment = increment || null;
+      this.body = body;
+      Object.freeze(this);
+    }
+    // Reconstruct from named slots — the children array's shape varies
+    // (3, 4, or 5 slots depending on which optional clauses were present).
+    _withChildren(_) {
+      throw new Error(`SFor._withChildren: rebuild via the named-arg constructor instead`);
+    }
   }
   class SBreak extends Stmt {
     constructor(loc) { super(loc); Object.freeze(this); }
@@ -3046,10 +3176,22 @@ class Expr {
     constructor(loc) { super(loc); Object.freeze(this); }
   }
   class SReturn extends Stmt {
-    constructor(loc, expr) { super(loc); this.expr = expr || null; Object.freeze(this); }
+    constructor(loc, expr) {
+      super(loc, expr ? [expr] : []);
+      this.expr = expr || null;
+      Object.freeze(this);
+    }
+    _withChildren(newChildren) {
+      return new SReturn(this.loc, newChildren.length > 0 ? newChildren[0] : null);
+    }
   }
   class SSwitch extends Stmt {
-    constructor(loc, expr, cases, body) { super(loc); this.expr = expr; this.cases = cases; this.body = body; Object.freeze(this); }
+    constructor(loc, expr, cases, body) {
+      super(loc, [expr, body]);
+      this.expr = expr; this.cases = cases; this.body = body;
+      Object.freeze(this);
+    }
+    _withChildren([expr, body]) { return new SSwitch(this.loc, expr, this.cases, body); }
   }
   // SGoto and SLabel are seal-only (not frozen) because the parser
   // backfills `target` (when a forward goto's label is later defined)
@@ -3063,11 +3205,28 @@ class Expr {
   class SEmpty extends Stmt {
     constructor(loc) { super(loc); Object.freeze(this); }
   }
+  // STryCatch's catches are { tag, bindings, body } objects — body is a
+  // Stmt and bubbles, so include each catch body in children.
   class STryCatch extends Stmt {
-    constructor(loc, tryBody, catches) { super(loc); this.tryBody = tryBody; this.catches = catches; Object.freeze(this); }
+    constructor(loc, tryBody, catches) {
+      const kids = [tryBody, ...catches.map(c => c.body)];
+      super(loc, kids);
+      this.tryBody = tryBody; this.catches = catches;
+      Object.freeze(this);
+    }
+    _withChildren(newChildren) {
+      const newTry = newChildren[0];
+      const newCatches = this.catches.map((c, i) => ({ ...c, body: newChildren[i + 1] }));
+      return new STryCatch(this.loc, newTry, newCatches);
+    }
   }
   class SThrow extends Stmt {
-    constructor(loc, tag, args) { super(loc); this.tag = tag; this.args = args; Object.freeze(this); }
+    constructor(loc, tag, args) {
+      super(loc, args);
+      this.tag = tag; this.args = args;
+      Object.freeze(this);
+    }
+    _withChildren(newChildren) { return new SThrow(this.loc, this.tag, newChildren); }
   }
 
 // ---------- AST traversal / rewrite ----------
@@ -3631,6 +3790,8 @@ return {
   Linearity, joinLinearity,
   // Generic traversal / substitution for AST→AST passes
   walkExpr, substituteParams,
+  // Bubble-up metadata container
+  TreeBag,
 };
 })();
 
@@ -3862,12 +4023,10 @@ function foldExpr(expr) {
         return folded;
       });
       const call = changed ? new AST.ECall(expr.loc, callee, newArgs) : expr;
-      // Mark the callee as live (for tree-shake) — even if we end up
-      // inlining, recording it is harmless and inlining might fail later
-      // (e.g., recursion) and leave a real call in place.
-      if (call.funcDecl) _liveFuncs.add(call.funcDecl);
-      // Try inlining. If we can substitute, recurse-fold on the result
-      // so cascaded folds (e.g., square(5) → 5*5 → 25) collapse.
+      // No manual liveness bookkeeping here — the call's children (the
+      // EDecay/EIdent on the callee) bubble the DFunc into the
+      // referencedFunctions bag automatically. Try inlining; on success,
+      // recurse-fold so cascades like square(5) → 25 collapse in one pass.
       const inlined = tryInline(call);
       return inlined !== null ? foldExpr(inlined) : call;
     }
@@ -4131,11 +4290,10 @@ function foldStmt(stmt) {
 // After we're done with F's body, we pop. This gives us natural
 // recursion detection without a separate call-graph pass.
 //
-// _liveFuncs is the set of functions reached during the walk —
-// populated by ECall handling whether or not inlining succeeds.
-// Functions never marked live are dropped at the end of optimize().
+// Liveness no longer needs separate state — the AST itself bubbles up
+// `referencedFunctions` via TreeBag, so once a function's body has been
+// folded we can read its bag to see what it transitively references.
 const _inliningStack = new Set();
-const _liveFuncs = new Set();
 
 // Predicate: is this body a single `return EXPR;`? Returns the return
 // expression, or null if the body is anything more complex.
@@ -4207,38 +4365,35 @@ function isRootFunction(f, unit) {
 
 function optimize(unit) {
   _inliningStack.clear();
-  _liveFuncs.clear();
-  // Walk frontier: every "root" function. Each fold encounters ECalls
-  // that mark their callees live; the worklist drains transitively.
+  // Walk from roots transitively. After folding a function's body,
+  // its `referencedFunctions` bag tells us which other functions are
+  // reachable from it; queue any with bodies that haven't been folded.
+  // Tree-shake falls out: anything not visited is unreferenced.
   const worklist = [];
+  const optimized = new Set();
   for (const f of unit.definedFunctions) {
-    if (isRootFunction(f, unit)) {
-      _liveFuncs.add(f);
-      worklist.push(f);
-    }
+    if (isRootFunction(f, unit)) worklist.push(f);
   }
   // Globals' initializers may reference functions (function-pointer
-  // tables, &foo addresses). Walk those too.
+  // tables, &foo addresses). Fold them and mark anything referenced.
   for (const v of unit.definedVariables) {
     if (v.initExpr) {
       const folded = foldExpr(v.initExpr);
       if (folded !== v.initExpr) v.initExpr = folded;
+      for (const g of v.initExpr.referencedFunctions) {
+        if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) worklist.push(g);
+      }
     }
   }
-  // Drain the worklist. Each fold may add new callees to _liveFuncs;
-  // only newly-discovered functions are queued.
-  const optimized = new Set();
   while (worklist.length > 0) {
     const f = worklist.shift();
     if (optimized.has(f)) continue;
     optimized.add(f);
     if (!f.body) continue;
     f.body = foldStmt(f.body);
-    // Newly-discovered callees with bodies become work too.
-    for (const g of _liveFuncs) {
-      if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) {
-        worklist.push(g);
-      }
+    // Functions reachable from f's folded body become work too.
+    for (const g of f.body.referencedFunctions) {
+      if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) worklist.push(g);
     }
   }
   return unit;
