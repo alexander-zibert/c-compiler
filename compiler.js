@@ -3006,9 +3006,14 @@ class Expr {
     }
     _withChildren(newChildren) { return new EComma(this.loc, this.type, newChildren); }
   }
-  // EInitList is seal-only (not frozen) because normalizeInitList mutates
-  // its `elements` array in place after construction. `this.children`
-  // shares the same array reference so walkers see the current state.
+  // EInitList stays seal-only because normalizeInitList still mutates
+  // `unionMemberIndex` in place when designators select a non-default
+  // union member during the stack-based traversal. The `.type` mutation
+  // was lifted out (normalize returns a fresh EInitList for that), but
+  // `unionMemberIndex` writes happen through `top.output` references
+  // mid-traversal and would require restructuring the whole walk to
+  // remove. Acceptable trade-off — the refactor is bounded but not
+  // earned today.
   class EInitList extends Expr {
     constructor(loc, type, elements, designators, unionMemberIndex) {
       super(loc, type, elements, Linearity.UNRESTRICTED);
@@ -5022,17 +5027,25 @@ function findMemberChain(tag, name) {
   return null;
 }
 
-// Normalize an init list: resolve designators, brace elision, zero-fill
+// Normalize an init list: resolve designators, brace elision, zero-fill.
+// Returns the (possibly new) init list — for unsized arrays the type
+// changes to the inferred size, so a fresh EInitList is built at the
+// end. Otherwise returns the original (mutated in place: elements and
+// designators arrays are rewritten through the existing references —
+// safe because Object.freeze on EInitList is shallow).
 function normalizeInitList(initList, containerType) {
-  initList.type = containerType;
-
-  // Snapshot source, then clear in place. We mutate the array's length
-  // rather than reassigning so that initList.children (which aliases
-  // initList.elements) stays consistent for walkers.
+  // Snapshot source, then clear in place. Mutating array lengths/
+  // contents rather than reassigning the references keeps
+  // initList.children aliasing initList.elements for walkers. Frozen
+  // EInitList allows array-content mutation since freeze is shallow.
   const src = initList.elements.slice();
   const desigs = initList.designators.slice();
   initList.elements.length = 0;
   initList.designators.length = 0;
+  // Effective type: starts as containerType; may be refined for unsized
+  // arrays once we know the actual extent. Tracked locally rather than
+  // mutated on initList so we can build a fresh EInitList at the end.
+  let effectiveType = containerType;
 
   // Child count for an aggregate type
   function childCount(t) {
@@ -5206,7 +5219,7 @@ function normalizeInitList(initList, containerType) {
       if (src[srcIdx] instanceof AST.EInitList) {
         // Braced sub-init-list: place and recurse
         top.output.elements[top.index] = src[srcIdx];
-        normalizeInitList(top.output.elements[top.index], slotType);
+        top.output.elements[top.index] = normalizeInitList(top.output.elements[top.index], slotType);
         srcIdx++;
         if (top.index + 1 > maxExtent) maxExtent = top.index + 1;
         advanceCursor();
@@ -5241,11 +5254,11 @@ function normalizeInitList(initList, containerType) {
     }
   }
 
-  // For unsized arrays, finalize type based on actual extent
+  // For unsized arrays, finalize type based on actual extent.
   if (containerType.isArray() && (containerType.arraySize || 0) === 0) {
     const finalSize = Math.max(maxExtent, initList.elements.length);
     const elemType = containerType.baseType;
-    initList.type = Types.arrayOf(elemType, finalSize);
+    effectiveType = Types.arrayOf(elemType, finalSize);
     while (initList.elements.length < finalSize) initList.elements.push(null);
   }
 
@@ -5314,7 +5327,14 @@ function normalizeInitList(initList, containerType) {
       }
     }
   }
-  fillZeros(initList, initList.type);
+  fillZeros(initList, effectiveType);
+  // If the type was refined (unsized → sized array), build a new
+  // EInitList sharing the now-mutated elements/designators arrays.
+  if (effectiveType !== initList.type) {
+    return new AST.EInitList(initList.loc, effectiveType,
+      initList.elements, initList.designators, initList.unionMemberIndex);
+  }
+  return initList;
 }
 
 // ====================
@@ -6240,17 +6260,18 @@ class Parser {
         this.expect(")");
         if (this.atText("{")) {
           // Compound literal
-          const initList = this.parseInitList(castType);
-          // Handle string-initialized char array
+          let initList = this.parseInitList(castType);
+          // Handle string-initialized char array (e.g., `(char[]){"hi"}`).
           if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
               initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
             castType = initList.elements[0].type;
-            initList.type = castType;
+            initList = new AST.EInitList(initList.loc, castType,
+              initList.elements, initList.designators, initList.unionMemberIndex);
           } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
-            normalizeInitList(initList, castType);
+            initList = normalizeInitList(initList, castType);
             castType = initList.type;
           } else if (castType.isAggregate()) {
-            normalizeInitList(initList, castType);
+            initList = normalizeInitList(initList, castType);
           }
           const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
           if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
@@ -6261,8 +6282,8 @@ class Parser {
         const expr = this.parseCastExpression();
         // GCC extension: cast-to-union — (union_type) expr → compound literal
         if (castType.isUnion()) {
-          const initList = new AST.EInitList(startLoc, castType, [expr], []);
-          normalizeInitList(initList, castType);
+          let initList = new AST.EInitList(startLoc, castType, [expr], []);
+          initList = normalizeInitList(initList, castType);
           const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
           if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
           else this.currentParsingFunc.compoundLiterals.push(cl);
@@ -7013,17 +7034,17 @@ class Parser {
           const startLoc = Lexer.Loc.fromTok(startTok);
           if (this.atText("{")) {
             // Compound literal: (type){...}
-            const initList = this.parseInitList(castType);
-            // Handle string-initialized char array
+            let initList = this.parseInitList(castType);
             if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
                 initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
               castType = initList.elements[0].type;
-              initList.type = castType;
+              initList = new AST.EInitList(initList.loc, castType,
+                initList.elements, initList.designators, initList.unionMemberIndex);
             } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
-              normalizeInitList(initList, castType);
+              initList = normalizeInitList(initList, castType);
               castType = initList.type;
             } else if (castType.isAggregate()) {
-              normalizeInitList(initList, castType);
+              initList = normalizeInitList(initList, castType);
             }
             const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
             if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
@@ -7033,8 +7054,8 @@ class Parser {
           const expr = this.parseCastExpression();
           // GCC extension: cast-to-union — (union_type) expr → compound literal
           if (castType.isUnion()) {
-            const initList = new AST.EInitList(startLoc, castType, [expr], []);
-            normalizeInitList(initList, castType);
+            let initList = new AST.EInitList(startLoc, castType, [expr], []);
+            initList = normalizeInitList(initList, castType);
             const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
             if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
             else this.currentParsingFunc.compoundLiterals.push(cl);
@@ -7725,11 +7746,11 @@ class Parser {
         // Normalize init list
         if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
           if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
-            normalizeInitList(dvar.initExpr, type);
+            dvar.initExpr = normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
             dvar.type = type;
           } else if (type.isAggregate()) {
-            normalizeInitList(dvar.initExpr, type);
+            dvar.initExpr = normalizeInitList(dvar.initExpr, type);
           }
         }
         // Insert an implicit cast for scalar inits whose source type
@@ -8008,11 +8029,11 @@ class Parser {
         // Normalize init list
         if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
           if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
-            normalizeInitList(dvar.initExpr, type);
+            dvar.initExpr = normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
             dvar.type = type;
           } else if (type.isAggregate()) {
-            normalizeInitList(dvar.initExpr, type);
+            dvar.initExpr = normalizeInitList(dvar.initExpr, type);
           }
         }
         // Insert an implicit cast for scalar inits whose source type
