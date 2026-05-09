@@ -3497,6 +3497,19 @@ function rejectNonZeroToRef(targetType, expr, loc) {
     `cannot convert '${expr.type.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
 }
 
+// Pointer arithmetic: given the operand types of a binary `+`/`-`,
+// return the pointee element type if one side is a pointer/array (the
+// other being an integer), or null if it's not pointer arithmetic.
+// Used by both constEval and codegen to consistently identify the
+// pointee whose size scales the integer operand.
+function pointerArithElemType(leftType, rightType) {
+  const l = leftType.removeQualifiers();
+  const r = rightType.removeQualifiers();
+  if (l.isPointer() || l.isArray()) return l.baseType;
+  if (r.isPointer() || r.isArray()) return r.baseType;
+  return null;
+}
+
 // C99 6.3.1.1: integer promotions for bitfield expressions. A bitfield
 // member smaller than int promotes to int (or unsigned int if it can't
 // be represented as int). Non-bitfield expressions promote to themselves.
@@ -3944,6 +3957,7 @@ return {
   // C-semantics-aware builders
   maybeImplicitCast, typesAreAssignmentCompatible,
   maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
+  pointerArithElemType,
   promoteExprType, computeBinaryType, markAddressTaken,
   makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
   makeMember, makeArrow, makeIdent, lookupMemberChain,
@@ -10135,24 +10149,21 @@ function constEvalExpr(expr, policy) {
       if (hasAddr) {
         // addr + int, addr - int (pointer arithmetic: scale by pointee size)
         if (l.kind === "addr" && r.kind === "int" && (expr.op === "ADD" || expr.op === "SUB")) {
-          const leftType = expr.left.type.removeQualifiers();
-          let elemSize = leftType.kind === Types.TypeKind.POINTER ? leftType.baseType.size
-                       : leftType.kind === Types.TypeKind.ARRAY ? leftType.baseType.size : 1;
+          const elemType = AST.pointerArithElemType(expr.left.type, expr.right.type);
+          const elemSize = elemType ? elemType.size : 1;
           const offset = Number(r.intVal) * elemSize;
           return { kind: "addr", addrVal: expr.op === "ADD" ? l.addrVal + offset : l.addrVal - offset };
         }
         // int + addr
         if (r.kind === "addr" && l.kind === "int" && expr.op === "ADD") {
-          const rightType = expr.right.type.removeQualifiers();
-          let elemSize = rightType.kind === Types.TypeKind.POINTER ? rightType.baseType.size
-                       : rightType.kind === Types.TypeKind.ARRAY ? rightType.baseType.size : 1;
+          const elemType = AST.pointerArithElemType(expr.left.type, expr.right.type);
+          const elemSize = elemType ? elemType.size : 1;
           return { kind: "addr", addrVal: r.addrVal + Number(l.intVal) * elemSize };
         }
         // addr - addr (pointer difference)
         if (l.kind === "addr" && r.kind === "addr" && expr.op === "SUB") {
-          const leftType = expr.left.type.removeQualifiers();
-          let elemSize = leftType.kind === Types.TypeKind.POINTER ? leftType.baseType.size
-                       : leftType.kind === Types.TypeKind.ARRAY ? leftType.baseType.size : 1;
+          const elemType = AST.pointerArithElemType(expr.left.type, expr.right.type);
+          const elemSize = elemType ? elemType.size : 1;
           if (elemSize === 0) return null;
           return { kind: "int", intVal: BigInt(Math.trunc((l.addrVal - r.addrVal) / elemSize)) };
         }
@@ -11478,6 +11489,16 @@ class CodeGenerator {
   }
 
   // --- Load/Store ---
+  // After an address has been pushed for an lvalue, emit a load iff
+  // the value should be materialized (i.e. it's a scalar). Aggregates
+  // (struct/union/array) propagate as addresses — loading them here
+  // would be wrong; callers consume the address. Functions are also
+  // address-only at the wasm level (the call sequence reads the table
+  // index directly). Centralizes the rule that was repeated across
+  // EIdent / ESubscript / EMember / EArrow / OP_DEREF emit cases.
+  emitLoadIfScalar(type) {
+    if (!type.isAggregate() && !type.isFunction()) this.emitLoad(type);
+  }
   emitLoad(type) {
     type = type.removeQualifiers();
     if (type === Types.TCHAR || type === Types.TSCHAR) this.body.mop(MOP.I32_LOAD8_S, 0, 0);
@@ -12003,20 +12024,20 @@ class CodeGenerator {
           const varDecl = expr.decl.definition || expr.decl;
           const gait = this.globalArrayAddrs.get(varDecl);
           if (gait !== undefined) {
-            if (varDecl.type.isArray() || varDecl.type.isAggregate()) this.body.i32Const(gait);
-            else { this.body.i32Const(gait); this.emitLoad(varDecl.type); }
+            this.body.i32Const(gait);
+            this.emitLoadIfScalar(varDecl.type);
             break;
           }
           const lait = this.localArrayOffsets.get(varDecl);
           if (lait !== undefined) {
             this.emitFrameAddr(lait);
-            if (!varDecl.type.isArray() && !varDecl.type.isAggregate()) this.emitLoad(varDecl.type);
+            this.emitLoadIfScalar(varDecl.type);
             break;
           }
           const pait = this.paramMemoryOffsets.get(varDecl);
           if (pait !== undefined) {
             this.emitFrameAddr(pait);
-            if (!varDecl.type.isArray() && !varDecl.type.isAggregate()) this.emitLoad(varDecl.type);
+            this.emitLoadIfScalar(varDecl.type);
             break;
           }
           const lit = this.localVarToWasmLocalIdx.get(varDecl);
@@ -12045,28 +12066,26 @@ class CodeGenerator {
         const isComparison = meta.isCompare;
         const wt = this.getBinaryWasmType(isComparison ? leftType : expr.type);
         const isUnsigned = this.isUnsignedType(leftType);
-        // Pointer arithmetic
-        if (expr.op === "ADD" && (leftType.isPointer() || rightType.isPointer() || leftType.isArray() || rightType.isArray())) {
-          let ptrExpr, intExpr, elemType;
-          if (leftType.isPointer() || leftType.isArray()) {
-            ptrExpr = expr.left; intExpr = expr.right; elemType = leftType.baseType;
-          } else {
-            ptrExpr = expr.right; intExpr = expr.left; elemType = rightType.baseType;
-          }
+        // Pointer arithmetic — element type is whichever side is a
+        // pointer/array (only one side for ADD; left side for SUB).
+        const elemType = AST.pointerArithElemType(leftType, rightType);
+        if (expr.op === "ADD" && elemType) {
+          const leftIsPtr = leftType.isPointer() || leftType.isArray();
+          const ptrExpr = leftIsPtr ? expr.left : expr.right;
+          const intExpr = leftIsPtr ? expr.right : expr.left;
           this.emitExpr(ptrExpr);
           this.emitPointerOffset(intExpr, elemType);
           this.body.aop(WT_I32, ALU.OP_ADD);
           break;
         }
-        if (expr.op === "SUB" && (leftType.isPointer() || leftType.isArray())) {
-          const leftElemType = leftType.baseType;
+        if (expr.op === "SUB" && elemType) {
           if (rightType.isPointer() || rightType.isArray()) {
             this.emitExpr(expr.left); this.emitExpr(expr.right);
             this.body.aop(WT_I32, ALU.OP_SUB);
-            this.emitDivByElemSize(leftElemType);
+            this.emitDivByElemSize(elemType);
           } else {
             this.emitExpr(expr.left);
-            this.emitPointerOffset(expr.right, leftElemType);
+            this.emitPointerOffset(expr.right, elemType);
             this.body.aop(WT_I32, ALU.OP_SUB);
           }
           break;
@@ -12159,7 +12178,7 @@ class CodeGenerator {
             this.emitIncDec(expr, ctx); return;
           case "OP_DEREF":
             this.emitExpr(expr.operand);
-            if (!expr.type.isAggregate() && !expr.type.isFunction()) this.emitLoad(expr.type);
+            this.emitLoadIfScalar(expr.type);
             break;
           case "OP_ADDR":
             this.emitAddressOf(expr.operand);
@@ -12436,7 +12455,7 @@ class CodeGenerator {
         this.emitExpr(expr.array);
         this.emitPointerOffset(expr.index, elemType);
         this.body.aop(WT_I32, ALU.OP_ADD);
-        if (!elemType.isAggregate()) this.emitLoad(elemType);
+        this.emitLoadIfScalar(elemType);
         break;
       }
       case AST.EMember: {
@@ -12456,7 +12475,7 @@ class CodeGenerator {
         const offset = this.getFieldOffset(tag, field);
         if (offset) { this.body.i32Const(offset); this.body.aop(WT_I32, ALU.OP_ADD); }
         if (field.bitWidth >= 0) this.emitBitFieldLoad(field);
-        else if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
+        else this.emitLoadIfScalar(expr.type);
         break;
       }
       case AST.EArrow: {
@@ -12467,7 +12486,7 @@ class CodeGenerator {
         const offset = this.getFieldOffset(tag, field);
         if (offset) { this.body.i32Const(offset); this.body.aop(WT_I32, ALU.OP_ADD); }
         if (field.bitWidth >= 0) this.emitBitFieldLoad(field);
-        else if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
+        else this.emitLoadIfScalar(expr.type);
         break;
       }
       case AST.ESizeofExpr:
@@ -12760,12 +12779,11 @@ class CodeGenerator {
         const fsAddr = this.fileScopeCompoundLiteralAddrs.get(expr);
         if (fsAddr !== undefined) {
           this.body.i32Const(fsAddr);
-          if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
         } else {
           this.emitCompoundLiteralInit(expr);
           this.emitFrameAddr(this.compoundLiteralOffsets.get(expr));
-          if (!expr.type.isArray() && !expr.type.isAggregate()) this.emitLoad(expr.type);
         }
+        this.emitLoadIfScalar(expr.type);
         break;
       }
       case AST.EGCNew: {
