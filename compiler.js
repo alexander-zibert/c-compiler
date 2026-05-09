@@ -2534,8 +2534,11 @@ class Expr {
     }
   }
   class Stmt {
-    constructor() {
-      this.loc = null;
+    constructor(loc) {
+      if (!loc) {
+        throw new Error(`Stmt: loc is required (use Lexer.Loc.fromTok / Loc.generated for synthesized nodes)`);
+      }
+      this.loc = loc;
     }
   }
   class Decl {
@@ -2746,52 +2749,52 @@ class Expr {
 
   // --- Stmt subclasses ---
   class SExpr extends Stmt {
-    constructor(expr) { super(); this.expr = expr; Object.seal(this); }
+    constructor(loc, expr) { super(loc); this.expr = expr; Object.seal(this); }
   }
   class SDecl extends Stmt {
-    constructor(declarations) { super(); this.declarations = declarations; Object.seal(this); }
+    constructor(loc, declarations) { super(loc); this.declarations = declarations; Object.seal(this); }
   }
   class SCompound extends Stmt {
-    constructor(statements, labels) { super(); this.statements = statements; this.labels = labels || []; Object.seal(this); }
+    constructor(loc, statements, labels) { super(loc); this.statements = statements; this.labels = labels || []; Object.seal(this); }
   }
   class SIf extends Stmt {
-    constructor(condition, thenBranch, elseBranch) { super(); this.condition = condition; this.thenBranch = thenBranch; this.elseBranch = elseBranch || null; Object.seal(this); }
+    constructor(loc, condition, thenBranch, elseBranch) { super(loc); this.condition = condition; this.thenBranch = thenBranch; this.elseBranch = elseBranch || null; Object.seal(this); }
   }
   class SWhile extends Stmt {
-    constructor(condition, body) { super(); this.condition = condition; this.body = body; Object.seal(this); }
+    constructor(loc, condition, body) { super(loc); this.condition = condition; this.body = body; Object.seal(this); }
   }
   class SDoWhile extends Stmt {
-    constructor(body, condition) { super(); this.body = body; this.condition = condition; Object.seal(this); }
+    constructor(loc, body, condition) { super(loc); this.body = body; this.condition = condition; Object.seal(this); }
   }
   class SFor extends Stmt {
-    constructor(init, condition, increment, body) { super(); this.init = init; this.condition = condition; this.increment = increment; this.body = body; Object.seal(this); }
+    constructor(loc, init, condition, increment, body) { super(loc); this.init = init; this.condition = condition; this.increment = increment; this.body = body; Object.seal(this); }
   }
   class SBreak extends Stmt {
-    constructor() { super(); Object.seal(this); }
+    constructor(loc) { super(loc); Object.seal(this); }
   }
   class SContinue extends Stmt {
-    constructor() { super(); Object.seal(this); }
+    constructor(loc) { super(loc); Object.seal(this); }
   }
   class SReturn extends Stmt {
-    constructor(expr) { super(); this.expr = expr || null; Object.seal(this); }
+    constructor(loc, expr) { super(loc); this.expr = expr || null; Object.seal(this); }
   }
   class SSwitch extends Stmt {
-    constructor(expr, cases, body, loc) { super(); this.expr = expr; this.cases = cases; this.body = body; this.loc = loc || null; Object.seal(this); }
+    constructor(loc, expr, cases, body) { super(loc); this.expr = expr; this.cases = cases; this.body = body; Object.seal(this); }
   }
   class SGoto extends Stmt {
-    constructor(label) { super(); this.label = label; this.target = null; this.loc = null; Object.seal(this); }
+    constructor(loc, label) { super(loc); this.label = label; this.target = null; Object.seal(this); }
   }
   class SLabel extends Stmt {
-    constructor(name, enclosingBlock) { super(); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
+    constructor(loc, name, enclosingBlock) { super(loc); this.name = name; this.enclosingBlock = enclosingBlock || null; this.labelKind = Types.LabelKind.FORWARD; this.hasGotos = false; this.isSwitchLevel = false; Object.seal(this); }
   }
   class SEmpty extends Stmt {
-    constructor() { super(); Object.seal(this); }
+    constructor(loc) { super(loc); Object.seal(this); }
   }
   class STryCatch extends Stmt {
-    constructor(tryBody, catches) { super(); this.tryBody = tryBody; this.catches = catches; Object.seal(this); }
+    constructor(loc, tryBody, catches) { super(loc); this.tryBody = tryBody; this.catches = catches; Object.seal(this); }
   }
   class SThrow extends Stmt {
-    constructor(tag, args) { super(); this.tag = tag; this.args = args; Object.seal(this); }
+    constructor(loc, tag, args) { super(loc); this.tag = tag; this.args = args; Object.seal(this); }
   }
 
 // TUnit constructor
@@ -6149,15 +6152,12 @@ class Parser {
   // --- Statement parsing ---
 
   parseStatement() {
-    const tok = this.peek();
-    const stmt = this._parseStatement();
-    if (stmt && !stmt.loc && tok) stmt.loc = Lexer.Loc.fromTok(tok);
-    return stmt;
+    return this._parseStatement(Lexer.Loc.fromTok(this.peek()));
   }
 
-  _parseStatement() {
+  _parseStatement(loc) {
     // Empty statement
-    if (this.matchText(";")) return new AST.SEmpty();
+    if (this.matchText(";")) return new AST.SEmpty(loc);
 
     // Compound statement
     if (this.atText("{")) return this.parseCompoundStatement();
@@ -6172,7 +6172,7 @@ class Parser {
       const thenBranch = this.parseStatement();
       let elseBranch = null;
       if (this.matchKW(Lexer.Keyword.ELSE)) elseBranch = this.parseStatement();
-      return new AST.SIf(cond, thenBranch, elseBranch);
+      return new AST.SIf(loc, cond, thenBranch, elseBranch);
     }
 
     // while
@@ -6182,7 +6182,7 @@ class Parser {
       const cond = this.parseExpression();
       this._rejectRefAsCondition(cond, kwTok, "while");
       this.expect(")");
-      return new AST.SWhile(cond, this.parseStatement());
+      return new AST.SWhile(loc, cond, this.parseStatement());
     }
 
     // do-while
@@ -6195,7 +6195,7 @@ class Parser {
       this._rejectRefAsCondition(cond, kwTok, "do-while");
       this.expect(")");
       this.expect(";");
-      return new AST.SDoWhile(body, cond);
+      return new AST.SDoWhile(loc, body, cond);
     }
 
     // for
@@ -6208,9 +6208,10 @@ class Parser {
         if (this.isTypeName()) {
           init = this.parseDeclarationStatement();
         } else {
+          const eTok = this.peek();
           const e = this.parseExpression();
           this.expect(";");
-          init = new AST.SExpr(e);
+          init = new AST.SExpr(Lexer.Loc.fromTok(eTok), e);
         }
       }
       if (!this.matchText(";")) {
@@ -6222,7 +6223,7 @@ class Parser {
       this.expect(")");
       const body = this.parseStatement();
       this.typeScope.pop(); this.tagScope.pop(); this.varScope.pop();
-      return new AST.SFor(init, cond, incr, body);
+      return new AST.SFor(loc, init, cond, incr, body);
     }
 
     // switch
@@ -6240,7 +6241,7 @@ class Parser {
       this._currentCases = cases;
       const body = this.parseStatement();
       this._currentCases = savedCases;
-      return new AST.SSwitch(expr, cases, body, { filename: switchTok.filename, line: switchTok.line });
+      return new AST.SSwitch(loc, expr, cases, body);
     }
 
     // case
@@ -6275,15 +6276,15 @@ class Parser {
     }
 
     // break
-    if (this.matchKW(Lexer.Keyword.BREAK)) { this.expect(";"); return new AST.SBreak(); }
+    if (this.matchKW(Lexer.Keyword.BREAK)) { this.expect(";"); return new AST.SBreak(loc); }
 
     // continue
-    if (this.matchKW(Lexer.Keyword.CONTINUE)) { this.expect(";"); return new AST.SContinue(); }
+    if (this.matchKW(Lexer.Keyword.CONTINUE)) { this.expect(";"); return new AST.SContinue(loc); }
 
     // return
     if (this.matchKW(Lexer.Keyword.RETURN)) {
       const retTok = this.peek(-1);
-      if (this.matchText(";")) return new AST.SReturn(null);
+      if (this.matchText(";")) return new AST.SReturn(loc, null);
       let expr = this.parseExpression();
       this.expect(";");
       // Decay array/function before any return-type adjustment.
@@ -6295,7 +6296,7 @@ class Parser {
         // Wrap in implicit cast to the function's return type.
         expr = maybeImplicitCast(expr, retType);
       }
-      return new AST.SReturn(expr);
+      return new AST.SReturn(loc, expr);
     }
 
     // goto
@@ -6303,8 +6304,7 @@ class Parser {
       const tok = this.expectKind(Lexer.TokenKind.IDENT);
       const label = tok.text;
       this.expect(";");
-      const sg = new AST.SGoto(label);
-      sg.loc = Lexer.Loc.fromTok(tok);
+      const sg = new AST.SGoto(Lexer.Loc.fromTok(tok), label);
       if (this.parsedLabels.has(label)) {
         // Backward goto — label already defined, must be a loop label
         const target = this.parsedLabels.get(label);
@@ -6325,12 +6325,13 @@ class Parser {
 
     // label: statement
     if (this.atKind(Lexer.TokenKind.IDENT) && this.peek(1)?.text === ":") {
+      const labelTok = this.peek();
       const name = this.advance().text;
       this.advance(); // skip :
       if (this.parsedLabels.has(name)) {
         this.error(this.peek(-2), `Duplicate label '${name}'`);
       }
-      const sl = new AST.SLabel(name, this.currentCompound);
+      const sl = new AST.SLabel(Lexer.Loc.fromTok(labelTok), name, this.currentCompound);
       this.parsedLabels.set(name, sl);
       if (this.currentCompound) {
         if (!this.currentCompound.labels) this.currentCompound.labels = [];
@@ -6394,7 +6395,7 @@ class Parser {
           this.error(this.peek(), "catch-all (__catch without type) must be the last catch clause");
         }
       }
-      return new AST.STryCatch(tryBody, catches);
+      return new AST.STryCatch(loc, tryBody, catches);
     }
 
     // __throw
@@ -6419,7 +6420,7 @@ class Parser {
           args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
         }
       }
-      return new AST.SThrow(tag || { name: tagName }, args);
+      return new AST.SThrow(loc, tag || { name: tagName }, args);
     }
 
     // _Static_assert inside function body
@@ -6435,7 +6436,7 @@ class Parser {
       this.expect(";");
       const val = constEvalInt(condExpr);
       if (val === 0n) this.recoverableError(this.peek(-1) || this.peek(), `_Static_assert failed: ${msg}`);
-      return new AST.SCompound([]);
+      return new AST.SCompound(loc, []);
     }
 
     // Declaration statement
@@ -6446,7 +6447,7 @@ class Parser {
     // Expression statement
     const expr = this.parseExpression();
     this.expect(";");
-    return new AST.SExpr(expr);
+    return new AST.SExpr(loc, expr);
   }
 
   findExceptionTag(name) {
@@ -6457,12 +6458,13 @@ class Parser {
   }
 
   parseCompoundStatement() {
+    const startTok = this.peek();
     this.expect("{");
     this.typeScope.push(); this.tagScope.push(); this.varScope.push();
     const statements = [];
     const savedCount = this._currentCompoundStmtCount;
     this._currentCompoundStmtCount = 0;
-    const compound = new AST.SCompound(statements);
+    const compound = new AST.SCompound(Lexer.Loc.fromTok(startTok), statements);
     const savedCompound = this.currentCompound;
     this.currentCompound = compound;
 
@@ -6481,13 +6483,15 @@ class Parser {
   }
 
   parseDeclarationStatement() {
+    const startTok = this.peek();
+    const startLoc = Lexer.Loc.fromTok(startTok);
     const declarations = [];
     const specs = this.parseDeclSpecifiers();
     let baseType = specs.type;
 
     if (this.matchText(";")) {
       // Anonymous struct/union/enum declaration
-      return new AST.SDecl(declarations);
+      return new AST.SDecl(startLoc, declarations);
     }
 
     let first = true;
@@ -6515,7 +6519,7 @@ class Parser {
           this.error(this.peek(), `redefinition of typedef '${name}'`);
         }
         this.typeScope.set(name, type);
-        if (this.matchText(";")) return new AST.SDecl(declarations);
+        if (this.matchText(";")) return new AST.SDecl(startLoc, declarations);
         continue;
       }
 
@@ -6626,7 +6630,7 @@ class Parser {
       }
     }
     this.expect(";");
-    return new AST.SDecl(declarations);
+    return new AST.SDecl(startLoc, declarations);
   }
 
   // --- External declaration parsing ---
@@ -7286,7 +7290,7 @@ function makeSetBufIdStmt(bufExpr, counterVar) {
   const counterRef = new AST.EIdent(loc, Types.TINT, counterVar.name, counterVar);
   const rhs = new AST.EUnary(loc, Types.TINT, "OP_PRE_INC", counterRef);
   const assign = new AST.EBinary(loc, Types.TINT, "ASSIGN", lhs, rhs);
-  return new AST.SExpr(assign);
+  return new AST.SExpr(loc, assign);
 }
 
 // Build: __throw tag(idExpr, valExpr)
@@ -7299,7 +7303,7 @@ function makeThrowLongJump(tag, idExpr, valExpr) {
       args[i] = maybeImplicitCast(args[i], tag.paramTypes[i]);
     }
   }
-  return new AST.SThrow(tag, args);
+  return new AST.SThrow(idExpr.loc, tag, args);
 }
 
 // Build catch body: { if (id != buf[0]) rethrow; <userBody> }
@@ -7313,8 +7317,8 @@ function makeCatchBody(tag, idVar, valVar, bufExpr, userBody) {
   const valRef = new AST.EIdent(loc, Types.TINT, valVar.name, valVar);
   const rethrow = makeThrowLongJump(tag, idRef2, valRef);
 
-  const rethrowIf = new AST.SIf(cond, rethrow, null);
-  return new AST.SCompound([rethrowIf, userBody]);
+  const rethrowIf = new AST.SIf(loc, cond, rethrow, null);
+  return new AST.SCompound(loc, [rethrowIf, userBody]);
 }
 
 // Transform longjmp calls in a statement tree into __throw __LongJump(buf[0], val)
@@ -7433,10 +7437,11 @@ function lowerSetjmpInCompound(compound, tag, counterVar) {
     // Determine try-body and catch-body based on pattern
     let tryBody, catchUserBody;
 
+    const stmtLoc = stmt.loc;
     if (zeroIsTrue) {
       // Pattern A: if (setjmp(buf) == 0) { Y } else { X }
       tryBody = stmt.thenBranch;
-      catchUserBody = stmt.elseBranch || new AST.SEmpty();
+      catchUserBody = stmt.elseBranch || new AST.SEmpty(stmtLoc);
     } else {
       // Pattern B: if (setjmp(buf)) { X }  <remaining stmts>
       catchUserBody = stmt.thenBranch;
@@ -7447,9 +7452,9 @@ function lowerSetjmpInCompound(compound, tag, counterVar) {
         // Gather remaining statements from the compound as the try body
         const remaining = stmts.splice(i + 1);
         if (remaining.length === 0) {
-          tryBody = new AST.SEmpty();
+          tryBody = new AST.SEmpty(stmtLoc);
         } else {
-          tryBody = new AST.SCompound(remaining);
+          tryBody = new AST.SCompound(stmtLoc, remaining);
         }
       }
     }
@@ -7472,7 +7477,7 @@ function lowerSetjmpInCompound(compound, tag, counterVar) {
     };
 
     // Build the STryCatch
-    const tryCatch = new AST.STryCatch(tryBody, [cc]);
+    const tryCatch = new AST.STryCatch(stmtLoc, tryBody, [cc]);
 
     // Build: buf[0] = ++__setjmp_id_counter; try { ... } catch { ... }
     const setBufStmt = makeSetBufIdStmt(bufExpr, counterVar);
