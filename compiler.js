@@ -2881,11 +2881,64 @@ class Expr {
       return _EMPTY_TREE_BAG;
     }
   }
+  // BinOp / UnOp: single source of truth for op metadata. EBinary /
+  // EUnary look up linearity here at construction time and reject
+  // unknown op names (catches typos like "ASSING" or stray refactor
+  // residue). Other code consults these for diagnostic text and
+  // category checks (isAssign, isCompare, etc.) instead of scattering
+  // `op === "..."` chains. The flags are fixed properties of the op
+  // itself — assignment-ness etc. don't depend on operands.
+  const BinOp = Object.freeze({
+    ADD:         { text: "+",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    SUB:         { text: "-",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    MUL:         { text: "*",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    DIV:         { text: "/",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    MOD:         { text: "%",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    EQ:          { text: "==",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    NE:          { text: "!=",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    LT:          { text: "<",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    GT:          { text: ">",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    LE:          { text: "<=",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    GE:          { text: ">=",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: true,  isLogical: false, isShift: false, isBitwise: false },
+    LAND:        { text: "&&",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: true,  isShift: false, isBitwise: false },
+    LOR:         { text: "||",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: true,  isShift: false, isBitwise: false },
+    BAND:        { text: "&",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    BOR:         { text: "|",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    BXOR:        { text: "^",   linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    SHL:         { text: "<<",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: true,  isBitwise: false },
+    SHR:         { text: ">>",  linearity: Linearity.UNRESTRICTED, isAssign: false, isCompare: false, isLogical: false, isShift: true,  isBitwise: false },
+    ASSIGN:      { text: "=",   linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    ADD_ASSIGN:  { text: "+=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    SUB_ASSIGN:  { text: "-=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    MUL_ASSIGN:  { text: "*=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    DIV_ASSIGN:  { text: "/=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    MOD_ASSIGN:  { text: "%=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: false },
+    BAND_ASSIGN: { text: "&=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    BOR_ASSIGN:  { text: "|=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    BXOR_ASSIGN: { text: "^=",  linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: false, isBitwise: true },
+    SHL_ASSIGN:  { text: "<<=", linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: true,  isBitwise: false },
+    SHR_ASSIGN:  { text: ">>=", linearity: Linearity.LINEAR,       isAssign: true,  isCompare: false, isLogical: false, isShift: true,  isBitwise: false },
+  });
+  const UnOp = Object.freeze({
+    OP_PRE_INC:  { text: "++",  linearity: Linearity.LINEAR,       isIncDec: true,  isAddr: false, isDeref: false },
+    OP_PRE_DEC:  { text: "--",  linearity: Linearity.LINEAR,       isIncDec: true,  isAddr: false, isDeref: false },
+    OP_POST_INC: { text: "++",  linearity: Linearity.LINEAR,       isIncDec: true,  isAddr: false, isDeref: false },
+    OP_POST_DEC: { text: "--",  linearity: Linearity.LINEAR,       isIncDec: true,  isAddr: false, isDeref: false },
+    // Address-take produces identity (the address is observable).
+    OP_ADDR:     { text: "&",   linearity: Linearity.AFFINE,       isIncDec: false, isAddr: true,  isDeref: false },
+    // Memory read; treated as pure at this level (no volatile model).
+    OP_DEREF:    { text: "*",   linearity: Linearity.UNRESTRICTED, isIncDec: false, isAddr: false, isDeref: true },
+    OP_POS:      { text: "+",   linearity: Linearity.UNRESTRICTED, isIncDec: false, isAddr: false, isDeref: false },
+    OP_NEG:      { text: "-",   linearity: Linearity.UNRESTRICTED, isIncDec: false, isAddr: false, isDeref: false },
+    OP_BNOT:     { text: "~",   linearity: Linearity.UNRESTRICTED, isIncDec: false, isAddr: false, isDeref: false },
+    OP_LNOT:     { text: "!",   linearity: Linearity.UNRESTRICTED, isIncDec: false, isAddr: false, isDeref: false },
+  });
+
   class EBinary extends Expr {
     constructor(loc, type, op, left, right) {
-      const isAssignOp = op === "ASSIGN" || op.endsWith("_ASSIGN");
-      super(loc, type, [left, right],
-        isAssignOp ? Linearity.LINEAR : Linearity.UNRESTRICTED);
+      const meta = BinOp[op];
+      if (!meta) throw new Error(`EBinary: unknown op '${op}' (typo? known: ${Object.keys(BinOp).join(", ")})`);
+      super(loc, type, [left, right], meta.linearity);
       this.op = op; this.left = left; this.right = right;
       Object.freeze(this);
     }
@@ -2893,14 +2946,9 @@ class Expr {
   }
   class EUnary extends Expr {
     constructor(loc, type, op, operand) {
-      // Inc/dec mutate; address-take produces identity; +/-/~/!/deref are
-      // pure (deref reads memory but has no side effect at this level).
-      let opLin;
-      if (op === "OP_PRE_INC"  || op === "OP_POST_INC" ||
-          op === "OP_PRE_DEC"  || op === "OP_POST_DEC") opLin = Linearity.LINEAR;
-      else if (op === "OP_ADDR") opLin = Linearity.AFFINE;
-      else opLin = Linearity.UNRESTRICTED;  // OP_POS / OP_NEG / OP_BNOT / OP_LNOT / OP_DEREF
-      super(loc, type, [operand], opLin);
+      const meta = UnOp[op];
+      if (!meta) throw new Error(`EUnary: unknown op '${op}' (typo? known: ${Object.keys(UnOp).join(", ")})`);
+      super(loc, type, [operand], meta.linearity);
       this.op = op; this.operand = operand;
       Object.freeze(this);
     }
@@ -3381,12 +3429,13 @@ function promoteExprType(e) {
 function computeBinaryType(op, leftType, rightType) {
   // Divergent absorbs — propagate so further ops on it stay sound.
   if (leftType.isDivergent() || rightType.isDivergent()) return Types.TDIVERGENT;
+  const meta = AST.BinOp[op];
   // Comparison and logical operators return int.
-  if (["EQ","NE","LT","GT","LE","GE","LAND","LOR"].includes(op)) return Types.TINT;
+  if (meta.isCompare || meta.isLogical) return Types.TINT;
   // Assignment operators return left type.
-  if (op.endsWith("ASSIGN") || op === "ASSIGN") return leftType;
+  if (meta.isAssign) return leftType;
   // Shift operators: result type is the promoted left operand type (C99 6.5.7).
-  if (op === "SHL" || op === "SHR") {
+  if (meta.isShift) {
     const uq = leftType.removeQualifiers();
     if (uq === Types.TCHAR || uq === Types.TSCHAR || uq === Types.TUCHAR ||
         uq === Types.TSHORT || uq === Types.TUSHORT || uq === Types.TBOOL) {
@@ -3401,17 +3450,6 @@ function computeBinaryType(op, leftType, rightType) {
   return Types.usualArithmeticConversions(leftType, rightType);
 }
 
-// Pretty source text for each AST binary op, for use in diagnostics.
-const BOP_TEXT = {
-  ADD: "+", SUB: "-", MUL: "*", DIV: "/", MOD: "%",
-  EQ: "==", NE: "!=", LT: "<", GT: ">", LE: "<=", GE: ">=",
-  LAND: "&&", LOR: "||", BAND: "&", BOR: "|", BXOR: "^",
-  SHL: "<<", SHR: ">>", ASSIGN: "=",
-  ADD_ASSIGN: "+=", SUB_ASSIGN: "-=", MUL_ASSIGN: "*=",
-  DIV_ASSIGN: "/=", MOD_ASSIGN: "%=", BAND_ASSIGN: "&=",
-  BOR_ASSIGN: "|=", BXOR_ASSIGN: "^=", SHL_ASSIGN: "<<=", SHR_ASSIGN: ">>=",
-};
-
 // Build an EBinary, applying C semantics:
 //   - reject ref-incompatible operators
 //   - reject non-null int → ref on ASSIGN; reject any compound-assign on ref
@@ -3425,7 +3463,9 @@ const BOP_TEXT = {
 // `fatalError` so parsing halts at the first one, matching the parser's
 // historic behavior.
 function makeBinary(loc, op, left, right) {
-  const opText = BOP_TEXT[op] || op;
+  const meta = AST.BinOp[op];
+  if (!meta) throw new Error(`makeBinary: unknown op '${op}'`);
+  const opText = meta.text;
   const lIsRef = left.type.removeQualifiers().isRef();
   const rIsRef = right.type.removeQualifiers().isRef();
   // Refs: only ==, !=, &&, ||, ASSIGN are allowed.
@@ -3433,13 +3473,13 @@ function makeBinary(loc, op, left, right) {
     if (op === "LT" || op === "GT" || op === "LE" || op === "GE") {
       fatalError(loc, `'${opText}' on reference type is not allowed (only ==, != for identity/null)`);
     }
+    // Arithmetic / shift / bitwise on refs is meaningless.
     if (op === "ADD" || op === "SUB" || op === "MUL" || op === "DIV" ||
-        op === "MOD" || op === "SHL" || op === "SHR" ||
-        op === "BAND" || op === "BOR" || op === "BXOR") {
+        op === "MOD" || meta.isShift || meta.isBitwise) {
       fatalError(loc, `'${opText}' on reference type is not allowed`);
     }
     // == / != involving refs: must be ref-vs-ref OR ref-vs-(null pointer constant).
-    if (op === "EQ" || op === "NE") {
+    if (meta.isCompare && (op === "EQ" || op === "NE")) {
       if (lIsRef !== rIsRef && !isNullPointerConstant(lIsRef ? right : left)) {
         fatalError(loc,
           `'${opText}' between reference and non-reference requires the non-ref operand to be the literal 0 / NULL`);
@@ -3451,17 +3491,16 @@ function makeBinary(loc, op, left, right) {
     rejectNonZeroToRef(left.type, right, loc);
   }
   // Compound assignment on ref: not allowed.
-  if (lIsRef && op !== "ASSIGN" && op.endsWith("_ASSIGN")) {
+  if (lIsRef && meta.isAssign && op !== "ASSIGN") {
     fatalError(loc, `'${opText}' on reference type is not allowed`);
   }
   // Decay array/function operands. ASSIGN/compound's left is the lvalue
   // target — never decayed. ASSIGN's right decays only if the left is a
   // pointer (so `p = arr` works).
-  const isAssignOp = op === "ASSIGN" || op.endsWith("_ASSIGN");
   const isPtrArith = (op === "ADD" || op === "SUB") &&
     (left.type.isPointer() || right.type.isPointer() ||
      left.type.isArray() || right.type.isArray());
-  if (!isAssignOp) {
+  if (!meta.isAssign) {
     left = maybeDecay(left);
     right = maybeDecay(right);
   } else if (op === "ASSIGN" && left.type.isPointer()) {
@@ -3474,15 +3513,13 @@ function makeBinary(loc, op, left, right) {
   //   - logical && / || (boolean coercion is per-operand, not common)
   //   - pointer arithmetic (operand types are deliberately mixed)
   //   - ref operands (== / != on refs is identity, no conversion)
-  if (!isAssignOp && op !== "LAND" && op !== "LOR") {
+  if (!meta.isAssign && !meta.isLogical) {
     const leftType = left.type;
     const rightType = right.type;
     const involvesRef = leftType.removeQualifiers().isRef() ||
                         rightType.removeQualifiers().isRef();
     if (!isPtrArith && !involvesRef) {
-      const isComparison = op === "EQ" || op === "NE" || op === "LT" || op === "GT" ||
-                           op === "LE" || op === "GE";
-      const opType = isComparison
+      const opType = meta.isCompare
         ? Types.usualArithmeticConversions(leftType, rightType)
         : resType;
       left = maybeImplicitCast(left, opType);
@@ -3812,6 +3849,8 @@ return {
   makeMember, makeArrow, makeIdent, lookupMemberChain,
   // Linearity tagging for optimizer correctness checks
   Linearity, joinLinearity,
+  // Op metadata registries (text, linearity, classification flags)
+  BinOp, UnOp,
   // Generic traversal / substitution for AST→AST passes
   walkExpr, substituteParams,
   // Bubble-up metadata container
@@ -3918,7 +3957,7 @@ const INLINER = (() => {
 // effect of its own — folding the operands and rewriting to a literal
 // is OK iff this is true AND the operands are themselves pure.
 function isPureBinop(op) {
-  return op !== "ASSIGN" && !op.endsWith("_ASSIGN");
+  return !AST.BinOp[op].isAssign;
 }
 
 // Evaluate a pure integer binary op on BigInt operands. Returns the
@@ -11881,12 +11920,13 @@ class CodeGenerator {
         break;
       }
       case AST.EBinary: {
-        if (expr.op.endsWith("ASSIGN")) {
+        const meta = AST.BinOp[expr.op];
+        if (meta.isAssign) {
           this.emitAssignment(expr, ctx);
           return;
         }
         const leftType = expr.left.type, rightType = expr.right.type;
-        const isComparison = ["EQ","NE","LT","GT","LE","GE"].includes(expr.op);
+        const isComparison = meta.isCompare;
         const wt = this.getBinaryWasmType(isComparison ? leftType : expr.type);
         const isUnsigned = this.isUnsignedType(leftType);
         // Pointer arithmetic

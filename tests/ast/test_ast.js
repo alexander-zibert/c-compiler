@@ -701,6 +701,95 @@ test('DExceptionTag is a real Decl class', () => {
 });
 
 // =============================================================================
+// BinOp / UnOp registries
+// =============================================================================
+
+test('BinOp registry covers every C binary op', () => {
+  const expected = ['ADD','SUB','MUL','DIV','MOD',
+                    'EQ','NE','LT','GT','LE','GE',
+                    'LAND','LOR','BAND','BOR','BXOR','SHL','SHR',
+                    'ASSIGN','ADD_ASSIGN','SUB_ASSIGN','MUL_ASSIGN','DIV_ASSIGN',
+                    'MOD_ASSIGN','BAND_ASSIGN','BOR_ASSIGN','BXOR_ASSIGN',
+                    'SHL_ASSIGN','SHR_ASSIGN'];
+  for (const op of expected) {
+    assert(AST.BinOp[op], `missing BinOp.${op}`);
+    assert(typeof AST.BinOp[op].text === 'string', `BinOp.${op}.text`);
+    assert(AST.BinOp[op].linearity, `BinOp.${op}.linearity`);
+  }
+});
+test('BinOp flags classify ops correctly', () => {
+  assert(AST.BinOp.ASSIGN.isAssign, 'ASSIGN.isAssign');
+  assert(AST.BinOp.ADD_ASSIGN.isAssign, 'ADD_ASSIGN.isAssign');
+  assert(!AST.BinOp.ADD.isAssign, 'ADD.isAssign should be false');
+  assert(AST.BinOp.EQ.isCompare, 'EQ.isCompare');
+  assert(AST.BinOp.LT.isCompare, 'LT.isCompare');
+  assert(!AST.BinOp.ADD.isCompare, 'ADD.isCompare should be false');
+  assert(AST.BinOp.LAND.isLogical, 'LAND.isLogical');
+  assert(AST.BinOp.LOR.isLogical, 'LOR.isLogical');
+  assert(AST.BinOp.SHL.isShift, 'SHL.isShift');
+  assert(AST.BinOp.SHR_ASSIGN.isShift, 'SHR_ASSIGN.isShift');
+  assert(AST.BinOp.BAND.isBitwise, 'BAND.isBitwise');
+  assert(AST.BinOp.BOR_ASSIGN.isBitwise, 'BOR_ASSIGN.isBitwise');
+});
+test('BinOp linearity: assigns are LINEAR, others UNRESTRICTED', () => {
+  for (const op of Object.keys(AST.BinOp)) {
+    const meta = AST.BinOp[op];
+    if (meta.isAssign) {
+      assertEq(meta.linearity, 'LINEAR', `BinOp.${op}.linearity`);
+    } else {
+      assertEq(meta.linearity, 'UNRESTRICTED', `BinOp.${op}.linearity`);
+    }
+  }
+});
+test('EBinary rejects unknown op strings', () => {
+  const i1 = new AST.EInt(LOC, Types.TINT, 1n);
+  const i2 = new AST.EInt(LOC, Types.TINT, 2n);
+  assertThrows(() => new AST.EBinary(LOC, Types.TINT, 'NOT_A_REAL_OP', i1, i2),
+    /unknown op/);
+  assertThrows(() => new AST.EBinary(LOC, Types.TINT, 'ASSING', i1, i2),
+    /unknown op/);
+});
+test('EBinary picks up linearity from the registry', () => {
+  const i1 = new AST.EInt(LOC, Types.TINT, 1n);
+  const i2 = new AST.EInt(LOC, Types.TINT, 2n);
+  const add = new AST.EBinary(LOC, Types.TINT, 'ADD', i1, i2);
+  assertEq(add.linearity, 'UNRESTRICTED', 'ADD on pure ints is UNRESTRICTED');
+  const assign = new AST.EBinary(LOC, Types.TINT, 'ASSIGN', i1, i2);
+  assertEq(assign.linearity, 'LINEAR', 'ASSIGN is LINEAR regardless of operands');
+});
+
+test('UnOp registry covers every C unary op', () => {
+  const expected = ['OP_PRE_INC','OP_PRE_DEC','OP_POST_INC','OP_POST_DEC',
+                    'OP_ADDR','OP_DEREF','OP_POS','OP_NEG','OP_BNOT','OP_LNOT'];
+  for (const op of expected) {
+    assert(AST.UnOp[op], `missing UnOp.${op}`);
+    assert(typeof AST.UnOp[op].text === 'string', `UnOp.${op}.text`);
+    assert(AST.UnOp[op].linearity, `UnOp.${op}.linearity`);
+  }
+});
+test('UnOp flags: isIncDec, isAddr, isDeref', () => {
+  assert(AST.UnOp.OP_PRE_INC.isIncDec, 'OP_PRE_INC.isIncDec');
+  assert(AST.UnOp.OP_POST_DEC.isIncDec, 'OP_POST_DEC.isIncDec');
+  assert(!AST.UnOp.OP_NEG.isIncDec, 'OP_NEG.isIncDec should be false');
+  assert(AST.UnOp.OP_ADDR.isAddr, 'OP_ADDR.isAddr');
+  assert(!AST.UnOp.OP_DEREF.isAddr, 'OP_DEREF.isAddr should be false');
+  assert(AST.UnOp.OP_DEREF.isDeref, 'OP_DEREF.isDeref');
+});
+test('UnOp linearity: inc/dec LINEAR, addr AFFINE, others UNRESTRICTED', () => {
+  assertEq(AST.UnOp.OP_PRE_INC.linearity,  'LINEAR');
+  assertEq(AST.UnOp.OP_POST_DEC.linearity, 'LINEAR');
+  assertEq(AST.UnOp.OP_ADDR.linearity,     'AFFINE');
+  assertEq(AST.UnOp.OP_DEREF.linearity,    'UNRESTRICTED');
+  assertEq(AST.UnOp.OP_NEG.linearity,      'UNRESTRICTED');
+  assertEq(AST.UnOp.OP_LNOT.linearity,     'UNRESTRICTED');
+});
+test('EUnary rejects unknown op strings', () => {
+  const i1 = new AST.EInt(LOC, Types.TINT, 1n);
+  assertThrows(() => new AST.EUnary(LOC, Types.TINT, 'OP_NOT_REAL', i1),
+    /unknown op/);
+});
+
+// =============================================================================
 // runner output
 // =============================================================================
 
