@@ -2582,9 +2582,12 @@ function _rankToLinearity(r) {
 // Join an op's intrinsic linearity with the linearity of children. The
 // result is the strictest of (opLinearity, child1.linearity, ...) — a
 // node is UNRESTRICTED iff its op is pure AND every child is too.
+// Tolerates null/undefined children (some construction phases use partial
+// child lists, e.g. EInitList during normalizeInitList).
 function joinLinearity(opLinearity, ...children) {
   let rank = _LINEARITY_RANK[opLinearity];
   for (const c of children) {
+    if (!c) continue;
     const r = _LINEARITY_RANK[c.linearity];
     if (r > rank) rank = r;
   }
@@ -2592,13 +2595,34 @@ function joinLinearity(opLinearity, ...children) {
 }
 
 // --- Base classes ---
+// The base Expr constructor takes a `children` array (in evaluation
+// order) and an `opLinearity` (the intrinsic linearity of this op,
+// before child contributions). The base computes `this.linearity` by
+// joining opLinearity with the children's linearities — subclasses
+// just declare what kind of op they are; bubble-up is automatic.
+//
+// Children are walkable via `this.children` (used by walkExpr / generic
+// rewriters). Subclasses additionally store named field aliases (`left`,
+// `right`, `operand`, `base`, `index`, etc.) for ergonomic access from
+// codegen and other consumers — these alias the same expression objects.
 class Expr {
-    constructor(loc, type) {
+    constructor(loc, type, children, opLinearity) {
       if (!loc) {
         throw new Error(`Expr: loc is required (use Lexer.Loc.fromTok / Loc.generated for synthesized nodes)`);
       }
       this.loc = loc;
       this.type = type;
+      this.children = children;
+      this.linearity = joinLinearity(opLinearity, ...children);
+    }
+    // Rebuild this node with replaced children, in the same order as
+    // `this.children`. Leaf subclasses (no children) inherit this
+    // identity-return; non-leaf subclasses must override.
+    _withChildren(newChildren) {
+      if (newChildren.length === 0) return this;
+      throw new Error(
+        `${this.constructor.name} must implement _withChildren ` +
+        `(node has ${this.children.length} children)`);
     }
   }
   class Stmt {
@@ -2678,9 +2702,8 @@ class Expr {
       if (typeof value !== 'bigint') {
         throw new Error(`EInt: value must be a BigInt; got ${typeof value}`);
       }
-      super(loc, type);
+      super(loc, type, [], Linearity.UNRESTRICTED);
       this.value = value;
-      this.linearity = Linearity.UNRESTRICTED;
       Object.freeze(this);
     }
   }
@@ -2692,9 +2715,8 @@ class Expr {
       if (typeof value !== 'number') {
         throw new Error(`EFloat: value must be a number; got ${typeof value}`);
       }
-      super(loc, type);
+      super(loc, type, [], Linearity.UNRESTRICTED);
       this.value = value;
-      this.linearity = Linearity.UNRESTRICTED;
       Object.freeze(this);
     }
   }
@@ -2715,54 +2737,56 @@ class Expr {
       if (!Array.isArray(value)) {
         throw new Error(`EString: value must be an Array of byte numbers; got ${value?.constructor?.name ?? typeof value}`);
       }
-      super(loc, type);
+      super(loc, type, [], Linearity.UNRESTRICTED);
       this.value = value;
-      this.linearity = Linearity.UNRESTRICTED;
       Object.freeze(this);
     }
   }
+  // Variable / function / enum constant reference. Pure UNRESTRICTED at
+  // this AST level: the load itself has no side effects, and reading a
+  // named decl twice in adjacent positions yields the same value (we
+  // don't model volatile, signal handlers, or threads).
   class EIdent extends Expr {
     constructor(loc, type, name, decl) {
-      super(loc, type); this.name = name; this.decl = decl;
-      // EnumConst / DFunc references are pure constants. DVar references
-      // are memory loads — LINEAR (a non-volatile read is reorderable in
-      // some windows, but we don't track those windows here).
-      const isPureRef = decl && (decl instanceof DEnumConst || decl instanceof DFunc);
-      this.linearity = isPureRef ? Linearity.UNRESTRICTED : Linearity.LINEAR;
+      super(loc, type, [], Linearity.UNRESTRICTED);
+      this.name = name; this.decl = decl;
       Object.freeze(this);
     }
   }
   class EBinary extends Expr {
     constructor(loc, type, op, left, right) {
-      super(loc, type); this.op = op; this.left = left; this.right = right;
       const isAssignOp = op === "ASSIGN" || op.endsWith("_ASSIGN");
-      this.linearity = joinLinearity(
-        isAssignOp ? Linearity.LINEAR : Linearity.UNRESTRICTED, left, right);
+      super(loc, type, [left, right],
+        isAssignOp ? Linearity.LINEAR : Linearity.UNRESTRICTED);
+      this.op = op; this.left = left; this.right = right;
       Object.freeze(this);
     }
+    _withChildren([left, right]) { return new EBinary(this.loc, this.type, this.op, left, right); }
   }
   class EUnary extends Expr {
     constructor(loc, type, op, operand) {
-      super(loc, type); this.op = op; this.operand = operand;
-      // Inc/dec mutate; deref reads memory; address-take has identity.
+      // Inc/dec mutate; address-take produces identity; +/-/~/!/deref are
+      // pure (deref reads memory but has no side effect at this level).
       let opLin;
       if (op === "OP_PRE_INC"  || op === "OP_POST_INC" ||
-          op === "OP_PRE_DEC"  || op === "OP_POST_DEC" ||
-          op === "OP_DEREF") opLin = Linearity.LINEAR;
+          op === "OP_PRE_DEC"  || op === "OP_POST_DEC") opLin = Linearity.LINEAR;
       else if (op === "OP_ADDR") opLin = Linearity.AFFINE;
-      else opLin = Linearity.UNRESTRICTED;  // OP_POS / OP_NEG / OP_BNOT / OP_LNOT
-      this.linearity = joinLinearity(opLin, operand);
+      else opLin = Linearity.UNRESTRICTED;  // OP_POS / OP_NEG / OP_BNOT / OP_LNOT / OP_DEREF
+      super(loc, type, [operand], opLin);
+      this.op = op; this.operand = operand;
       Object.freeze(this);
     }
+    _withChildren([operand]) { return new EUnary(this.loc, this.type, this.op, operand); }
   }
   class ETernary extends Expr {
     constructor(loc, type, condition, thenExpr, elseExpr) {
-      super(loc, type);
+      // Control flow: only one branch evaluates. Conservative LINEAR.
+      super(loc, type, [condition, thenExpr, elseExpr], Linearity.LINEAR);
       this.condition = condition; this.thenExpr = thenExpr; this.elseExpr = elseExpr;
-      // Control flow: only one branch evaluates, so we can't simply
-      // bubble both. Treat as LINEAR.
-      this.linearity = Linearity.LINEAR;
       Object.freeze(this);
+    }
+    _withChildren([condition, thenExpr, elseExpr]) {
+      return new ETernary(this.loc, this.type, condition, thenExpr, elseExpr);
     }
   }
   class ECall extends Expr {
@@ -2784,7 +2808,7 @@ class Expr {
           calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
         returnType = calleeType.baseType.returnType;
       }
-      super(loc, returnType);
+      super(loc, returnType, [callee, ...args], Linearity.LINEAR);
       this.callee = callee;
       this.arguments = args;
       // Look through EDecay so direct calls to a function name still
@@ -2792,122 +2816,148 @@ class Expr {
       const inner = callee instanceof EDecay ? callee.operand : callee;
       this.funcDecl = (inner instanceof EIdent && inner.decl instanceof DFunc)
         ? inner.decl : null;
-      this.linearity = Linearity.LINEAR;  // function calls are always sequenced
       Object.freeze(this);
     }
+    _withChildren([callee, ...args]) { return new ECall(this.loc, callee, args); }
   }
   class ESubscript extends Expr {
     constructor(loc, type, array, index) {
-      super(loc, type); this.array = array; this.index = index;
-      this.linearity = Linearity.LINEAR;  // memory access
+      // Pure indexed read at this level — no side effect, deterministic.
+      super(loc, type, [array, index], Linearity.UNRESTRICTED);
+      this.array = array; this.index = index;
       Object.freeze(this);
     }
+    _withChildren([array, index]) { return new ESubscript(this.loc, this.type, array, index); }
   }
   class EMember extends Expr {
     constructor(loc, type, base, memberName, memberDecl) {
-      super(loc, type); this.base = base; this.memberName = memberName;
+      // Pure field read.
+      super(loc, type, [base], Linearity.UNRESTRICTED);
+      this.base = base; this.memberName = memberName;
       this.memberDecl = memberDecl || null;
-      this.linearity = Linearity.LINEAR;  // memory access
       Object.freeze(this);
+    }
+    _withChildren([base]) {
+      return new EMember(this.loc, this.type, base, this.memberName, this.memberDecl);
     }
   }
   class EArrow extends Expr {
     constructor(loc, type, base, memberName, memberDecl) {
-      super(loc, type); this.base = base; this.memberName = memberName;
+      // Pure indirect field read.
+      super(loc, type, [base], Linearity.UNRESTRICTED);
+      this.base = base; this.memberName = memberName;
       this.memberDecl = memberDecl || null;
-      this.linearity = Linearity.LINEAR;  // memory access via pointer
       Object.freeze(this);
+    }
+    _withChildren([base]) {
+      return new EArrow(this.loc, this.type, base, this.memberName, this.memberDecl);
     }
   }
   class ECast extends Expr {
     constructor(loc, type, targetType, expr) {
-      super(loc, type); this.targetType = targetType; this.expr = expr;
-      this.linearity = joinLinearity(Linearity.UNRESTRICTED, expr);
+      super(loc, type, [expr], Linearity.UNRESTRICTED);
+      this.targetType = targetType; this.expr = expr;
       Object.freeze(this);
     }
+    _withChildren([expr]) { return new ECast(this.loc, this.type, this.targetType, expr); }
   }
+  // sizeof / _Alignof don't evaluate their expression operand — children
+  // is empty so its linearity doesn't propagate.
   class ESizeofExpr extends Expr {
     constructor(loc, type, expr) {
-      super(loc, type); this.expr = expr;
-      // Operand is not evaluated — its linearity doesn't propagate.
-      this.linearity = Linearity.UNRESTRICTED;
+      super(loc, type, [], Linearity.UNRESTRICTED);
+      this.expr = expr;
       Object.freeze(this);
     }
   }
   class ESizeofType extends Expr {
     constructor(loc, type, operandType) {
-      super(loc, type); this.operandType = operandType;
-      this.linearity = Linearity.UNRESTRICTED;
+      super(loc, type, [], Linearity.UNRESTRICTED);
+      this.operandType = operandType;
       Object.freeze(this);
     }
   }
   class EAlignofExpr extends Expr {
     constructor(loc, type, expr) {
-      super(loc, type); this.expr = expr;
-      // Operand not evaluated.
-      this.linearity = Linearity.UNRESTRICTED;
+      super(loc, type, [], Linearity.UNRESTRICTED);
+      this.expr = expr;
       Object.freeze(this);
     }
   }
   class EAlignofType extends Expr {
     constructor(loc, type, operandType) {
-      super(loc, type); this.operandType = operandType;
-      this.linearity = Linearity.UNRESTRICTED;
+      super(loc, type, [], Linearity.UNRESTRICTED);
+      this.operandType = operandType;
       Object.freeze(this);
     }
   }
   class EComma extends Expr {
     constructor(loc, type, expressions) {
-      super(loc, type); this.expressions = expressions;
       // Sequencing — each subexpression evaluates in order.
-      this.linearity = Linearity.LINEAR;
+      super(loc, type, expressions, Linearity.LINEAR);
+      this.expressions = expressions;
       Object.freeze(this);
     }
+    _withChildren(newChildren) { return new EComma(this.loc, this.type, newChildren); }
   }
-  // EInitList is seal-only (not frozen) because normalizeInitList rewrites
-  // its `elements` and `designators` arrays in place after construction.
+  // EInitList is seal-only (not frozen) because normalizeInitList mutates
+  // its `elements` array in place after construction. `this.children`
+  // shares the same array reference so walkers see the current state.
   class EInitList extends Expr {
     constructor(loc, type, elements, designators, unionMemberIndex) {
-      super(loc, type);
-      this.elements = elements; this.designators = designators || [];
+      super(loc, type, elements, Linearity.UNRESTRICTED);
+      this.elements = elements;  // same ref as this.children
+      this.designators = designators || [];
       this.unionMemberIndex = unionMemberIndex ?? -1;
-      this.linearity = joinLinearity(Linearity.UNRESTRICTED, ...elements.filter(e => e));
       Object.seal(this);
+    }
+    _withChildren(newChildren) {
+      return new EInitList(this.loc, this.type, newChildren, this.designators, this.unionMemberIndex);
     }
   }
   class EIntrinsic extends Expr {
     constructor(loc, type, ikind, args, argType) {
-      super(loc, type); this.intrinsicKind = ikind; this.args = args;
-      this.argType = argType || null;
       // Most intrinsics are calls (memory ops, va_arg, etc.).
-      this.linearity = Linearity.LINEAR;
+      super(loc, type, args, Linearity.LINEAR);
+      this.intrinsicKind = ikind; this.args = args;
+      this.argType = argType || null;
       Object.freeze(this);
+    }
+    _withChildren(newChildren) {
+      return new EIntrinsic(this.loc, this.type, this.intrinsicKind, newChildren, this.argType);
     }
   }
   class EWasm extends Expr {
     constructor(loc, type, args, bytes) {
-      super(loc, type); this.args = args; this.bytes = bytes;
-      this.linearity = Linearity.LINEAR;
+      super(loc, type, args, Linearity.LINEAR);
+      this.args = args; this.bytes = bytes;
       Object.freeze(this);
+    }
+    _withChildren(newChildren) {
+      return new EWasm(this.loc, this.type, newChildren, this.bytes);
     }
   }
   // ECompoundLiteral is seal-only (not frozen) because the optimizer
   // mutates `initList` in place to fold nested constants — replacing the
   // node would invalidate the parser/codegen identity-keyed tracking lists.
+  // Children is [initList] so walkers can recurse; INLINER's mutation
+  // updates both `this.initList` and `this.children[0]` together.
   class ECompoundLiteral extends Expr {
     constructor(loc, type, initList) {
-      super(loc, type); this.initList = initList;
       // Allocation has identity (the storage's address is observable).
-      this.linearity = Linearity.AFFINE;
+      super(loc, type, [initList], Linearity.AFFINE);
+      this.initList = initList;
       Object.seal(this);
     }
+    _withChildren([initList]) { return new ECompoundLiteral(this.loc, this.type, initList); }
   }
   class EImplicitCast extends Expr {
     constructor(loc, type, expr) {
-      super(loc, type); this.expr = expr;
-      this.linearity = joinLinearity(Linearity.UNRESTRICTED, expr);
+      super(loc, type, [expr], Linearity.UNRESTRICTED);
+      this.expr = expr;
       Object.freeze(this);
     }
+    _withChildren([expr]) { return new EImplicitCast(this.loc, this.type, expr); }
   }
   // Array→pointer or function→pointer decay. The operand has array or
   // function type; the EDecay node has the corresponding decayed pointer type.
@@ -2915,19 +2965,20 @@ class Expr {
   // base address for arrays / table index for functions).
   class EDecay extends Expr {
     constructor(loc, type, operand) {
-      super(loc, type);
+      super(loc, type, [operand], Linearity.UNRESTRICTED);
       this.operand = operand;
-      this.linearity = joinLinearity(Linearity.UNRESTRICTED, operand);
       Object.freeze(this);
     }
+    _withChildren([operand]) { return new EDecay(this.loc, this.type, operand); }
   }
   class EGCNew extends Expr {
     constructor(loc, type, args) {
-      super(loc, type); this.args = args;
       // GC allocation produces a fresh ref with identity.
-      this.linearity = Linearity.AFFINE;
+      super(loc, type, args, Linearity.AFFINE);
+      this.args = args;
       Object.freeze(this);
     }
+    _withChildren(newChildren) { return new EGCNew(this.loc, this.type, newChildren); }
   }
 
   // --- Stmt subclasses ---
@@ -2984,6 +3035,47 @@ class Expr {
   class SThrow extends Stmt {
     constructor(loc, tag, args) { super(loc); this.tag = tag; this.args = args; Object.freeze(this); }
   }
+
+// ---------- AST traversal / rewrite ----------
+//
+// walkExpr(expr, visit) walks the tree pre-order. The visitor returns:
+//   - undefined  → keep recursing into children
+//   - some node  → replace this subtree with the returned node (children
+//                  of the replacement are NOT visited automatically;
+//                  the visitor can call walkExpr on the replacement
+//                  recursively if it wants that)
+// If any child changed during recursion, the parent is rebuilt via
+// `_withChildren(newChildren)`. Identity-preserving on no-change paths,
+// so allocation stays O(changed).
+
+function walkExpr(expr, visit) {
+  if (!expr) return expr;
+  const replaced = visit(expr);
+  if (replaced !== undefined) return replaced;
+  const kids = expr.children;
+  if (!kids || kids.length === 0) return expr;
+  let changed = false;
+  const newKids = new Array(kids.length);
+  for (let i = 0; i < kids.length; i++) {
+    const w = walkExpr(kids[i], visit);
+    if (w !== kids[i]) changed = true;
+    newKids[i] = w;
+  }
+  return changed ? expr._withChildren(newKids) : expr;
+}
+
+// Substitute parameter references in an expression. `paramMap` maps
+// DVar instances (the function's parameter decls) to expression
+// replacements (the call's argument expressions). Used by the inliner
+// to rewrite a function body for substitution at a call site.
+function substituteParams(expr, paramMap) {
+  return walkExpr(expr, node => {
+    if (node instanceof EIdent && node.decl && paramMap.has(node.decl)) {
+      return paramMap.get(node.decl);
+    }
+    return undefined;
+  });
+}
 
 // ---------- AST builders that apply C semantics ----------
 //
@@ -3412,6 +3504,8 @@ return {
   makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
   // Linearity tagging for optimizer correctness checks
   Linearity, joinLinearity,
+  // Generic traversal / substitution for AST→AST passes
+  walkExpr, substituteParams,
 };
 })();
 
@@ -3642,11 +3736,15 @@ function foldExpr(expr) {
         if (folded !== a) changed = true;
         return folded;
       });
-      if (!changed) return expr;
-      // Bypass makeCall's validation — the parser already validated
-      // these args, and folding doesn't introduce new type issues.
-      const c = new AST.ECall(expr.loc, callee, newArgs);
-      return c;
+      const call = changed ? new AST.ECall(expr.loc, callee, newArgs) : expr;
+      // Mark the callee as live (for tree-shake) — even if we end up
+      // inlining, recording it is harmless and inlining might fail later
+      // (e.g., recursion) and leave a real call in place.
+      if (call.funcDecl) _liveFuncs.add(call.funcDecl);
+      // Try inlining. If we can substitute, recurse-fold on the result
+      // so cascaded folds (e.g., square(5) → 5*5 → 25) collapse.
+      const inlined = tryInline(call);
+      return inlined !== null ? foldExpr(inlined) : call;
     }
 
     case AST.ESubscript: {
@@ -3756,9 +3854,13 @@ function foldExpr(expr) {
 
     case AST.ECompoundLiteral: {
       // Compound literals are tracked by identity in the parser/codegen —
-      // don't replace the node. Mutate the init list in place if folded.
+      // don't replace the node. Mutate the init list in place if folded
+      // (and keep children[0] in sync so walkExpr sees current state).
       const folded = foldExpr(expr.initList);
-      if (folded !== expr.initList) expr.initList = folded;
+      if (folded !== expr.initList) {
+        expr.initList = folded;
+        expr.children[0] = folded;
+      }
       return expr;
     }
 
@@ -3895,22 +3997,129 @@ function foldStmt(stmt) {
   }
 }
 
-// Optimize a translation unit in place. Each defined function's body
-// is folded; each global variable's initializer is folded.
-function optimize(unit) {
-  for (const f of unit.definedFunctions) {
-    if (f.body) f.body = foldStmt(f.body);
+// ---------- Inlining ----------
+//
+// _inliningStack is the set of functions currently being inlined.
+// While we're substituting body B for a call to F, we push F. Any
+// recursive call to F encountered while folding B is left as a real
+// call (because tryInline bails when the callee is on the stack).
+// After we're done with F's body, we pop. This gives us natural
+// recursion detection without a separate call-graph pass.
+//
+// _liveFuncs is the set of functions reached during the walk —
+// populated by ECall handling whether or not inlining succeeds.
+// Functions never marked live are dropped at the end of optimize().
+const _inliningStack = new Set();
+const _liveFuncs = new Set();
+
+// Predicate: is this body a single `return EXPR;`? Returns the return
+// expression, or null if the body is anything more complex.
+function singleReturnBody(body) {
+  if (!body) return null;
+  if (body instanceof AST.SReturn) return body.expr || null;
+  if (body instanceof AST.SCompound &&
+      body.statements.length === 1 &&
+      body.statements[0] instanceof AST.SReturn) {
+    return body.statements[0].expr || null;
   }
+  return null;
+}
+
+// Try to inline a call. Returns the substituted expression on success,
+// or null if the call should stay as a call. Conservative criteria:
+//   - direct call (funcDecl set), with a body
+//   - body is a single `return EXPR;`
+//   - return EXPR is UNRESTRICTED (no side effects, deterministic)
+//   - argument count matches parameter count
+//   - all arguments are UNRESTRICTED (safe to substitute multiple times)
+//   - callee is not currently being inlined (recursion detected via stack)
+function tryInline(callExpr) {
+  const decl = callExpr.funcDecl;
+  if (!decl) return null;
+  if (_inliningStack.has(decl)) return null;
+  const def = decl.definition || decl;
+  if (!def.body) return null;
+  const returnExpr = singleReturnBody(def.body);
+  if (!returnExpr) return null;
+  if (returnExpr.linearity !== AST.Linearity.UNRESTRICTED) return null;
+  const params = def.parameters || [];
+  if (callExpr.arguments.length !== params.length) return null;
+  for (const arg of callExpr.arguments) {
+    if (arg.linearity !== AST.Linearity.UNRESTRICTED) return null;
+  }
+  const paramMap = new Map();
+  for (let i = 0; i < params.length; i++) {
+    paramMap.set(params[i], callExpr.arguments[i]);
+  }
+  // Push self onto the stack while substituting & re-folding the body,
+  // so a recursive call to `decl` inside the body sees its callee as
+  // already-being-inlined and bails.
+  _inliningStack.add(decl);
+  try {
+    return AST.substituteParams(returnExpr, paramMap);
+  } finally {
+    _inliningStack.delete(decl);
+  }
+}
+
+// Optimize a translation unit. Walk from "root" functions (entry points
+// + exported + extern + address-taken) and fold their bodies; ECall
+// folding records every reached callee as live and tries to inline.
+// Anything never reached gets dropped from the unit at the end —
+// inlining and tree-shaking fall out of the same walk.
+function isRootFunction(f, unit) {
+  // Anything not defined here can't be a root we own.
+  if (!f.body) return false;
+  // `main` is the conventional program entry.
+  if (f.name === "main") return true;
+  // Anything explicitly exported is a root.
+  for (const [, decl] of unit.exportDirectives) if (decl === f) return true;
+  // Extern-linkage functions might be called from another TU.
+  if (f.storageClass === Types.StorageClass.EXTERN ||
+      f.storageClass === Types.StorageClass.NONE) return true;
+  return false;
+}
+
+function optimize(unit) {
+  _inliningStack.clear();
+  _liveFuncs.clear();
+  // Walk frontier: every "root" function. Each fold encounters ECalls
+  // that mark their callees live; the worklist drains transitively.
+  const worklist = [];
+  for (const f of unit.definedFunctions) {
+    if (isRootFunction(f, unit)) {
+      _liveFuncs.add(f);
+      worklist.push(f);
+    }
+  }
+  // Globals' initializers may reference functions (function-pointer
+  // tables, &foo addresses). Walk those too.
   for (const v of unit.definedVariables) {
     if (v.initExpr) {
       const folded = foldExpr(v.initExpr);
       if (folded !== v.initExpr) v.initExpr = folded;
     }
   }
+  // Drain the worklist. Each fold may add new callees to _liveFuncs;
+  // only newly-discovered functions are queued.
+  const optimized = new Set();
+  while (worklist.length > 0) {
+    const f = worklist.shift();
+    if (optimized.has(f)) continue;
+    optimized.add(f);
+    if (!f.body) continue;
+    f.body = foldStmt(f.body);
+    // Newly-discovered callees with bodies become work too.
+    for (const g of _liveFuncs) {
+      if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) {
+        worklist.push(g);
+      }
+    }
+  }
   return unit;
 }
 
-return { optimize, foldExpr, foldStmt };
+return { optimize, foldExpr, foldStmt, tryInline };
 })();
 
 // LEB128 encoding utilities (shared between Parser and Wasm)
@@ -4537,11 +4746,13 @@ function findMemberChain(tag, name) {
 function normalizeInitList(initList, containerType) {
   initList.type = containerType;
 
-  // Save source elements and designators, then clear for output
-  const src = initList.elements;
-  const desigs = initList.designators;
-  initList.elements = [];
-  initList.designators = [];
+  // Snapshot source, then clear in place. We mutate the array's length
+  // rather than reassigning so that initList.children (which aliases
+  // initList.elements) stays consistent for walkers.
+  const src = initList.elements.slice();
+  const desigs = initList.designators.slice();
+  initList.elements.length = 0;
+  initList.designators.length = 0;
 
   // Child count for an aggregate type
   function childCount(t) {
@@ -4621,10 +4832,9 @@ function normalizeInitList(initList, containerType) {
     stack.push({ type: slotType, index: 0, count: cc, output: sub });
   }
 
-  // Initialize root level
+  // Initialize root level — `length = 0` was already done above; pad with nulls.
   const rootCount = childCount(containerType);
   if (rootCount !== 0x7FFFFFFF && rootCount > 0) {
-    initList.elements = [];
     for (let i = 0; i < rootCount; i++) initList.elements.push(null);
   }
   stack.push({ type: containerType, index: 0, count: rootCount, output: initList });
