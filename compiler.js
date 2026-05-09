@@ -2830,28 +2830,26 @@ class Expr {
     _withChildren([array, index]) { return new ESubscript(this.loc, this.type, array, index); }
   }
   class EMember extends Expr {
-    constructor(loc, type, base, memberName, memberDecl) {
+    constructor(loc, type, base, memberDecl) {
+      if (!memberDecl) throw new Error(`EMember: memberDecl is required (use makeMember to look up by name)`);
       // Pure field read.
       super(loc, type, [base], Linearity.UNRESTRICTED);
-      this.base = base; this.memberName = memberName;
-      this.memberDecl = memberDecl || null;
+      this.base = base;
+      this.memberDecl = memberDecl;
       Object.freeze(this);
     }
-    _withChildren([base]) {
-      return new EMember(this.loc, this.type, base, this.memberName, this.memberDecl);
-    }
+    _withChildren([base]) { return new EMember(this.loc, this.type, base, this.memberDecl); }
   }
   class EArrow extends Expr {
-    constructor(loc, type, base, memberName, memberDecl) {
+    constructor(loc, type, base, memberDecl) {
+      if (!memberDecl) throw new Error(`EArrow: memberDecl is required (use makeArrow to look up by name)`);
       // Pure indirect field read.
       super(loc, type, [base], Linearity.UNRESTRICTED);
-      this.base = base; this.memberName = memberName;
-      this.memberDecl = memberDecl || null;
+      this.base = base;
+      this.memberDecl = memberDecl;
       Object.freeze(this);
     }
-    _withChildren([base]) {
-      return new EArrow(this.loc, this.type, base, this.memberName, this.memberDecl);
-    }
+    _withChildren([base]) { return new EArrow(this.loc, this.type, base, this.memberDecl); }
   }
   class ECast extends Expr {
     constructor(loc, type, targetType, expr) {
@@ -3142,9 +3140,7 @@ function rejectNonZeroToRef(targetType, expr, loc) {
 function promoteExprType(e) {
   const t = e.type;
   let bf = null;
-  if (e instanceof EMember && e.memberDecl && e.memberDecl.bitWidth >= 0) {
-    bf = e.memberDecl;
-  } else if (e instanceof EArrow && e.memberDecl && e.memberDecl.bitWidth >= 0) {
+  if ((e instanceof EMember || e instanceof EArrow) && e.memberDecl.bitWidth >= 0) {
     bf = e.memberDecl;
   }
   if (bf) {
@@ -3308,7 +3304,7 @@ function makeUnary(loc, op, operand) {
       break;
     case "OP_ADDR":
       if ((operand instanceof EMember || operand instanceof EArrow) &&
-          operand.memberDecl && operand.memberDecl.bitWidth >= 0) {
+          operand.memberDecl.bitWidth >= 0) {
         fatalError(loc, `Cannot take address of bit-field member '${operand.memberDecl.name}'`);
       }
       if (isRef) {
@@ -3377,6 +3373,70 @@ function makeCast(loc, targetType, expr) {
     fatalError(loc, "Cannot cast to or from a reference type; use __cast(T, x) (or __ref_cast for GC ref downcast)");
   }
   return new ECast(loc, targetType, targetType, expr);
+}
+
+// Resolve a member-name lookup against a struct/union type. Returns
+// the chain of DVar field decls leading to the target (length 1 for a
+// direct field, length >1 when traversing anonymous nested structs),
+// or null if the name doesn't resolve. Pure — depends only on the type
+// and its tagDecl.members.
+function lookupMemberChain(type, name) {
+  const ut = type.removeQualifiers();
+  if (ut.tagDecl && ut.tagDecl.members) {
+    for (const m of ut.tagDecl.members) {
+      if (!(m instanceof DVar)) continue;
+      if (m.name === name) return [m];
+      // Recurse into anonymous nested struct/union members.
+      if (!m.name && m.type && m.type.tagDecl && m.type.tagDecl.members) {
+        const sub = lookupMemberChain(m.type, name);
+        if (sub) return [m, ...sub];
+      }
+    }
+  }
+  return null;
+}
+
+// Build a member-access expression `base.name`. Looks up the field
+// (handling anonymous-nested chains), reports a fatal error if it
+// doesn't exist, and constructs the chain of EMember nodes. After this
+// returns, every EMember has a non-null memberDecl by construction.
+function makeMember(loc, base, name) {
+  const chain = lookupMemberChain(base.type, name);
+  if (!chain) {
+    fatalError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+  }
+  let result = base;
+  for (const m of chain) {
+    result = new EMember(loc, m.type, result, m);
+  }
+  return result;
+}
+
+// Build a pointer-arrow expression `base->name`. For GC struct refs
+// (one-indirection by design), this is equivalent to `.` and builds an
+// EMember chain. For other pointer-to-struct types, decay the base if
+// needed and build EArrow + EMember chain (deref pointer once, then
+// walk anonymous-nested fields).
+function makeArrow(loc, base, name) {
+  let bt = base.type.removeQualifiers();
+  if (bt.kind === Types.TypeKind.GC_STRUCT) {
+    return makeMember(loc, base, name);
+  }
+  base = maybeDecay(base);
+  bt = base.type.removeQualifiers();
+  if (bt.kind === Types.TypeKind.POINTER) bt = bt.baseType;
+  const chain = lookupMemberChain(bt, name);
+  if (!chain) {
+    fatalError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+  }
+  // Outermost is the EArrow (deref); subsequent levels are EMember
+  // (walking through the dereferenced struct's anonymous fields).
+  const first = chain[0];
+  let result = new EArrow(loc, first.type, base, first);
+  for (let i = 1; i < chain.length; i++) {
+    result = new EMember(loc, chain[i].type, result, chain[i]);
+  }
+  return result;
 }
 
 // Build an ESubscript, applying C semantics:
@@ -3502,6 +3562,7 @@ return {
   maybeImplicitCast, maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
   promoteExprType, computeBinaryType, markAddressTaken,
   makeCall, makeSubscript, makeBinary, makeUnary, makeReturn, makeCast,
+  makeMember, makeArrow, lookupMemberChain,
   // Linearity tagging for optimizer correctness checks
   Linearity, joinLinearity,
   // Generic traversal / substitution for AST→AST passes
@@ -3544,7 +3605,7 @@ function constEvalInt(expr) {
       if (expr.op === "OP_ADDR") {
         // Support offsetof pattern: &((type*)0)->member
         const inner = expr.operand;
-        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
+        if (inner instanceof AST.EArrow || inner instanceof AST.EMember) {
           const base = constEvalInt(inner.base);
           if (base !== null) return base + BigInt(inner.memberDecl.byteOffset);
         }
@@ -3757,13 +3818,13 @@ function foldExpr(expr) {
     case AST.EMember: {
       const base = foldExpr(expr.base);
       return base === expr.base ? expr
-        : new AST.EMember(expr.loc, expr.type, base, expr.memberName, expr.memberDecl);
+        : new AST.EMember(expr.loc, expr.type, base, expr.memberDecl);
     }
 
     case AST.EArrow: {
       const base = foldExpr(expr.base);
       return base === expr.base ? expr
-        : new AST.EArrow(expr.loc, expr.type, base, expr.memberName, expr.memberDecl);
+        : new AST.EArrow(expr.loc, expr.type, base, expr.memberDecl);
     }
 
     case AST.ECast: {
@@ -4305,11 +4366,11 @@ function dumpExpr(expr, ctx, indent) {
       ret += dumpExpr(expr.index, ctx, indent + 1);
       break;
     case AST.EMember:
-      ret += "MEMBER ." + (expr.memberName ?? "(anon)");
+      ret += "MEMBER ." + (expr.memberDecl.name ?? "(anon)");
       ret += dumpExpr(expr.base, ctx, indent + 1);
       break;
     case AST.EArrow:
-      ret += "ARROW ->" + (expr.memberName ?? "(anon)");
+      ret += "ARROW ->" + (expr.memberDecl.name ?? "(anon)");
       ret += dumpExpr(expr.base, ctx, indent + 1);
       break;
     case AST.ECast:
@@ -6694,31 +6755,6 @@ class Parser {
     return initType;
   }
 
-  lookupMemberChain(type, name) {
-    const ut = type.removeQualifiers();
-    if (ut.tagDecl && ut.tagDecl.members) {
-      for (const m of ut.tagDecl.members) {
-        if (!(m instanceof AST.DVar)) continue;
-        if (m.name === name) return [m];
-        // Recurse into anonymous struct/union members
-        if (!m.name && m.type && m.type.tagDecl && m.type.tagDecl.members) {
-          const sub = this.lookupMemberChain(m.type, name);
-          if (sub) return [m, ...sub];
-        }
-      }
-    }
-    return null;
-  }
-
-  lookupMember(type, name) {
-    const chain = this.lookupMemberChain(type, name);
-    if (chain && chain.length > 0) {
-      const last = chain[chain.length - 1];
-      return { type: last.type, decl: last, chain };
-    }
-    return { type: Types.TINT, decl: null, chain: null };
-  }
-
   // Matches CC's parseUnaryExpression (compiler.cc ~line 10538)
   parseUnaryExpression() {
     const PREFIX_OPS = {
@@ -6824,53 +6860,15 @@ class Parser {
         continue;
       }
       if (this.matchText(".")) {
-        const dotTok = this.peek(-1);
-        const dotLoc = Lexer.Loc.fromTok(dotTok);
+        const dotLoc = Lexer.Loc.fromTok(this.peek(-1));
         const name = this.expectKind(Lexer.TokenKind.IDENT).text;
-        const { chain } = this.lookupMember(expr.type, name);
-        if (chain) {
-          for (const mVar of chain) {
-            expr = new AST.EMember(dotLoc, mVar.type, expr, mVar.name, mVar);
-          }
-        } else {
-          expr = new AST.EMember(dotLoc, Types.TINT, expr, name, null);
-        }
+        expr = AST.makeMember(dotLoc, expr, name);
         continue;
       }
       if (this.matchText("->")) {
-        const arrowTok = this.peek(-1);
-        const arrowLoc = Lexer.Loc.fromTok(arrowTok);
+        const arrowLoc = Lexer.Loc.fromTok(this.peek(-1));
         const name = this.expectKind(Lexer.TokenKind.IDENT).text;
-        let bt = expr.type.removeQualifiers();
-        // GC ref types are already "one indirection" semantically — `p->x` on
-        // a __struct ref is equivalent to `p.x`. Build EMember instead of
-        // EArrow so codegen takes the GC-struct member path.
-        if (bt.kind === Types.TypeKind.GC_STRUCT) {
-          const { chain } = this.lookupMember(bt, name);
-          if (chain) {
-            for (const m of chain) expr = new AST.EMember(arrowLoc, m.type, expr, m.name, m);
-          } else {
-            expr = new AST.EMember(arrowLoc, Types.TINT, expr, name, null);
-          }
-          continue;
-        }
-        // The lhs of `->` is decayed array-to-pointer if needed; the
-        // existing path handles plain pointers directly.
-        expr = maybeDecay(expr);
-        bt = expr.type.removeQualifiers();
-        if (bt.kind === Types.TypeKind.POINTER) bt = bt.baseType;
-        const { chain } = this.lookupMember(bt, name);
-        if (chain) {
-          // First element: arrow (dereference pointer)
-          const first = chain[0];
-          expr = new AST.EArrow(arrowLoc, first.type, expr, first.name, first);
-          // Remaining: member access (traverse anonymous structs)
-          for (let i = 1; i < chain.length; i++) {
-            expr = new AST.EMember(arrowLoc, chain[i].type, expr, chain[i].name, chain[i]);
-          }
-        } else {
-          expr = new AST.EArrow(arrowLoc, Types.TINT, expr, name, null);
-        }
+        expr = AST.makeArrow(arrowLoc, expr, name);
         continue;
       }
       if (this.matchText("++")) {
@@ -9542,7 +9540,7 @@ function constEvalAddr(expr, policy) {
     return null;
   }
   // Arrow: base->member → addr(base) + offset, where base is pointer
-  if (expr instanceof AST.EArrow && expr.memberDecl) {
+  if (expr instanceof AST.EArrow) {
     const baseVal = constEvalExpr(expr.base, policy);
     if (baseVal && (baseVal.kind === "addr" || baseVal.kind === "int")) {
       const baseAddr = baseVal.kind === "addr" ? baseVal.addrVal : Number(baseVal.intVal);
@@ -9600,7 +9598,7 @@ function constEvalExpr(expr, policy) {
           }
         }
         // &(base->member) or &(base.member) → base_addr + member offset
-        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
+        if (inner instanceof AST.EArrow || inner instanceof AST.EMember) {
           const baseAddr = constEvalAddr(inner.base, policy);
           if (baseAddr !== null) {
             return { kind: "addr", addrVal: baseAddr + inner.memberDecl.byteOffset };
@@ -11285,14 +11283,14 @@ class CodeGenerator {
         };
       }
       this.emitAddressOf(expr);
-      const lv = { kind: LV_MEMORY, type: expr.type, bitField: (expr.memberDecl && expr.memberDecl.bitWidth >= 0) ? expr.memberDecl : null, addrSource: LV_ADDR_LOCAL };
+      const lv = { kind: LV_MEMORY, type: expr.type, bitField: expr.memberDecl.bitWidth >= 0 ? expr.memberDecl : null, addrSource: LV_ADDR_LOCAL };
       lv.savedLocal = this.allocLocal(WT_I32);
       this.body.localSet(lv.savedLocal);
       return lv;
     }
     if (expr instanceof AST.EArrow) {
       this.emitAddressOf(expr);
-      const lv = { kind: LV_MEMORY, type: expr.type, bitField: (expr.memberDecl && expr.memberDecl.bitWidth >= 0) ? expr.memberDecl : null, addrSource: LV_ADDR_LOCAL };
+      const lv = { kind: LV_MEMORY, type: expr.type, bitField: expr.memberDecl.bitWidth >= 0 ? expr.memberDecl : null, addrSource: LV_ADDR_LOCAL };
       lv.savedLocal = this.allocLocal(WT_I32);
       this.body.localSet(lv.savedLocal);
       return lv;
