@@ -3265,6 +3265,504 @@ return {
 };
 })();
 
+// ====================
+// constEvalInt — pure integer constant evaluator
+// ====================
+// Returns BigInt or null. Handles literals, enum constants, arithmetic
+// on integer constants, sizeof/_Alignof, casts/implicit casts, and a
+// narrow address-arithmetic pattern (&((T*)0)->m → byteOffset) that
+// supports offsetof().
+
+function constEvalInt(expr) {
+  if (!expr) return null;
+  switch (expr.constructor) {
+    case AST.EInt: return expr.value;  // already BigInt
+    case AST.EIdent:
+      if (expr.decl && expr.decl instanceof AST.DEnumConst) return expr.decl.value;
+      return null;
+    case AST.EBinary: {
+      const l = constEvalInt(expr.left), r = constEvalInt(expr.right);
+      if (l === null || r === null) return null;
+      switch (expr.op) {
+        case "ADD": return l + r; case "SUB": return l - r;
+        case "MUL": return l * r; case "DIV": return r === 0n ? null : l / r;
+        case "MOD": return r === 0n ? null : l % r;
+        case "BAND": return l & r; case "BOR": return l | r; case "BXOR": return l ^ r;
+        case "SHL": return l << r; case "SHR": return l >> r;
+        case "EQ": return l === r ? 1n : 0n; case "NE": return l !== r ? 1n : 0n;
+        case "LT": return l < r ? 1n : 0n; case "GT": return l > r ? 1n : 0n;
+        case "LE": return l <= r ? 1n : 0n; case "GE": return l >= r ? 1n : 0n;
+        case "LAND": return (l && r) ? 1n : 0n; case "LOR": return (l || r) ? 1n : 0n;
+        default: return null;
+      }
+    }
+    case AST.EUnary: {
+      if (expr.op === "OP_ADDR") {
+        // Support offsetof pattern: &((type*)0)->member
+        const inner = expr.operand;
+        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
+          const base = constEvalInt(inner.base);
+          if (base !== null) return base + BigInt(inner.memberDecl.byteOffset);
+        }
+        return null;
+      }
+      const v = constEvalInt(expr.operand);
+      if (v === null) return null;
+      switch (expr.op) {
+        case "OP_POS": return v; case "OP_NEG": return -v;
+        case "OP_LNOT": return v === 0n ? 1n : 0n; case "OP_BNOT": return ~v;
+        default: return null;
+      }
+    }
+    case AST.EImplicitCast: {
+      return constEvalInt(expr.expr);
+    }
+    case AST.ETernary: {
+      const c = constEvalInt(expr.condition);
+      if (c === null) return null;
+      return constEvalInt(c !== 0n ? expr.thenExpr : expr.elseExpr);
+    }
+    case AST.ECast: {
+      const v = constEvalInt(expr.expr);
+      return v;
+    }
+    case AST.ESizeofExpr: return BigInt(expr.expr.type.size);
+    case AST.ESizeofType: return BigInt(expr.operandType.size);
+    case AST.EAlignofExpr: return BigInt(expr.expr.type.align);
+    case AST.EAlignofType: return BigInt(expr.operandType.align);
+    default: return null;
+  }
+}
+
+// ====================
+// INLINER — AST→AST optimization pass
+// ====================
+//
+// One pass that walks each function body bottom-up and folds constant
+// subexpressions (and dead branches under constant conditions). Named
+// INLINER because it's the home for inlining + tree-shaking too once
+// those land — the three optimizations want to feed each other. For
+// now: constant folding only.
+//
+// Strategy:
+//   - Bottom-up post-order: fold children, then try to fold the node.
+//   - On replacement, return a fresh AST node (preserve the original
+//     node's loc and type). Constructors are dumb, so we can build
+//     directly without surprise wrapping; type-changing rewrites would
+//     route through make* helpers, but folding never changes types.
+//   - On no change, return the original node identity. Callers compare
+//     by `===` to skip rebuilds, which keeps AST allocation O(changed).
+//   - Side-effecting ops (ASSIGN, ++/--, function calls, dereferences,
+//     intrinsics, etc.) are walked into but never folded as a whole.
+//   - DFunc.body and DVar.initExpr are mutated in place (sealed but
+//     writable), matching how the rest of the codebase already handles
+//     post-construction updates.
+
+const INLINER = (() => {
+
+// True if `op` is the AST tag for an op with no value-producing side
+// effect of its own — folding the operands and rewriting to a literal
+// is OK iff this is true AND the operands are themselves pure.
+function isPureBinop(op) {
+  return op !== "ASSIGN" && !op.endsWith("_ASSIGN");
+}
+
+// Evaluate a pure integer binary op on BigInt operands. Returns the
+// result as a BigInt, or null if not foldable (e.g. div by zero, shift
+// out of range). Caller is responsible for truncating to the result type.
+function evalIntBinop(op, l, r) {
+  switch (op) {
+    case "ADD": return l + r;
+    case "SUB": return l - r;
+    case "MUL": return l * r;
+    case "DIV": return r === 0n ? null : l / r;       // BigInt / truncates toward zero (matches C)
+    case "MOD": return r === 0n ? null : l % r;
+    case "BAND": return l & r;
+    case "BOR":  return l | r;
+    case "BXOR": return l ^ r;
+    case "SHL":  return r < 0n || r >= 64n ? null : l << r;
+    case "SHR":  return r < 0n || r >= 64n ? null : l >> r;
+    case "EQ": return l === r ? 1n : 0n;
+    case "NE": return l !== r ? 1n : 0n;
+    case "LT": return l <  r ? 1n : 0n;
+    case "GT": return l >  r ? 1n : 0n;
+    case "LE": return l <= r ? 1n : 0n;
+    case "GE": return l >= r ? 1n : 0n;
+    case "LAND": return (l !== 0n && r !== 0n) ? 1n : 0n;
+    case "LOR":  return (l !== 0n || r !== 0n) ? 1n : 0n;
+    default: return null;
+  }
+}
+
+function evalIntUnop(op, v) {
+  switch (op) {
+    case "OP_POS":  return v;
+    case "OP_NEG":  return -v;
+    case "OP_BNOT": return ~v;
+    case "OP_LNOT": return v === 0n ? 1n : 0n;
+    default: return null;
+  }
+}
+
+// Fold an expression. Bottom-up: fold children first.
+function foldExpr(expr) {
+  if (!expr) return expr;
+  switch (expr.constructor) {
+    // True leaves — nothing inside to fold.
+    case AST.EInt:
+    case AST.EFloat:
+    case AST.EString:
+    case AST.EIdent:
+    case AST.ESizeofType:
+    case AST.EAlignofType:
+      return expr;
+
+    // sizeof(expr) / _Alignof(expr) don't evaluate their operand at
+    // runtime — leave the inner expression alone so we don't create
+    // surprising side-effect changes.
+    case AST.ESizeofExpr:
+    case AST.EAlignofExpr:
+      return expr;
+
+    case AST.EUnary: {
+      const op = expr.op;
+      const operand = foldExpr(expr.operand);
+      // Skip side-effecting / addressing ops; only rebuild if the operand changed.
+      if (op === "OP_PRE_INC"  || op === "OP_PRE_DEC" ||
+          op === "OP_POST_INC" || op === "OP_POST_DEC" ||
+          op === "OP_ADDR"     || op === "OP_DEREF") {
+        return operand === expr.operand ? expr
+          : new AST.EUnary(expr.loc, expr.type, op, operand);
+      }
+      const v = constEvalInt(operand);
+      if (v !== null && expr.type.isInteger()) {
+        const r = evalIntUnop(op, v);
+        if (r !== null) {
+          return new AST.EInt(expr.loc, expr.type, Types.truncateConstInt(r, expr.type));
+        }
+      }
+      return operand === expr.operand ? expr
+        : new AST.EUnary(expr.loc, expr.type, op, operand);
+    }
+
+    case AST.EBinary: {
+      const left = foldExpr(expr.left);
+      const right = foldExpr(expr.right);
+      const op = expr.op;
+      if (!isPureBinop(op)) {
+        return (left === expr.left && right === expr.right) ? expr
+          : new AST.EBinary(expr.loc, expr.type, op, left, right);
+      }
+      const lv = constEvalInt(left);
+      // Short-circuit: 0 && x → 0 (drops x, even if x has side effects, per C99).
+      if (op === "LAND" && lv === 0n) return new AST.EInt(expr.loc, expr.type, 0n);
+      // 1 || x → 1 (same, drops x).
+      if (op === "LOR"  && lv !== null && lv !== 0n) return new AST.EInt(expr.loc, expr.type, 1n);
+      const rv = constEvalInt(right);
+      if (lv !== null && rv !== null && expr.type.isInteger()) {
+        const r = evalIntBinop(op, lv, rv);
+        if (r !== null) {
+          return new AST.EInt(expr.loc, expr.type, Types.truncateConstInt(r, expr.type));
+        }
+      }
+      return (left === expr.left && right === expr.right) ? expr
+        : new AST.EBinary(expr.loc, expr.type, op, left, right);
+    }
+
+    case AST.ETernary: {
+      const cond = foldExpr(expr.condition);
+      const cv = constEvalInt(cond);
+      if (cv !== null) {
+        // Pick the live branch; fold and return it directly (its type
+        // matches expr.type by the parser's ternary type computation,
+        // possibly via an EImplicitCast wrapper).
+        return foldExpr(cv !== 0n ? expr.thenExpr : expr.elseExpr);
+      }
+      const thenE = foldExpr(expr.thenExpr);
+      const elseE = foldExpr(expr.elseExpr);
+      return (cond === expr.condition && thenE === expr.thenExpr && elseE === expr.elseExpr) ? expr
+        : new AST.ETernary(expr.loc, expr.type, cond, thenE, elseE);
+    }
+
+    case AST.ECall: {
+      const callee = foldExpr(expr.callee);
+      let changed = callee !== expr.callee;
+      const newArgs = expr.arguments.map(a => {
+        const folded = foldExpr(a);
+        if (folded !== a) changed = true;
+        return folded;
+      });
+      if (!changed) return expr;
+      // Bypass makeCall's validation — the parser already validated
+      // these args, and folding doesn't introduce new type issues.
+      const c = new AST.ECall(expr.loc, callee, newArgs);
+      return c;
+    }
+
+    case AST.ESubscript: {
+      const arr = foldExpr(expr.array);
+      const idx = foldExpr(expr.index);
+      return (arr === expr.array && idx === expr.index) ? expr
+        : new AST.ESubscript(expr.loc, expr.type, arr, idx);
+    }
+
+    case AST.EMember: {
+      const base = foldExpr(expr.base);
+      return base === expr.base ? expr
+        : new AST.EMember(expr.loc, expr.type, base, expr.memberName, expr.memberDecl);
+    }
+
+    case AST.EArrow: {
+      const base = foldExpr(expr.base);
+      return base === expr.base ? expr
+        : new AST.EArrow(expr.loc, expr.type, base, expr.memberName, expr.memberDecl);
+    }
+
+    case AST.ECast: {
+      const inner = foldExpr(expr.expr);
+      const v = constEvalInt(inner);
+      if (v !== null && expr.targetType.isInteger()) {
+        return new AST.EInt(expr.loc, expr.targetType, Types.truncateConstInt(v, expr.targetType));
+      }
+      return inner === expr.expr ? expr
+        : new AST.ECast(expr.loc, expr.type, expr.targetType, inner);
+    }
+
+    case AST.EImplicitCast: {
+      const inner = foldExpr(expr.expr);
+      const v = constEvalInt(inner);
+      if (v !== null && expr.type.isInteger()) {
+        return new AST.EInt(expr.loc, expr.type, Types.truncateConstInt(v, expr.type));
+      }
+      return inner === expr.expr ? expr
+        : new AST.EImplicitCast(expr.loc, expr.type, inner);
+    }
+
+    case AST.EDecay: {
+      const inner = foldExpr(expr.operand);
+      return inner === expr.operand ? expr
+        : new AST.EDecay(expr.loc, expr.type, inner);
+    }
+
+    case AST.EComma: {
+      let changed = false;
+      const newExprs = expr.expressions.map(e => {
+        const folded = foldExpr(e);
+        if (folded !== e) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.EComma(expr.loc, expr.type, newExprs)
+        : expr;
+    }
+
+    case AST.EInitList: {
+      let changed = false;
+      const newElems = expr.elements.map(e => {
+        const folded = foldExpr(e);
+        if (folded !== e) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.EInitList(expr.loc, expr.type, newElems, expr.designators, expr.unionMemberIndex)
+        : expr;
+    }
+
+    case AST.EIntrinsic: {
+      let changed = false;
+      const newArgs = expr.args.map(a => {
+        const folded = foldExpr(a);
+        if (folded !== a) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.EIntrinsic(expr.loc, expr.type, expr.intrinsicKind, newArgs, expr.argType)
+        : expr;
+    }
+
+    case AST.EWasm: {
+      let changed = false;
+      const newArgs = expr.args.map(a => {
+        const folded = foldExpr(a);
+        if (folded !== a) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.EWasm(expr.loc, expr.type, newArgs, expr.bytes)
+        : expr;
+    }
+
+    case AST.EGCNew: {
+      let changed = false;
+      const newArgs = expr.args.map(a => {
+        const folded = foldExpr(a);
+        if (folded !== a) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.EGCNew(expr.loc, expr.type, newArgs)
+        : expr;
+    }
+
+    case AST.ECompoundLiteral: {
+      // Compound literals are tracked by identity in the parser/codegen —
+      // don't replace the node. Mutate the init list in place if folded.
+      const folded = foldExpr(expr.initList);
+      if (folded !== expr.initList) expr.initList = folded;
+      return expr;
+    }
+
+    default:
+      return expr;
+  }
+}
+
+// Fold a statement bottom-up. Eliminates dead branches when conditions
+// are constant. Returns a (possibly new) statement; callers compare by
+// `===` to skip rebuilds.
+function foldStmt(stmt) {
+  if (!stmt) return stmt;
+  switch (stmt.constructor) {
+    case AST.SEmpty:
+    case AST.SBreak:
+    case AST.SContinue:
+    case AST.SLabel:
+    case AST.SGoto:
+      return stmt;
+
+    case AST.SExpr: {
+      const e = foldExpr(stmt.expr);
+      return e === stmt.expr ? stmt : new AST.SExpr(stmt.loc, e);
+    }
+
+    case AST.SDecl: {
+      // Mutate each DVar's initExpr in place. DVars are sealed-but-writable.
+      for (const d of stmt.declarations) {
+        if (d instanceof AST.DVar && d.initExpr) {
+          const folded = foldExpr(d.initExpr);
+          if (folded !== d.initExpr) d.initExpr = folded;
+        }
+      }
+      return stmt;
+    }
+
+    case AST.SCompound: {
+      let changed = false;
+      const newStmts = stmt.statements.map(s => {
+        const folded = foldStmt(s);
+        if (folded !== s) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.SCompound(stmt.loc, newStmts, stmt.labels)
+        : stmt;
+    }
+
+    case AST.SIf: {
+      const cond = foldExpr(stmt.condition);
+      const cv = constEvalInt(cond);
+      // Dead-branch elimination when the condition is a known constant.
+      if (cv === 0n) return stmt.elseBranch ? foldStmt(stmt.elseBranch) : new AST.SEmpty(stmt.loc);
+      if (cv !== null && cv !== 0n) return foldStmt(stmt.thenBranch);
+      const thenB = foldStmt(stmt.thenBranch);
+      const elseB = foldStmt(stmt.elseBranch);
+      return (cond === stmt.condition && thenB === stmt.thenBranch && elseB === stmt.elseBranch)
+        ? stmt
+        : new AST.SIf(stmt.loc, cond, thenB, elseB);
+    }
+
+    case AST.SWhile: {
+      const cond = foldExpr(stmt.condition);
+      const body = foldStmt(stmt.body);
+      // while (0) — body never runs. Replace with empty.
+      if (constEvalInt(cond) === 0n) return new AST.SEmpty(stmt.loc);
+      return (cond === stmt.condition && body === stmt.body)
+        ? stmt
+        : new AST.SWhile(stmt.loc, cond, body);
+    }
+
+    case AST.SDoWhile: {
+      const body = foldStmt(stmt.body);
+      const cond = foldExpr(stmt.condition);
+      return (body === stmt.body && cond === stmt.condition)
+        ? stmt
+        : new AST.SDoWhile(stmt.loc, body, cond);
+    }
+
+    case AST.SFor: {
+      const init = stmt.init ? foldStmt(stmt.init) : null;
+      const cond = stmt.condition ? foldExpr(stmt.condition) : null;
+      const incr = stmt.increment ? foldExpr(stmt.increment) : null;
+      const body = foldStmt(stmt.body);
+      return (init === stmt.init && cond === stmt.condition &&
+              incr === stmt.increment && body === stmt.body)
+        ? stmt
+        : new AST.SFor(stmt.loc, init, cond, incr, body);
+    }
+
+    case AST.SReturn: {
+      if (!stmt.expr) return stmt;
+      const e = foldExpr(stmt.expr);
+      return e === stmt.expr ? stmt : new AST.SReturn(stmt.loc, e);
+    }
+
+    case AST.SSwitch: {
+      const e = foldExpr(stmt.expr);
+      const body = foldStmt(stmt.body);
+      return (e === stmt.expr && body === stmt.body)
+        ? stmt
+        : new AST.SSwitch(stmt.loc, e, stmt.cases, body);
+    }
+
+    case AST.STryCatch: {
+      const tryB = foldStmt(stmt.tryBody);
+      let changed = tryB !== stmt.tryBody;
+      const newCatches = stmt.catches.map(c => {
+        const newBody = foldStmt(c.body);
+        if (newBody === c.body) return c;
+        changed = true;
+        return { ...c, body: newBody };
+      });
+      return changed
+        ? new AST.STryCatch(stmt.loc, tryB, newCatches)
+        : stmt;
+    }
+
+    case AST.SThrow: {
+      let changed = false;
+      const newArgs = stmt.args.map(a => {
+        const folded = foldExpr(a);
+        if (folded !== a) changed = true;
+        return folded;
+      });
+      return changed
+        ? new AST.SThrow(stmt.loc, stmt.tag, newArgs)
+        : stmt;
+    }
+
+    default:
+      return stmt;
+  }
+}
+
+// Optimize a translation unit in place. Each defined function's body
+// is folded; each global variable's initializer is folded.
+function optimize(unit) {
+  for (const f of unit.definedFunctions) {
+    if (f.body) f.body = foldStmt(f.body);
+  }
+  for (const v of unit.definedVariables) {
+    if (v.initExpr) {
+      const folded = foldExpr(v.initExpr);
+      if (folded !== v.initExpr) v.initExpr = folded;
+    }
+  }
+  return unit;
+}
+
+return { optimize, foldExpr, foldStmt };
+})();
+
 // LEB128 encoding utilities (shared between Parser and Wasm)
 function lebU(out, value) {
   do {
@@ -3854,70 +4352,6 @@ function linkTranslationUnits(units, compilerOptions) {
   return { errors };
 }
 
-// ====================
-// Parser — ConstEval (simplified for parse-time)
-// ====================
-
-function constEvalInt(expr) {
-  if (!expr) return null;
-  switch (expr.constructor) {
-    case AST.EInt: return expr.value;  // already BigInt
-    case AST.EIdent:
-      if (expr.decl && expr.decl instanceof AST.DEnumConst) return expr.decl.value;
-      return null;
-    case AST.EBinary: {
-      const l = constEvalInt(expr.left), r = constEvalInt(expr.right);
-      if (l === null || r === null) return null;
-      switch (expr.op) {
-        case "ADD": return l + r; case "SUB": return l - r;
-        case "MUL": return l * r; case "DIV": return r === 0n ? null : l / r;
-        case "MOD": return r === 0n ? null : l % r;
-        case "BAND": return l & r; case "BOR": return l | r; case "BXOR": return l ^ r;
-        case "SHL": return l << r; case "SHR": return l >> r;
-        case "EQ": return l === r ? 1n : 0n; case "NE": return l !== r ? 1n : 0n;
-        case "LT": return l < r ? 1n : 0n; case "GT": return l > r ? 1n : 0n;
-        case "LE": return l <= r ? 1n : 0n; case "GE": return l >= r ? 1n : 0n;
-        case "LAND": return (l && r) ? 1n : 0n; case "LOR": return (l || r) ? 1n : 0n;
-        default: return null;
-      }
-    }
-    case AST.EUnary: {
-      if (expr.op === "OP_ADDR") {
-        // Support offsetof pattern: &((type*)0)->member
-        const inner = expr.operand;
-        if ((inner instanceof AST.EArrow || inner instanceof AST.EMember) && inner.memberDecl) {
-          const base = constEvalInt(inner.base);
-          if (base !== null) return base + BigInt(inner.memberDecl.byteOffset);
-        }
-        return null;
-      }
-      const v = constEvalInt(expr.operand);
-      if (v === null) return null;
-      switch (expr.op) {
-        case "OP_POS": return v; case "OP_NEG": return -v;
-        case "OP_LNOT": return v === 0n ? 1n : 0n; case "OP_BNOT": return ~v;
-        default: return null;
-      }
-    }
-    case AST.EImplicitCast: {
-      return constEvalInt(expr.expr);
-    }
-    case AST.ETernary: {
-      const c = constEvalInt(expr.condition);
-      if (c === null) return null;
-      return constEvalInt(c !== 0n ? expr.thenExpr : expr.elseExpr);
-    }
-    case AST.ECast: {
-      const v = constEvalInt(expr.expr);
-      return v;
-    }
-    case AST.ESizeofExpr: return BigInt(expr.expr.type.size);
-    case AST.ESizeofType: return BigInt(expr.operandType.size);
-    case AST.EAlignofExpr: return BigInt(expr.expr.type.align);
-    case AST.EAlignofType: return BigInt(expr.operandType.align);
-    default: return null;
-  }
-}
 
 // ====================
 // Init list normalization helpers
@@ -16289,6 +16723,7 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // time at each construction site.
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
     if (!options?.compilerOptions?.noUndefined) Parser.filterUnusedDeclarations(unit);
+    INLINER.optimize(unit);
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
       hasErrors = true;
