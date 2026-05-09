@@ -2797,6 +2797,121 @@ class Expr {
     constructor(loc, tag, args) { super(loc); this.tag = tag; this.args = args; Object.seal(this); }
   }
 
+// ---------- AST builders that apply C semantics ----------
+//
+// These take "raw" inputs (the things the parser literally has at hand:
+// callee + args, op + operands, etc.) and return a node with the
+// C-standard conversions already inserted: array/function decay,
+// implicit casts to the target type, default-argument promotions, etc.
+//
+// Constructors stay dumb (no implicit insertions). The make* helpers are
+// the canonical place to build correct nodes — useful for the parser, AST
+// rewriters, and any future pass that synthesizes calls/binops/etc.
+//
+// Diagnostics: callers pass a `report(loc, msg)` callback. The helpers
+// don't throw — they report and proceed with the best-effort node, so
+// callers can decide whether errors are fatal or recoverable.
+
+// Wrap an expression in EImplicitCast at the target type. Pass-through
+// when the source already matches the target after qualifier strip, or
+// when either side is void.
+function maybeImplicitCast(expr, targetType) {
+  targetType = targetType.removeQualifiers();
+  const srcType = expr.type.removeQualifiers();
+  if (srcType === targetType) return expr;
+  if (targetType.isVoid() || srcType.isVoid()) return expr;
+  return new EImplicitCast(expr.loc, targetType, expr);
+}
+
+// Wrap an expression in EDecay if its type is array or function.
+// Pass-through otherwise.
+function maybeDecay(expr) {
+  const t = expr.type;
+  if (t.isArray() || t.isFunction()) return new EDecay(expr.loc, t.decay(), expr);
+  return expr;
+}
+
+// True if `expr` is a null pointer constant (literal 0, possibly wrapped
+// in casts to void* / similar).
+function isNullPointerConstant(expr) {
+  if (!expr) return false;
+  if (expr instanceof EInt && expr.value === 0n) return true;
+  if (expr instanceof EImplicitCast || expr instanceof ECast) {
+    return isNullPointerConstant(expr.expr);
+  }
+  return false;
+}
+
+// Reject a non-zero non-ref source flowing into a ref target. Allowed:
+// null pointer constant, prim → __eqref auto-box. Anything else needs an
+// explicit __cast.
+function rejectNonZeroToRef(targetType, expr, loc, report) {
+  if (!expr || !targetType) return;
+  const t = targetType.removeQualifiers();
+  const s = expr.type.removeQualifiers();
+  if (!t.isRef() || s.isRef()) return;
+  if (isNullPointerConstant(expr)) return;
+  if (t === Types.TEQREF && s.isArithmetic()) return;
+  report(loc,
+    `cannot convert '${expr.type.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+}
+
+// Build an ECall, applying C semantics:
+//   - decay callee (function name → function pointer; array → ptr)
+//   - decay each argument
+//   - reject ref-conversion errors on declared params
+//   - reject ref-typed varargs
+//   - implicit-cast each fixed arg to its parameter type
+//   - default-argument promotion (float → double) on varargs
+//
+// `report` is invoked with (loc, message) for each diagnostic. Always
+// returns an ECall (best-effort even on errors), so the caller can decide
+// whether to halt.
+function makeCall(loc, callee, args, report) {
+  callee = maybeDecay(callee);
+  const calleeType = callee.type;
+  let funcType = null;
+  if (calleeType.kind === Types.TypeKind.POINTER &&
+      calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
+    funcType = calleeType.baseType;
+  }
+  // Decay all arguments first; pointer-typed params and varargs alike
+  // receive pointer values, never arrays.
+  for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
+  if (funcType) {
+    const paramTypes = funcType.getParamTypes();
+    const numFixed = paramTypes.length;
+    // Validation: only meaningful when the prototype declared its params.
+    if (!funcType.hasUnspecifiedParams) {
+      const n = Math.min(args.length, numFixed);
+      for (let i = 0; i < n; i++) {
+        rejectNonZeroToRef(paramTypes[i], args[i], loc, report);
+      }
+      if (funcType.isVarArg) {
+        for (let i = numFixed; i < args.length; i++) {
+          if (args[i].type.removeQualifiers().isRef()) {
+            report(loc,
+              `cannot pass reference type '${args[i].type.toString()}' as a variadic argument — vararg storage uses linear memory which can't hold GC references`);
+          }
+        }
+      }
+    }
+    // Implicit casts on fixed arguments.
+    for (let i = 0; i < args.length && i < numFixed; i++) {
+      args[i] = maybeImplicitCast(args[i], paramTypes[i]);
+    }
+    // Default-argument promotion (C99 6.5.2.2/6) for varargs: float → double.
+    if (funcType.isVarArg) {
+      for (let i = numFixed; i < args.length; i++) {
+        if (args[i].type.removeQualifiers() === Types.TFLOAT) {
+          args[i] = maybeImplicitCast(args[i], Types.TDOUBLE);
+        }
+      }
+    }
+  }
+  return new ECall(loc, callee, args);
+}
+
 // TUnit constructor
 class TUnit {
   constructor(filename) {
@@ -2832,6 +2947,9 @@ return {
   SBreak, SContinue, SReturn, SSwitch, SGoto, SLabel, SEmpty,
   STryCatch, SThrow,
   makeTUnit,
+  // C-semantics-aware builders
+  maybeImplicitCast, maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
+  makeCall,
 };
 })();
 
@@ -3879,6 +3997,12 @@ class Parser {
   }
   warning(tok, msg) {
     this.warnings.push(new Lexer.LexError(msg, tok.filename, tok.line));
+  }
+  // Report a recoverable error using a Lexer.Loc (rather than a token).
+  // Bridges the AST builders (which carry locs) into the parser's
+  // token-based error machinery.
+  _reportAtLoc(loc, msg) {
+    this.errors.push(new Lexer.LexError(msg, loc.filename, loc.line));
   }
 
   // --- isTypeName ---
@@ -5694,61 +5818,8 @@ class Parser {
           } while (this.matchText(","));
         }
         this.expect(")");
-
-        // Decay arrays/functions, then if the callee resolves to a function
-        // type extract its FunctionType for argument-validation below.
-        expr = maybeDecay(expr);
-        let calleeType = expr.type;
-        let calleeFuncType = null;
-        if (calleeType.kind === Types.TypeKind.POINTER && calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
-          calleeFuncType = calleeType.baseType;
-        }
-        // Forbid implicit int→ref on call arguments. Only check declared
-        // params (variadic / unspecified-params functions have no arg types).
-        if (calleeFuncType && !calleeFuncType.hasUnspecifiedParams) {
-          const params = calleeFuncType.getParamTypes();
-          const n = Math.min(args.length, params.length);
-          for (let i = 0; i < n; i++) this._rejectIntToRef(params[i], args[i], callTok);
-          // Reject ref-typed vararg arguments — vararg storage uses linear
-          // memory which can't hold GC references.
-          if (calleeFuncType.isVarArg) {
-            for (let i = params.length; i < args.length; i++) {
-              if (args[i].type.removeQualifiers().isRef()) {
-                this.error(callTok,
-                  `cannot pass reference type '${args[i].type.toString()}' as a variadic argument — vararg storage uses linear memory which can't hold GC references`);
-              }
-            }
-          }
-        }
-
-        // Decay all array/function-typed arguments first; pointer-typed
-        // params and varargs alike receive pointer values, never arrays.
-        for (let i = 0; i < args.length; i++) args[i] = maybeDecay(args[i]);
-        // Insert implicit casts on arguments. Mirrors the older annotateExpr
-        // post-pass for ECall: fixed args wrap to their parameter type;
-        // variadic args undergo float→double default-argument promotion.
-        // K&R-style `int f()` (hasUnspecifiedParams) has no paramTypes to
-        // wrap against; the loop iterates zero times.
-        if (calleeFuncType) {
-          const paramTypes = calleeFuncType.getParamTypes();
-          const numFixed = paramTypes.length;
-          if (calleeFuncType.isVarArg) {
-            for (let i = 0; i < numFixed && i < args.length; i++) {
-              args[i] = maybeImplicitCast(args[i], paramTypes[i]);
-            }
-            for (let i = numFixed; i < args.length; i++) {
-              if (args[i].type.removeQualifiers() === Types.TFLOAT) {
-                args[i] = maybeImplicitCast(args[i], Types.TDOUBLE);
-              }
-            }
-          } else {
-            for (let i = 0; i < args.length && i < numFixed; i++) {
-              args[i] = maybeImplicitCast(args[i], paramTypes[i]);
-            }
-          }
-        }
-
-        expr = new AST.ECall(Lexer.Loc.fromTok(callTok), expr, args);
+        expr = AST.makeCall(Lexer.Loc.fromTok(callTok), expr, args,
+          (loc, msg) => this._reportAtLoc(loc, msg));
         continue;
       }
       if (this.matchText("[")) {
@@ -7207,30 +7278,10 @@ function parseSource(filename, source, ppRegistry) {
   return parseResult;
 }
 
-// Wrap an expression in EImplicitCast at the target type. Returns the
-// (possibly wrapped) expression — pass-through when the source already
-// matches the target after qualifier strip, or when either side is void.
-// Used at the seven C-standard implicit-conversion sites: BinOp operands,
-// Call args, Ternary branches, Return value, Decl init, Throw args, and
-// the setjmp/longjmp lowering helper.
-function maybeImplicitCast(expr, targetType) {
-  targetType = targetType.removeQualifiers();
-  const srcType = expr.type.removeQualifiers();
-  if (srcType === targetType) return expr;
-  if (targetType.isVoid() || srcType.isVoid()) return expr;
-  return new AST.EImplicitCast(expr.loc, targetType, expr);
-}
-
-// Wrap an expression in EDecay if its type is array or function.
-// Pass-through otherwise. Used at every C-standard decay site:
-// subscript array operand, pointer arithmetic operands, call callee +
-// arguments, dereference operand, ternary branches, cast operand,
-// initialization/assignment/return/throw to a pointer-typed target.
-function maybeDecay(expr) {
-  const t = expr.type;
-  if (t.isArray() || t.isFunction()) return new AST.EDecay(expr.loc, t.decay(), expr);
-  return expr;
-}
+// Module-scope shorthand for the IIFE-internal builders that get called
+// from many parser sites — saves typing AST.maybeDecay(...) everywhere.
+const maybeImplicitCast = AST.maybeImplicitCast;
+const maybeDecay = AST.maybeDecay;
 
 // ========== setjmp/longjmp lowering ==========
 
