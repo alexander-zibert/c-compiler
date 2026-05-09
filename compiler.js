@@ -2478,6 +2478,46 @@ return {
 })();
 
 // ====================
+// Diagnostics pool
+// ====================
+//
+// Shared error/warning sink. Set by `withDiag(sink, fn)` for the duration
+// of `fn()`, after which `_currentDiag` is restored. Anywhere downstream
+// — parser, AST builders, codegen — can call `reportError`/`reportWarning`
+// without threading a context through.
+//
+// `fatalError` reports and throws `FatalDiag`. The caller's `withDiag`
+// scope catches it and the error is already in the sink.
+
+let _currentDiag = null;
+
+class FatalDiag {}
+
+function withDiag(sink, fn) {
+  const saved = _currentDiag;
+  _currentDiag = sink;
+  try { return fn(); } finally { _currentDiag = saved; }
+}
+
+function reportError(loc, msg) {
+  if (!_currentDiag) throw new Error(`reportError("${msg}") called outside withDiag scope`);
+  _currentDiag.errors.push(new Lexer.LexError(msg, loc.filename, loc.line));
+}
+
+function reportWarning(loc, msg) {
+  if (!_currentDiag) throw new Error(`reportWarning("${msg}") called outside withDiag scope`);
+  _currentDiag.warnings.push(new Lexer.LexError(msg, loc.filename, loc.line));
+}
+
+// Reports the error and throws FatalDiag. The active `withDiag` scope
+// catches it; downstream parsing of the current translation unit halts
+// but the error is preserved in the sink.
+function fatalError(loc, msg) {
+  reportError(loc, msg);
+  throw new FatalDiag();
+}
+
+// ====================
 // AST
 // ====================
 
@@ -2845,14 +2885,14 @@ function isNullPointerConstant(expr) {
 // Reject a non-zero non-ref source flowing into a ref target. Allowed:
 // null pointer constant, prim → __eqref auto-box. Anything else needs an
 // explicit __cast.
-function rejectNonZeroToRef(targetType, expr, loc, report) {
+function rejectNonZeroToRef(targetType, expr, loc) {
   if (!expr || !targetType) return;
   const t = targetType.removeQualifiers();
   const s = expr.type.removeQualifiers();
   if (!t.isRef() || s.isRef()) return;
   if (isNullPointerConstant(expr)) return;
   if (t === Types.TEQREF && s.isArithmetic()) return;
-  report(loc,
+  reportError(loc,
     `cannot convert '${expr.type.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
 }
 
@@ -2864,10 +2904,9 @@ function rejectNonZeroToRef(targetType, expr, loc, report) {
 //   - implicit-cast each fixed arg to its parameter type
 //   - default-argument promotion (float → double) on varargs
 //
-// `report` is invoked with (loc, message) for each diagnostic. Always
-// returns an ECall (best-effort even on errors), so the caller can decide
-// whether to halt.
-function makeCall(loc, callee, args, report) {
+// Diagnostics flow through the active `withDiag` sink — no callback
+// threading. Always returns an ECall (best-effort even on errors).
+function makeCall(loc, callee, args) {
   callee = maybeDecay(callee);
   const calleeType = callee.type;
   let funcType = null;
@@ -2885,12 +2924,12 @@ function makeCall(loc, callee, args, report) {
     if (!funcType.hasUnspecifiedParams) {
       const n = Math.min(args.length, numFixed);
       for (let i = 0; i < n; i++) {
-        rejectNonZeroToRef(paramTypes[i], args[i], loc, report);
+        rejectNonZeroToRef(paramTypes[i], args[i], loc);
       }
       if (funcType.isVarArg) {
         for (let i = numFixed; i < args.length; i++) {
           if (args[i].type.removeQualifiers().isRef()) {
-            report(loc,
+            reportError(loc,
               `cannot pass reference type '${args[i].type.toString()}' as a variadic argument — vararg storage uses linear memory which can't hold GC references`);
           }
         }
@@ -3957,11 +3996,6 @@ class Parser {
     this.parsedLabels = new Map();
     this.pendingGotos = new Map();
     this.warningFlags = { pointerDecay: false, circularDependency: false };
-    // Bound report callback for AST builder helpers (AST.makeCall etc.)
-    // — they take a (loc, msg) function rather than knowing about tokens.
-    this._report = (loc, msg) => {
-      this.errors.push(new Lexer.LexError(msg, loc.filename, loc.line));
-    };
   }
 
   // --- Lexer.Token helpers ---
@@ -3993,16 +4027,12 @@ class Parser {
     if (this.atKind(kind)) return this.advance();
     this.error(this.peek(), msg || `Expected ${kind}`);
   }
-  error(tok, msg) {
-    const err = new Lexer.LexError(msg, tok.filename, tok.line);
-    throw err;
-  }
-  recoverableError(tok, msg) {
-    this.errors.push(new Lexer.LexError(msg, tok.filename, tok.line));
-  }
-  warning(tok, msg) {
-    this.warnings.push(new Lexer.LexError(msg, tok.filename, tok.line));
-  }
+  // Token-flavored shorthands that delegate to the module-level diag pool.
+  // New code should prefer reportError / reportWarning / fatalError on a
+  // Loc directly; these stay because the parser has many existing callers.
+  error(tok, msg) { fatalError(Lexer.Loc.fromTok(tok), msg); }
+  recoverableError(tok, msg) { reportError(Lexer.Loc.fromTok(tok), msg); }
+  warning(tok, msg) { reportWarning(Lexer.Loc.fromTok(tok), msg); }
 
   // --- isTypeName ---
   isTypeName() {
@@ -5004,7 +5034,7 @@ class Parser {
       // Reject implicit non-zero int → non-eqref ref field (silent-null bug).
       const newLoc = Lexer.Loc.fromTok(newTok);
       for (let i = 0; i < args.length; i++) {
-        AST.rejectNonZeroToRef(fields[i].type, args[i], newLoc, this._report);
+        AST.rejectNonZeroToRef(fields[i].type, args[i], newLoc);
       }
       return new AST.EGCNew(newLoc, nq, args);
     }
@@ -5032,7 +5062,7 @@ class Parser {
       }
       // Reject non-zero int as fill value when element type is a non-eqref ref.
       const newLoc = Lexer.Loc.fromTok(newTok);
-      if (args.length === 2) AST.rejectNonZeroToRef(elemType, args[1], newLoc, this._report);
+      if (args.length === 2) AST.rejectNonZeroToRef(elemType, args[1], newLoc);
       return new AST.EGCNew(newLoc, arrType, args);
     }
 
@@ -5201,7 +5231,7 @@ class Parser {
       // Reject implicit non-zero int → non-eqref ref element (silent-null bug).
       const tokLoc = Lexer.Loc.fromTok(tok);
       for (let i = 0; i < args.length; i++) {
-        AST.rejectNonZeroToRef(elemType, args[i], tokLoc, this._report);
+        AST.rejectNonZeroToRef(elemType, args[i], tokLoc);
       }
       const arrType = Types.gcArrayOf(elemType);
       return new AST.EIntrinsic(tokLoc, arrType, Types.IntrinsicKind.GC_NEW_ARRAY, args, elemType);
@@ -5224,7 +5254,7 @@ class Parser {
       }
       const elemType = arr.type.removeQualifiers().baseType;
       const tokLoc = Lexer.Loc.fromTok(tok);
-      AST.rejectNonZeroToRef(elemType, val, tokLoc, this._report);
+      AST.rejectNonZeroToRef(elemType, val, tokLoc);
       return new AST.EIntrinsic(tokLoc, Types.TVOID, Types.IntrinsicKind.ARRAY_FILL, [arr, off, val, count]);
     }
 
@@ -5793,7 +5823,7 @@ class Parser {
           } while (this.matchText(","));
         }
         this.expect(")");
-        expr = AST.makeCall(Lexer.Loc.fromTok(callTok), expr, args, this._report);
+        expr = AST.makeCall(Lexer.Loc.fromTok(callTok), expr, args);
         continue;
       }
       if (this.matchText("[")) {
@@ -6074,7 +6104,7 @@ class Parser {
       // Assignment to ref: only literal 0 (or null pointer constant) is
       // allowed as a non-ref source.
       if (bop === "ASSIGN" && lIsRef && !rIsRef) {
-        AST.rejectNonZeroToRef(left.type, right, Lexer.Loc.fromTok(opTok), this._report);
+        AST.rejectNonZeroToRef(left.type, right, Lexer.Loc.fromTok(opTok));
       }
       // Compound assignment (+=, -=, *=, etc.) has no meaning on ref types.
       if (lIsRef &&
@@ -6337,7 +6367,7 @@ class Parser {
       // Forbid implicit int→ref on return (use __ref_null(T) instead).
       if (this.currentParsingFunc) {
         const retType = this.currentParsingFunc.type.getReturnType();
-        AST.rejectNonZeroToRef(retType, expr, Lexer.Loc.fromTok(retTok), this._report);
+        AST.rejectNonZeroToRef(retType, expr, Lexer.Loc.fromTok(retTok));
         // Wrap in implicit cast to the function's return type.
         expr = maybeImplicitCast(expr, retType);
       }
@@ -6625,7 +6655,7 @@ class Parser {
             // Re-evaluate allocClass: aggregates need MEMORY storage.
             if (type.isAggregate()) dvar.allocClass = Types.AllocClass.MEMORY;
           }
-          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok), this._report);
+          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok));
         }
         // Handle string-initialized char array
         if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
@@ -6899,7 +6929,7 @@ class Parser {
           dvar.initExpr = this.parseInitList(type);
         } else {
           dvar.initExpr = this.parseAssignmentExpression();
-          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok), this._report);
+          AST.rejectNonZeroToRef(type, dvar.initExpr, Lexer.Loc.fromTok(eqTok));
           // File-scope ref-typed globals: WASM constant init expressions
           // can only emit ref.null. Allocation (e.g. boxing a primitive)
           // is not allowed at module-init time.
@@ -7124,22 +7154,22 @@ class Parser {
 // ====================
 
 function parseTokens(tokens, options) {
-  const errors = [];
-  const warnings = [];
+  const sink = { errors: [], warnings: [] };
 
   if (tokens.length === 0) {
-    errors.push(new Lexer.LexError("No tokens to parse", null, 0));
-    return { translationUnit: AST.makeTUnit(null), errors, warnings };
+    sink.errors.push(new Lexer.LexError("No tokens to parse", null, 0));
+    return { translationUnit: AST.makeTUnit(null), errors: sink.errors, warnings: sink.warnings };
   }
 
   const unit = AST.makeTUnit(tokens[0].filename);
-  const parser = new Parser(tokens, errors, warnings);
+  const parser = new Parser(tokens, sink.errors, sink.warnings);
   if (options?.warningFlags) parser.warningFlags = options.warningFlags;
   if (options?.compilerOptions?.allowImplicitInt) parser._allowImplicitInt = true;
   if (options?.compilerOptions?.allowKnRDefinitions) parser._allowKnRDefinitions = true;
   if (options?.compilerOptions?.allowImplicitFunctionDecl) parser._allowImplicitFunctionDecl = true;
   if (options?.exceptionTagRegistry) parser._exceptionTagRegistry = options.exceptionTagRegistry;
 
+  withDiag(sink, () => {
   try {
     while (!parser.atEnd()) {
       // __require_source
@@ -7227,19 +7257,19 @@ function parseTokens(tokens, options) {
       parser.parseExternalDeclaration(unit);
     }
   } catch (e) {
-    if (e instanceof Lexer.LexError) {
-      errors.push(e);
-    } else {
-      errors.push(new Lexer.LexError(e.message, null, 0));
-    }
+    // FatalDiag: error is already in the sink, just stop parsing.
+    if (e instanceof FatalDiag) return;
+    // Programming bug: surface as a generic diagnostic.
+    sink.errors.push(new Lexer.LexError(e.message, null, 0));
   }
+  });
 
   unit.requiredSources = parser.requiredSources;
   unit.exportDirectives = parser.exportDirectives;
   unit.globalUsedSymbols = parser.globalUsedSymbols;
   unit.fileScopeCompoundLiterals = parser.fileScopeCompoundLiterals;
 
-  return { translationUnit: unit, errors, warnings };
+  return { translationUnit: unit, errors: sink.errors, warnings: sink.warnings };
 }
 
 function parseSource(filename, source, ppRegistry) {
