@@ -870,6 +870,36 @@ test('TAC: literal 1 does NOT flow into pointer type', () => {
   assert(!TAC(Types.TINT, intPtr, one), 'literal 1 → int* rejected');
 });
 // =============================================================================
+// isBoolContextType: cond legal in if/while/do/for/?:/!
+// =============================================================================
+
+const IBC = AST.isBoolContextType;
+
+test('IBC: arithmetic types are bool-context', () => {
+  assert(IBC(Types.TINT));
+  assert(IBC(Types.TFLOAT));
+  assert(IBC(Types.TBOOL));
+  assert(IBC(Types.TCHAR));
+});
+test('IBC: pointers are bool-context', () => {
+  assert(IBC(Types.TINT.pointer()));
+  assert(IBC(Types.TVOID.pointer()));
+});
+test('IBC: refs are bool-context (compiler extension)', () => {
+  assert(IBC(Types.TEXTERNREF));
+  assert(IBC(Types.TREFEXTERN));
+  assert(IBC(Types.TEQREF));
+});
+test('IBC: divergent absorbs', () => {
+  assert(IBC(Types.TDIVERGENT));
+});
+test('IBC: void / arrays / functions / structs are NOT bool-context', () => {
+  assert(!IBC(Types.TVOID));
+  assert(!IBC(Types.arrayOf(Types.TINT, 3)));
+  // (struct types need a tag; skip — covered via integration tests)
+});
+
+// =============================================================================
 // typesAreOperandCompatible: per-op operand legality (C99 6.5.5–6.5.10)
 // =============================================================================
 

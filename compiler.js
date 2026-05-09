@@ -3449,6 +3449,16 @@ function typesAreAssignmentCompatible(srcType, targetType, expr) {
   return false;
 }
 
+// True if `t` is legal in a "controlling expression" position
+// (C99 §6.8.4.1, §6.8.5.1-3, §6.5.15.2, §6.5.3.3 — `if` / `while` /
+// `do-while` / `for` / `?:` / `!`). Standard C requires scalar; we
+// extend with refs (compiler extension: `if (gc_ref)` is sugar for
+// `__ref_is_null` semantics, just as we already allow `!gc_ref`).
+function isBoolContextType(t) {
+  const u = t.removeQualifiers();
+  return u.isDivergent() || u.isScalar() || u.isRef();
+}
+
 // True if `leftType` and `rightType` are a legal operand pair for the
 // given binary op. Catches operator-illegal combinations the C standard
 // forbids regardless of any implicit conversion (e.g. bitwise ops on
@@ -3804,7 +3814,13 @@ function makeUnary(loc, op, operand) {
       if (isRef) fatalError(loc, `unary '~' on reference type is not allowed`);
       break;
     case "OP_LNOT":
-      // !ref is allowed (sugar for __ref_is_null).
+      // Operand must be testable as bool — same rule as if/while/etc.
+      // Refs are allowed (sugar for __ref_is_null); structs/unions/
+      // void/arrays are not.
+      if (!isBoolContextType(operand.type)) {
+        reportError(loc,
+          `unary '!' requires a scalar operand, got '${operand.type.toString()}'`);
+      }
       break;
   }
   return new EUnary(loc, Types.computeUnaryType(op, operand.type), op, operand);
@@ -3941,19 +3957,39 @@ function makeIdent(loc, name, scope) {
 function makeSubscript(loc, base, index) {
   const baseUt = base.type.removeQualifiers();
   const idxUt = index.type.removeQualifiers();
+  // Reverse-order subscript (`5[arr]`) — rejected as our compiler
+  // doesn't support C99's commutative form.
   if (baseUt.isInteger() &&
       (idxUt.kind === Types.TypeKind.POINTER || idxUt.kind === Types.TypeKind.ARRAY)) {
     reportError(loc, "Commutative subscript (e.g. 0[arr]) is not supported; write arr[0] instead");
   }
-  let elemType = Types.TINT;
-  if (baseUt.kind === Types.TypeKind.ARRAY ||
-      baseUt.kind === Types.TypeKind.POINTER ||
-      baseUt.kind === Types.TypeKind.GC_ARRAY) {
-    elemType = baseUt.baseType;
-  } else if (baseUt.isRef()) {
+  // Base must be pointer / array / GC-array. Without this check
+  // codegen would emit `base_addr + idx*sizeof(elem)` against a
+  // non-pointer base value (e.g. a struct's wasm representation),
+  // producing a wild memory read.
+  const baseIsIndexable =
+    baseUt.kind === Types.TypeKind.ARRAY ||
+    baseUt.kind === Types.TypeKind.POINTER ||
+    baseUt.kind === Types.TypeKind.GC_ARRAY;
+  // Refs that aren't GC arrays (e.g. eqref, GC structs, externref) —
+  // give the helpful `__array(T)` hint. GC_ARRAY is handled as
+  // indexable above; isRef() also matches it, so the order matters.
+  if (!baseIsIndexable && baseUt.isRef()) {
     reportError(loc,
       `subscript '[]' on reference type '${base.type.toString()}' is not allowed (use __array(T) for indexable GC storage)`);
+  } else if (!baseIsIndexable && !baseUt.isDivergent()) {
+    reportError(loc,
+      `subscripted value is not an array, pointer, or vector — got '${base.type.toString()}'`);
   }
+  // Index must be integer. Otherwise codegen multiplies a non-int
+  // (e.g. another pointer's bit-value) by sizeof(elem) and adds it to
+  // base — silent wild memory access.
+  if (!idxUt.isInteger() && !idxUt.isDivergent()) {
+    reportError(loc,
+      `array subscript must be of integer type, got '${index.type.toString()}'`);
+  }
+  let elemType = Types.TINT;
+  if (baseIsIndexable) elemType = baseUt.baseType;
   // GC arrays don't decay; keep them as the array operand.
   const arrayOperand = baseUt.kind === Types.TypeKind.GC_ARRAY ? base : maybeDecay(base);
   return new ESubscript(loc, elemType, arrayOperand, index);
@@ -4045,6 +4081,7 @@ return {
   makeTUnit,
   // C-semantics-aware builders
   maybeImplicitCast, typesAreAssignmentCompatible, typesAreOperandCompatible,
+  isBoolContextType,
   maybeDecay, isNullPointerConstant, rejectNonZeroToRef,
   pointerArithElemType,
   promoteExprType, computeBinaryType, markAddressTaken,
@@ -7217,9 +7254,14 @@ class Parser {
     return this.parsePostfixTail(expr);
   }
 
-  _rejectRefAsCondition(expr, tok, ctxName) {
-    // Refs in boolean context are now allowed as sugar for !__ref_is_null.
-    // Helper retained as a no-op so existing call sites need no edits.
+  _validateCond(expr, tok, ctxName) {
+    // Controlling expressions (if/while/for/do/?:) must be scalar.
+    // We extend C with refs (sugar for !__ref_is_null), but reject
+    // structs / unions / arrays / void.
+    if (!AST.isBoolContextType(expr.type)) {
+      this.error(tok,
+        `controlling expression of '${ctxName}' must be scalar, got '${expr.type.toString()}'`);
+    }
   }
 
   // C23 `auto`: validate that the declarator is a plain identifier (no
@@ -7470,7 +7512,7 @@ class Parser {
 
       // Ternary
       if (op === "?") {
-        this._rejectRefAsCondition(left, opTok, "ternary");
+        this._validateCond(left, opTok, "ternary");
         let thenExpr = this.parseExpression();
         this.expect(":");
         let elseExpr = this.parseBinaryExpression(3);
@@ -7595,7 +7637,7 @@ class Parser {
       const kwTok = this.peek(-1);
       this.expect("(");
       const cond = this.parseExpression();
-      this._rejectRefAsCondition(cond, kwTok, "if");
+      this._validateCond(cond, kwTok, "if");
       this.expect(")");
       const thenBranch = this.parseStatement();
       let elseBranch = null;
@@ -7608,7 +7650,7 @@ class Parser {
       const kwTok = this.peek(-1);
       this.expect("(");
       const cond = this.parseExpression();
-      this._rejectRefAsCondition(cond, kwTok, "while");
+      this._validateCond(cond, kwTok, "while");
       this.expect(")");
       return new AST.SWhile(loc, cond, this.parseStatement());
     }
@@ -7620,7 +7662,7 @@ class Parser {
       this.expectKW(Lexer.Keyword.WHILE);
       this.expect("(");
       const cond = this.parseExpression();
-      this._rejectRefAsCondition(cond, kwTok, "do-while");
+      this._validateCond(cond, kwTok, "do-while");
       this.expect(")");
       this.expect(";");
       return new AST.SDoWhile(loc, body, cond);
@@ -7644,7 +7686,7 @@ class Parser {
       }
       if (!this.matchText(";")) {
         cond = this.parseExpression();
-        this._rejectRefAsCondition(cond, kwTok, "for");
+        this._validateCond(cond, kwTok, "for");
         this.expect(";");
       }
       if (!this.atText(")")) incr = this.parseExpression();
