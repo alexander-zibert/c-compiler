@@ -2684,6 +2684,10 @@ class Expr {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedVariables));
     }
+    get referencedCompoundLiterals() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedCompoundLiterals));
+    }
     // Rebuild this node with replaced children, in the same order as
     // `this.children`. Leaf subclasses (no children) inherit this
     // identity-return; non-leaf subclasses must override.
@@ -2716,6 +2720,10 @@ class Expr {
     get referencedVariables() {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedVariables));
+    }
+    get referencedCompoundLiterals() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedCompoundLiterals));
     }
     _withChildren(newChildren) {
       if (newChildren.length === 0) return this;
@@ -2753,7 +2761,6 @@ class Expr {
       this.isInline = isInline || false;
       this.body = body || null;
       this.staticLocals = []; this.externLocals = []; this.externLocalFuncs = [];
-      this.compoundLiterals = [];
       this.definition = null;
       this.importModule = null; this.importName = null;
       Object.seal(this);
@@ -3116,19 +3123,24 @@ class Expr {
       return new EWasm(this.loc, this.type, newChildren, this.bytes);
     }
   }
-  // ECompoundLiteral is seal-only (not frozen) because the optimizer
-  // mutates `initList` in place to fold nested constants — replacing the
-  // node would invalidate the parser/codegen identity-keyed tracking lists.
-  // Children is [initList] so walkers can recurse; INLINER's mutation
-  // updates both `this.initList` and `this.children[0]` together.
+  // ECompoundLiteral represents `(T){...}` — an aggregate-typed
+  // allocation with observable identity (its storage address is taken).
+  // Bubbles itself up via `referencedCompoundLiterals` so codegen can
+  // discover all live compound literals from the AST shape rather than
+  // a parser-side list — that lets INLINER replace nodes via
+  // `_withChildren` without breaking layout (the bag picks up whatever
+  // node is current at codegen time).
   class ECompoundLiteral extends Expr {
     constructor(loc, type, initList) {
       // Allocation has identity (the storage's address is observable).
       super(loc, type, [initList], Linearity.AFFINE);
       this.initList = initList;
-      Object.seal(this);
+      Object.freeze(this);
     }
     _withChildren([initList]) { return new ECompoundLiteral(this.loc, this.type, initList); }
+    get referencedCompoundLiterals() {
+      return new TreeBag([this], this.initList.referencedCompoundLiterals);
+    }
   }
   class EImplicitCast extends Expr {
     constructor(loc, type, expr) {
@@ -3936,7 +3948,6 @@ class TUnit {
     this.minStackBytes = 0;
     this.exportDirectives = [];
     this.exceptionTags = [];
-    this.fileScopeCompoundLiterals = [];
     Object.seal(this);
   }
 }
@@ -4314,15 +4325,10 @@ function foldExpr(expr) {
     }
 
     case AST.ECompoundLiteral: {
-      // Compound literals are tracked by identity in the parser/codegen —
-      // don't replace the node. Mutate the init list in place if folded
-      // (and keep children[0] in sync so walkExpr sees current state).
+      // ECompoundLiteral is frozen — fold the init list and rebuild via
+      // _withChildren. Codegen finds the current node via the bag.
       const folded = foldExpr(expr.initList);
-      if (folded !== expr.initList) {
-        expr.initList = folded;
-        expr.children[0] = folded;
-      }
-      return expr;
+      return folded === expr.initList ? expr : expr._withChildren([folded]);
     }
 
     default:
@@ -5551,7 +5557,6 @@ class Parser {
     this.requiredSources = new Set();
     this.exportDirectives = [];
     this.parsedExceptionTags = [];
-    this.fileScopeCompoundLiterals = [];
     this.parsedLabels = new Map();
     this.pendingGotos = new Map();
     this.warningFlags = { pointerDecay: false, circularDependency: false };
@@ -6460,10 +6465,7 @@ class Parser {
           } else if (castType.isAggregate()) {
             initList = normalizeInitList(initList, castType);
           }
-          const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
-          if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
-          else this.currentParsingFunc.compoundLiterals.push(cl);
-          return cl;
+          return new AST.ECompoundLiteral(startLoc, castType, initList);
         }
         // Cast expression
         const expr = this.parseCastExpression();
@@ -6471,10 +6473,7 @@ class Parser {
         if (castType.isUnion()) {
           let initList = new AST.EInitList(startLoc, castType, [expr], []);
           initList = normalizeInitList(initList, castType);
-          const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
-          if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
-          else this.currentParsingFunc.compoundLiterals.push(cl);
-          return cl;
+          return new AST.ECompoundLiteral(startLoc, castType, initList);
         }
         return AST.makeCast(startLoc, castType, expr);
       }
@@ -7233,20 +7232,14 @@ class Parser {
             } else if (castType.isAggregate()) {
               initList = normalizeInitList(initList, castType);
             }
-            const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
-            if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
-            else this.currentParsingFunc.compoundLiterals.push(cl);
-            return this.parsePostfixTail(cl);
+            return this.parsePostfixTail(new AST.ECompoundLiteral(startLoc, castType, initList));
           }
           const expr = this.parseCastExpression();
           // GCC extension: cast-to-union — (union_type) expr → compound literal
           if (castType.isUnion()) {
             let initList = new AST.EInitList(startLoc, castType, [expr], []);
             initList = normalizeInitList(initList, castType);
-            const cl = new AST.ECompoundLiteral(startLoc, castType, initList);
-            if (!this.currentParsingFunc) this.fileScopeCompoundLiterals.push(cl);
-            else this.currentParsingFunc.compoundLiterals.push(cl);
-            return this.parsePostfixTail(cl);
+            return this.parsePostfixTail(new AST.ECompoundLiteral(startLoc, castType, initList));
           }
           return AST.makeCast(startLoc, castType, expr);
         }
@@ -8548,7 +8541,6 @@ function parseTokens(tokens, options) {
 
   unit.requiredSources = parser.requiredSources;
   unit.exportDirectives = parser.exportDirectives;
-  unit.fileScopeCompoundLiterals = parser.fileScopeCompoundLiterals;
 
   return { translationUnit: unit, errors: sink.errors, warnings: sink.warnings };
 }
@@ -10865,8 +10857,17 @@ class CodeGenerator {
     this.paramMemoryOffsets.clear();
     this.compoundLiteralOffsets.clear();
     this.frameSize = 0;
-    if (memoryVars.length > 0 || memoryParams.length > 0 ||
-        (funcDef.compoundLiterals && funcDef.compoundLiterals.length > 0)) {
+    // Eager peek: do we have any frame-scope compound literals?
+    let hasFrameCompoundLiterals = false;
+    if (funcDef.body) {
+      for (const cl of funcDef.body.referencedCompoundLiterals) {
+        if (!this.fileScopeCompoundLiteralAddrs.has(cl)) {
+          hasFrameCompoundLiterals = true;
+          break;
+        }
+      }
+    }
+    if (memoryVars.length > 0 || memoryParams.length > 0 || hasFrameCompoundLiterals) {
       this.savedSpLocalIdx = this.allocLocal(WT_I32);
       let offset = 0;
       for (const v of memoryVars) {
@@ -10882,8 +10883,13 @@ class CodeGenerator {
         this.paramMemoryOffsets.set(p, offset);
         offset += this.sizeOf(p.type);
       }
-      if (funcDef.compoundLiterals) {
-        for (const cl of funcDef.compoundLiterals) {
+      // Frame-scope compound literals: walk the body's bag. Anything
+      // already allocated as a file-scope (static-storage) literal is
+      // skipped — its address is global, not frame-relative.
+      if (funcDef.body) {
+        for (const cl of funcDef.body.referencedCompoundLiterals) {
+          if (this.fileScopeCompoundLiteralAddrs.has(cl)) continue;
+          if (this.compoundLiteralOffsets.has(cl)) continue;
           const a = this.alignOf(cl.type);
           offset = (offset + a - 1) & ~(a - 1);
           this.compoundLiteralOffsets.set(cl, offset);
@@ -12832,6 +12838,24 @@ class CodeGenerator {
 // generateCode orchestration
 // ====================
 
+// Walk a unit's globals to collect every ECompoundLiteral reachable
+// from a static-storage init context (regular globals + static locals).
+// These get static addresses; their counterparts inside function bodies
+// (frame-scope) are collected separately per-function. The bag does
+// the recursion — we just enumerate the entry points.
+function collectFileScopeCompoundLiterals(unit) {
+  const out = new Set();
+  const collect = (expr) => {
+    if (!expr) return;
+    for (const cl of expr.referencedCompoundLiterals) out.add(cl);
+  };
+  for (const v of unit.definedVariables) collect(v.initExpr);
+  for (const func of [...unit.definedFunctions, ...unit.staticFunctions]) {
+    for (const v of (func.staticLocals || [])) collect(v.initExpr);
+  }
+  return out;
+}
+
 function generateCode(units, outputFile, options) {
   const wmod = new WasmModule();
   const cg = new CodeGenerator(wmod, options);
@@ -12933,7 +12957,12 @@ function generateCode(units, outputFile, options) {
         }
       }
     }
-    for (const cl of (unit.fileScopeCompoundLiterals || [])) {
+    // File-scope compound literals: discover via the bag from every
+    // global init expression (regular globals + static locals, whose
+    // initExprs are evaluated as constant expressions at file scope).
+    const fileScopeCLs = collectFileScopeCompoundLiterals(unit);
+    for (const cl of fileScopeCLs) {
+      if (cg.fileScopeCompoundLiteralAddrs.has(cl)) continue;
       const addr = cg.allocateStatic(cg.sizeOf(cl.type), cg.alignOf(cl.type));
       cg.fileScopeCompoundLiteralAddrs.set(cl, addr);
     }
@@ -12941,8 +12970,9 @@ function generateCode(units, outputFile, options) {
 
   // Initialize file-scope compound literals
   for (const unit of units) {
-    for (const cl of (unit.fileScopeCompoundLiterals || [])) {
+    for (const cl of collectFileScopeCompoundLiterals(unit)) {
       const addr = cg.fileScopeCompoundLiteralAddrs.get(cl);
+      if (addr === undefined) continue; // already initialized in another TU pass
       const baseOffset = addr - (cg.stackPages * 65536);
       if (cl.type.isArray() && cl.initList.elements.length === 1 && cl.initList.elements[0] instanceof AST.EString) {
         cg.writeStringLiteralToStatic(cl.initList.elements[0].value, cl.type, baseOffset);

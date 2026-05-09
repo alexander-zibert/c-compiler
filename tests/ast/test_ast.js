@@ -157,6 +157,29 @@ test('EInitList is seal-only (not frozen) — designator path', () => {
   const n = new AST.EInitList(LOC, Types.TINT, [], [], -1);
   assert(!Object.isFrozen(n), 'EInitList should be seal-only');
 });
+test('ECompoundLiteral is frozen', () => {
+  const initList = new AST.EInitList(LOC, Types.TINT, [int(1)], [], -1);
+  const n = new AST.ECompoundLiteral(LOC, Types.TINT, initList);
+  assert(Object.isFrozen(n), 'ECompoundLiteral should be frozen now (bag-driven layout)');
+  assertThrows(() => { n.initList = null; }, /read only|Cannot assign/);
+});
+test('ECompoundLiteral.referencedCompoundLiterals contains itself', () => {
+  const initList = new AST.EInitList(LOC, Types.TINT, [int(1)], [], -1);
+  const cl = new AST.ECompoundLiteral(LOC, Types.TINT, initList);
+  const found = [...cl.referencedCompoundLiterals];
+  assertEq(found.length, 1, 'self-bag has one entry');
+  assertEq(found[0], cl, 'and that entry is itself');
+});
+test('referencedCompoundLiterals bubbles up through containing exprs', () => {
+  const innerInit = new AST.EInitList(LOC, Types.TINT, [int(1)], [], -1);
+  const cl = new AST.ECompoundLiteral(LOC, Types.TINT, innerInit);
+  const outerInit = new AST.EInitList(LOC, Types.TINT, [cl], [], -1);
+  const outer = new AST.ECompoundLiteral(LOC, Types.TINT, outerInit);
+  const found = new Set(outer.referencedCompoundLiterals);
+  assertEq(found.size, 2, 'outer bag includes both compound literals');
+  assert(found.has(cl), 'inner CL is reachable');
+  assert(found.has(outer), 'outer CL self-reference');
+});
 test('SLabel is seal-only (target backfilled)', () => {
   const n = new AST.SLabel(LOC, 'foo', null);
   assert(!Object.isFrozen(n), 'SLabel should be seal-only');
