@@ -628,6 +628,67 @@ test('tree-shake follows forward-declaration to definition', () => {
 });
 
 // =============================================================================
+// Tree-shake: referencedVariables bubble-up + dead static-global drops
+// =============================================================================
+
+test('tree-shake drops static global never referenced', () => {
+  const u = compileAndOptimize(
+    'static int dead = 99;\n' +
+    'static int live = 7;\n' +
+    'int main(void) { return live; }');
+  const names = u.definedVariables.map(v => v.name);
+  assert(!names.includes('dead'), `expected 'dead' dropped, got: ${names.join(",")}`);
+  assert(names.includes('live'), `expected 'live' kept, got: ${names.join(",")}`);
+});
+test('tree-shake follows static-global chain via address-take', () => {
+  const u = compileAndOptimize(
+    'static int leaf = 100;\n' +
+    'static int *mid = &leaf;\n' +
+    'static int **root = &mid;\n' +
+    'int main(void) { return **root; }');
+  const names = u.definedVariables.map(v => v.name);
+  assert(names.includes('leaf'), `expected 'leaf' kept, got: ${names.join(",")}`);
+  assert(names.includes('mid'), `expected 'mid' kept, got: ${names.join(",")}`);
+  assert(names.includes('root'), `expected 'root' kept, got: ${names.join(",")}`);
+});
+test('tree-shake drops static global only referenced from dead static', () => {
+  // unused_func mentions secret_var; if unused_func is dropped (which
+  // it should be — nothing live calls it), secret_var becomes dead too.
+  const u = compileAndOptimize(
+    'static int secret_var = 42;\n' +
+    'static int unused_func(void) { return secret_var; }\n' +
+    'int main(void) { return 0; }');
+  const fnNames = u.staticFunctions.map(f => f.name);
+  const varNames = u.definedVariables.map(v => v.name);
+  assert(!fnNames.includes('unused_func'),
+    `expected 'unused_func' dropped, got: ${fnNames.join(",")}`);
+  assert(!varNames.includes('secret_var'),
+    `expected 'secret_var' dropped, got: ${varNames.join(",")}`);
+});
+test('tree-shake follows forward-decl for variables', () => {
+  // Forward declaration of a variable, then reference via address-take
+  // before the definition appears. EIdent's referencedVariables must
+  // surface the linked definition so identity matches definedVariables.
+  const u = compileAndOptimize(
+    'extern int target;\n' +
+    'static int *ref = &target;\n' +
+    'int target = 7;\n' +
+    'int main(void) { return *ref; }');
+  const names = u.definedVariables.map(v => v.name);
+  assert(names.includes('target'), `expected 'target' kept, got: ${names.join(",")}`);
+  assert(names.includes('ref'), `expected 'ref' kept, got: ${names.join(",")}`);
+});
+test('referencedVariables bubbles up from EBinary children', () => {
+  const u = compileAndOptimize(
+    'static int a = 1, b = 2;\n' +
+    'int main(void) { return a + b; }');
+  const main = u.definedFunctions[0];
+  const refs = [...main.body.referencedVariables].map(v => v.name);
+  assert(refs.includes('a'), `expected 'a' in refs, got: ${refs.join(",")}`);
+  assert(refs.includes('b'), `expected 'b' in refs, got: ${refs.join(",")}`);
+});
+
+// =============================================================================
 // DExceptionTag class
 // =============================================================================
 

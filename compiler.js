@@ -2675,10 +2675,14 @@ class Expr {
     // seal-only escapees (EInitList, ECompoundLiteral) whose `children`
     // arrays are mutated by post-construction passes — the bag stays
     // consistent with whatever `children` currently looks like.
-    // EIdent of a DFunc overrides to add itself.
+    // EIdent of a DFunc / DVar overrides to add itself.
     get referencedFunctions() {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedFunctions));
+    }
+    get referencedVariables() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedVariables));
     }
     // Rebuild this node with replaced children, in the same order as
     // `this.children`. Leaf subclasses (no children) inherit this
@@ -2708,6 +2712,10 @@ class Expr {
     get referencedFunctions() {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedFunctions));
+    }
+    get referencedVariables() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.referencedVariables));
     }
     _withChildren(newChildren) {
       if (newChildren.length === 0) return this;
@@ -2862,6 +2870,12 @@ class Expr {
     // contains).
     get referencedFunctions() {
       if (this.decl instanceof DFunc) {
+        return new TreeBag([this.decl.definition || this.decl]);
+      }
+      return _EMPTY_TREE_BAG;
+    }
+    get referencedVariables() {
+      if (this.decl instanceof DVar) {
         return new TreeBag([this.decl.definition || this.decl]);
       }
       return _EMPTY_TREE_BAG;
@@ -4374,59 +4388,79 @@ function isRootFunction(f, unit) {
   return false;
 }
 
-function optimize(unit) {
+function optimize(unit, options) {
   _inliningStack.clear();
-  // Walk from roots transitively. After folding a function's body,
-  // its `referencedFunctions` bag tells us which other functions are
-  // reachable from it; queue any with bodies that haven't been folded.
-  // Tree-shake falls out: anything not visited is unreferenced.
-  const worklist = [];
-  const optimized = new Set();
+  // Unified worklist for both functions and globals. We walk from real
+  // roots (extern-linkage symbols, exports, main) and accumulate every
+  // function / variable reachable from them via the AST bag. Anything
+  // unreached at the end is dead and gets tree-shaken.
+  const liveFuncs = new Set();
+  const liveVars = new Set();
+  const funcQ = [];
+  const varQ = [];
+  const enqueueFunc = (f) => {
+    if (!f || liveFuncs.has(f)) return;
+    liveFuncs.add(f);
+    funcQ.push(f);
+  };
+  const enqueueVar = (v) => {
+    if (!v || liveVars.has(v)) return;
+    liveVars.add(v);
+    varQ.push(v);
+  };
+  const visitRefs = (node) => {
+    for (const f of node.referencedFunctions) enqueueFunc(f);
+    for (const v of node.referencedVariables) enqueueVar(v);
+  };
+  // Seed: extern-linkage / exported / main funcs + non-static globals.
   for (const f of unit.definedFunctions) {
-    if (isRootFunction(f, unit)) worklist.push(f);
+    if (isRootFunction(f, unit)) enqueueFunc(f);
   }
-  // Globals' initializers may reference functions (function-pointer
-  // tables, &foo addresses). Fold them and mark anything referenced.
   for (const v of unit.definedVariables) {
-    if (v.initExpr) {
+    if (v.storageClass !== Types.StorageClass.STATIC) enqueueVar(v);
+  }
+  // Drain to fixed point. We process funcs and vars together; either
+  // queue might add to the other.
+  while (funcQ.length > 0 || varQ.length > 0) {
+    while (funcQ.length > 0) {
+      const f = funcQ.shift();
+      if (!f.body) continue;
+      f.body = foldStmt(f.body);
+      visitRefs(f.body);
+      // Static locals are diverted out of the function body (they live
+      // in `staticLocals`), so their initializers don't ride the body's
+      // bag. Walk them explicitly — function-pointer tables in static
+      // locals (e.g. Lua's searcher_C / searcher_Lua dispatch table)
+      // are a real reference path.
+      for (const v of (f.staticLocals || [])) {
+        if (v.initExpr) {
+          const folded = foldExpr(v.initExpr);
+          if (folded !== v.initExpr) v.initExpr = folded;
+          visitRefs(v.initExpr);
+        }
+      }
+    }
+    while (varQ.length > 0) {
+      const v = varQ.shift();
+      if (!v.initExpr) continue;
       const folded = foldExpr(v.initExpr);
       if (folded !== v.initExpr) v.initExpr = folded;
-      for (const g of v.initExpr.referencedFunctions) {
-        if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) worklist.push(g);
-      }
+      visitRefs(v.initExpr);
     }
   }
-  const enqueueRefs = (bag) => {
-    for (const g of bag) {
-      if (g.body && !optimized.has(g) && worklist.indexOf(g) === -1) worklist.push(g);
-    }
-  };
-  while (worklist.length > 0) {
-    const f = worklist.shift();
-    if (optimized.has(f)) continue;
-    optimized.add(f);
-    if (!f.body) continue;
-    f.body = foldStmt(f.body);
-    enqueueRefs(f.body.referencedFunctions);
-    // Static locals are diverted out of the function body (they live in
-    // `staticLocals`), so their initializers don't ride the body's bag.
-    // Walk them explicitly — function-pointer tables in static locals
-    // (e.g. Lua's searcher_C / searcher_Lua dispatch table) are a real
-    // reference path.
-    for (const v of (f.staticLocals || [])) {
-      if (v.initExpr) {
-        const folded = foldExpr(v.initExpr);
-        if (folded !== v.initExpr) v.initExpr = folded;
-        enqueueRefs(v.initExpr.referencedFunctions);
-      }
-    }
+  // Tree-shake. The bag-walk above transitively visited everything
+  // reachable from roots; anything not in `live*` is genuinely dead.
+  // - static funcs / vars: drop if unreached (TU-internal, safe).
+  // - extern vars / declared funcs: drop if unreached UNLESS the user
+  //   asked for --no-undefined, in which case the linker should be
+  //   allowed to complain about every dangling reference for visibility.
+  unit.staticFunctions = unit.staticFunctions.filter(f => liveFuncs.has(f));
+  unit.definedVariables = unit.definedVariables.filter(
+    v => v.storageClass !== Types.StorageClass.STATIC || liveVars.has(v));
+  if (!options?.noUndefined) {
+    unit.externVariables = unit.externVariables.filter(v => liveVars.has(v));
+    unit.declaredFunctions = unit.declaredFunctions.filter(f => liveFuncs.has(f));
   }
-  // Tree-shake: drop static functions never reached. Non-static defined
-  // functions stay (could be called cross-TU). The bag-walk above
-  // transitively visited everything reachable from roots (including
-  // function-pointer tables in static globals and static locals), so
-  // anything in `staticFunctions` not in `optimized` is genuinely dead.
-  unit.staticFunctions = unit.staticFunctions.filter(f => optimized.has(f));
   return unit;
 }
 
@@ -17367,7 +17401,7 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // time at each construction site.
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
     if (!options?.compilerOptions?.noUndefined) Parser.filterUnusedDeclarations(unit);
-    INLINER.optimize(unit);
+    INLINER.optimize(unit, { noUndefined: !!options?.compilerOptions?.noUndefined });
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
       hasErrors = true;
