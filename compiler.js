@@ -2049,30 +2049,19 @@ class TypeInfo {
   getParamTypes() { return this.paramTypes || []; }
 
   // ------------- Predicates ---------------------------------------------
-  isInteger() {
-    switch (this.kind) {
-      case TypeKind.BOOL: case TypeKind.CHAR: case TypeKind.SCHAR: case TypeKind.UCHAR:
-      case TypeKind.SHORT: case TypeKind.USHORT: case TypeKind.INT: case TypeKind.UINT:
-      case TypeKind.LONG: case TypeKind.ULONG: case TypeKind.LLONG: case TypeKind.ULLONG:
-        return true;
-      default: return false;
-    }
-  }
-  isUnsigned() {
-    return this.kind === TypeKind.BOOL || this.kind === TypeKind.UCHAR ||
-        this.kind === TypeKind.USHORT || this.kind === TypeKind.UINT ||
-        this.kind === TypeKind.ULONG || this.kind === TypeKind.ULLONG;
-  }
-  isFloatingPoint() {
-    return this.kind === TypeKind.FLOAT || this.kind === TypeKind.DOUBLE || this.kind === TypeKind.LDOUBLE;
-  }
+  // Defaults are false on the abstract base; the relevant subclass overrides.
+  // E.g. `isInteger()` is true on IntegerType, `isFloatingPoint()` on
+  // FloatingType, `isVoid()` on VoidType, etc.
+  isInteger()    { return false; }
+  isUnsigned()   { return false; }
+  isFloatingPoint() { return false; }
   isArithmetic() { return this.isInteger() || this.isFloatingPoint(); }
   isScalar()     { return this.isArithmetic() || this.isPointer(); }
   isPointer()    { return false; }
   isArray()      { return false; }
   isFunction()   { return false; }
-  isVoid()       { return this.kind === TypeKind.VOID; }
-  isDivergent()  { return this.kind === TypeKind.DIVERGENT; }
+  isVoid()       { return false; }
+  isDivergent()  { return false; }
   isTag()        { return false; }
   isStruct()     { return false; }
   isUnion()      { return false; }
@@ -2173,14 +2162,81 @@ class TypeInfo {
 // Most primitive numeric types (BOOL/CHAR/INT/FLOAT/...) and the special
 // non-numeric singletons (VOID/AUTO/DIVERGENT/UNKNOWN). All have fixed
 // size+align and no kind-specific fields.
+// Abstract: any type that doesn't carry kind-specific structure (no
+// baseType, no params, no fields). Subclasses are the concrete primitive
+// categories: IntegerType, FloatingType, VoidType, AutoType, UnknownType,
+// DivergentType. They share the trivial qualifier-clone idiom — each
+// concrete subclass is also the cloning factory for its own kind.
 class PrimitiveType extends TypeInfo {
-  constructor(kind, size, align, isComplete = true) {
+  constructor(kind, size, align, isComplete) {
     super(kind, size, align, isComplete);
+  }
+}
+
+// Integer types: bool, char, signed/unsigned char/short/int/long/long long.
+// `isSigned` distinguishes the signedness of a given width.
+class IntegerType extends PrimitiveType {
+  constructor(kind, size, align, isSigned) {
+    super(kind, size, align, true);
+    this.isSigned = isSigned;
     Object.seal(this);
   }
-  _cloneForQualifier() {
-    return new PrimitiveType(this.kind, this.size, this.align, this.isComplete);
+  isInteger()  { return true; }
+  isUnsigned() { return !this.isSigned; }
+  _cloneForQualifier() { return new IntegerType(this.kind, this.size, this.align, this.isSigned); }
+}
+
+// Floating-point types: float, double, long double.
+class FloatingType extends PrimitiveType {
+  constructor(kind, size, align) {
+    super(kind, size, align, true);
+    Object.seal(this);
   }
+  isFloatingPoint() { return true; }
+  _cloneForQualifier() { return new FloatingType(this.kind, this.size, this.align); }
+}
+
+// `void`. Singleton; carried through pointer types as `void *` etc.
+// Has size/align of 0 and isComplete = false (cannot be a value type).
+class VoidType extends PrimitiveType {
+  constructor() {
+    super(TypeKind.VOID, 0, 0, false);
+    Object.seal(this);
+  }
+  isVoid() { return true; }
+  _cloneForQualifier() { return new VoidType(); }
+}
+
+// C23 `auto`: parser sentinel during decl-spec, replaced with the inferred
+// type once the initializer is known. Identity-compared (`t === TAUTO`).
+class AutoType extends PrimitiveType {
+  constructor() {
+    super(TypeKind.AUTO, 0, 0, false);
+    Object.seal(this);
+  }
+  _cloneForQualifier() { return new AutoType(); }
+}
+
+// `unknown` — placeholder for "no type known yet" in early parse stages.
+// Identity-compared sentinel.
+class UnknownType extends PrimitiveType {
+  constructor() {
+    super(TypeKind.UNKNOWN, 0, 0, false);
+    Object.seal(this);
+  }
+  _cloneForQualifier() { return new UnknownType(); }
+}
+
+// Bottom type for error recovery. Operations that combine types
+// (usual-arithmetic, computeBinaryType, maybeImplicitCast) treat any
+// divergent operand as absorbing — the result is divergent.
+class DivergentType extends PrimitiveType {
+  constructor() {
+    super(TypeKind.DIVERGENT, 0, 0, false);
+    Object.seal(this);
+  }
+  isDivergent() { return true; }
+  _cloneForQualifier() { return new DivergentType(); }
 }
 
 // `T *` — a C pointer to T. Always 4 bytes (wasm32).
@@ -2407,30 +2463,33 @@ class EqRefType extends TypeInfo {
   _cloneForQualifier() { return new EqRefType(); }
 }
 
-// Primitive type singletons. All sealed via PrimitiveType's constructor.
-const TUNKNOWN = new PrimitiveType(TypeKind.UNKNOWN, 0, 0, false);
-const TVOID = new PrimitiveType(TypeKind.VOID, 0, 0, false);
-// Divergent: bottom type for error recovery (see TypeKind.DIVERGENT).
-const TDIVERGENT = new PrimitiveType(TypeKind.DIVERGENT, 0, 0, false);
-const TBOOL = new PrimitiveType(TypeKind.BOOL, 1, 1);
-const TCHAR = new PrimitiveType(TypeKind.CHAR, 1, 1);
-const TSCHAR = new PrimitiveType(TypeKind.SCHAR, 1, 1);
-const TUCHAR = new PrimitiveType(TypeKind.UCHAR, 1, 1);
-const TSHORT = new PrimitiveType(TypeKind.SHORT, 2, 2);
-const TUSHORT = new PrimitiveType(TypeKind.USHORT, 2, 2);
-const TINT = new PrimitiveType(TypeKind.INT, 4, 4);
-const TUINT = new PrimitiveType(TypeKind.UINT, 4, 4);
-const TLONG = new PrimitiveType(TypeKind.LONG, 4, 4);
-const TULONG = new PrimitiveType(TypeKind.ULONG, 4, 4);
-const TLLONG = new PrimitiveType(TypeKind.LLONG, 8, 8);
-const TULLONG = new PrimitiveType(TypeKind.ULLONG, 8, 8);
-const TFLOAT = new PrimitiveType(TypeKind.FLOAT, 4, 4);
-const TDOUBLE = new PrimitiveType(TypeKind.DOUBLE, 8, 8);
-const TLDOUBLE = new PrimitiveType(TypeKind.LDOUBLE, 8, 8);
+// Primitive type singletons. Each is an instance of the concrete subclass
+// (IntegerType / FloatingType / VoidType / etc.). All are sealed via the
+// subclass constructor.
+const TUNKNOWN = new UnknownType();
+const TVOID = new VoidType();
+const TDIVERGENT = new DivergentType();
+const TBOOL   = new IntegerType(TypeKind.BOOL,   1, 1, /* isSigned */ false);
+// `char` signedness is implementation-defined in C; we treat plain char as
+// signed (matching most platforms and the existing isUnsigned() behavior).
+const TCHAR   = new IntegerType(TypeKind.CHAR,   1, 1, true);
+const TSCHAR  = new IntegerType(TypeKind.SCHAR,  1, 1, true);
+const TUCHAR  = new IntegerType(TypeKind.UCHAR,  1, 1, false);
+const TSHORT  = new IntegerType(TypeKind.SHORT,  2, 2, true);
+const TUSHORT = new IntegerType(TypeKind.USHORT, 2, 2, false);
+const TINT    = new IntegerType(TypeKind.INT,    4, 4, true);
+const TUINT   = new IntegerType(TypeKind.UINT,   4, 4, false);
+const TLONG   = new IntegerType(TypeKind.LONG,   4, 4, true);
+const TULONG  = new IntegerType(TypeKind.ULONG,  4, 4, false);
+const TLLONG  = new IntegerType(TypeKind.LLONG,  8, 8, true);
+const TULLONG = new IntegerType(TypeKind.ULLONG, 8, 8, false);
+const TFLOAT   = new FloatingType(TypeKind.FLOAT,   4, 4);
+const TDOUBLE  = new FloatingType(TypeKind.DOUBLE,  8, 8);
+const TLDOUBLE = new FloatingType(TypeKind.LDOUBLE, 8, 8);
 const TEXTERNREF = new ExternRefType();
 const TREFEXTERN = new RefExternType();
 const TEQREF = new EqRefType();
-const TAUTO = new PrimitiveType(TypeKind.AUTO, 0, 0, false);
+const TAUTO = new AutoType();
 
 // Type construction caches
 function arrayOf(elemType, size) {
@@ -2670,7 +2729,9 @@ return {
   TypeKind, TagKind, StorageClass, AllocClass, LabelKind,
   IntrinsicKind, BopStr, UopStr,
   TypeInfo,
-  PrimitiveType, PointerType, ArrayType, FunctionType, TagType,
+  PrimitiveType, IntegerType, FloatingType,
+  VoidType, AutoType, UnknownType, DivergentType,
+  PointerType, ArrayType, FunctionType, TagType,
   GCStructHeapType, GCStructRefType, GCArrayType,
   ExternRefType, RefExternType, EqRefType,
   TUNKNOWN, TVOID, TBOOL, TCHAR, TSCHAR, TUCHAR, TSHORT, TUSHORT,
