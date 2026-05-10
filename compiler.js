@@ -5077,6 +5077,464 @@ function optimize(unit, options) {
 return { optimize, foldExpr, foldStmt, tryInline };
 })();
 
+// ====================
+// GOTO NORMALIZER — AST→AST transformation pass
+// ====================
+//
+// C allows `goto L` to jump to any label `L:` within the same function,
+// regardless of block scoping. WASM only allows `br` to *enclosing* block
+// labels. Most of the gap is closed by the codegen's pre-scan (which opens a
+// `block` for each forward label at the same compound level), but cross-
+// block forward gotos — where `goto L` is in one branch and `L:` is in a
+// sibling/cousin branch — fail to codegen.
+//
+// This pass detects such cases and rewrites the AST to put the label at a
+// position structurally enclosing both the goto and its original location,
+// preserving the original control-flow semantics. The transform is:
+//
+//   if (cond) {                       if (cond) {
+//     goto L;                           goto L;
+//   } else {            =====>        } else {
+//     L: stmt;                          goto L;
+//   }                                 }
+//   /* continuation */                L: stmt;
+//                                     /* continuation */
+//
+// The label and its tail (subsequent statements in the same compound) move
+// to the LCA compound right after the subtree that contained the original
+// label. The original position becomes `goto L` so the natural fall-through
+// path still reaches the labeled stmt.
+//
+// Restrictions (bail with a clean diagnostic if violated):
+//   - Hoisting must NOT cross a loop body boundary. Hoisting a label out of
+//     a loop changes iteration semantics.
+//   - The hoisted tail must NOT contain `break` or `continue` whose target
+//     is a loop or switch crossed by the hoist.
+//   - The labeled tail must be at the END of its containing compound (the
+//     simple case). Mid-block labels with post-label stmts in nested
+//     intermediate compounds are not handled by this pass.
+//
+// The pass iterates: each round transforms one cross-block label, then
+// re-scans (transforms can reveal new opportunities or cause re-classifying
+// of other gotos). Bounded by the label count.
+
+const GOTO_NORMALIZER = (() => {
+
+// Walk a function body, collecting per-label and per-goto location traces.
+// Each trace is the chain of ancestor nodes from the function body (root)
+// down to the SLabel/SGoto, in outer→inner order. SCompound nodes act as
+// "scope boundaries" — gotos and labels are children of some SCompound.
+//
+// Returns:
+//   labels: Map<SLabel, { compound, indexInCompound, trace }>
+//   gotos:  Map<SGoto,  { compound, indexInCompound, trace }>
+function collectTraces(body) {
+  const labels = new Map();
+  const gotos = new Map();
+
+  // `nearestCompound` is the deepest SCompound on `trace` — the compound
+  // that an SGoto/SLabel "belongs to" structurally, even if its immediate
+  // parent is a control-flow node like an unbraced `if (cond) goto X;`.
+  function nearestCompound(trace) {
+    for (let i = trace.length - 1; i >= 0; i--) {
+      if (trace[i] instanceof AST.SCompound) return trace[i];
+    }
+    return null;
+  }
+
+  function visit(node, trace) {
+    if (!node) return;
+    const ntrace = [...trace, node];
+
+    if (node instanceof AST.SLabel) {
+      const compound = nearestCompound(ntrace);
+      // Index in compound is meaningful only if the label is a direct
+      // child of the compound. Otherwise (e.g. `if (cond) L: stmt;`),
+      // index is -1 to signal "non-direct child" — we won't apply the
+      // hoist transform to such labels.
+      const idx = compound ? compound.statements.indexOf(node) : -1;
+      labels.set(node, { compound, indexInCompound: idx, trace: ntrace });
+      return;
+    }
+    if (node instanceof AST.SGoto) {
+      const compound = nearestCompound(ntrace);
+      gotos.set(node, { compound, indexInCompound: -1, trace: ntrace });
+      return;
+    }
+
+    if (node instanceof AST.SCompound) {
+      for (const s of node.statements) visit(s, ntrace);
+    } else if (node instanceof AST.SIf) {
+      visit(node.thenBranch, ntrace);
+      if (node.elseBranch) visit(node.elseBranch, ntrace);
+    } else if (node instanceof AST.SWhile || node instanceof AST.SDoWhile) {
+      visit(node.body, ntrace);
+    } else if (node instanceof AST.SFor) {
+      visit(node.init, ntrace);
+      visit(node.body, ntrace);
+    } else if (node instanceof AST.SSwitch) {
+      visit(node.body, ntrace);
+    } else if (node instanceof AST.STryCatch) {
+      visit(node.tryBody, ntrace);
+      for (const cc of node.catches) visit(cc.body, ntrace);
+    }
+    // Other Stmt subclasses (SExpr, SDecl, SReturn, SBreak, SContinue,
+    // SEmpty) are leaves with no nested labels/gotos.
+  }
+
+  visit(body, []);
+  return { labels, gotos };
+}
+
+// Returns the deepest common-prefix length of two traces. trace1[0..k-1]
+// equals trace2[0..k-1], and they differ (or one ends) at index k.
+function commonPrefixLength(trace1, trace2) {
+  let i = 0;
+  while (i < trace1.length && i < trace2.length && trace1[i] === trace2[i]) i++;
+  return i;
+}
+
+// Classify a (goto, label) pair given their traces.
+//   "structured-forward": label's compound is an ancestor of the goto's
+//                         compound. The wasm `block` opened for the label
+//                         wraps the goto's position, so `br` reaches it.
+//                         Current codegen handles this; this pass skips.
+//   "needs-transform":    everything else — either the goto's compound is
+//                         an ancestor of the label's (jump INTO a nested
+//                         scope), or they're in sibling/cousin subtrees.
+//                         Both cases require hoisting the label to a
+//                         position structurally enclosing the goto.
+function classifyPair(gotoInfo, labelInfo) {
+  const gotoTrace = gotoInfo.trace;
+  if (gotoTrace.includes(labelInfo.compound)) return "structured-forward";
+  return "needs-transform";
+}
+
+// Find the SCompound that's the LCA of the given traces (deepest common
+// ancestor that is itself an SCompound, since insertions happen at compound
+// level). Returns { lcaCompound, anchorStmt, anchorIndex } where anchorStmt
+// is the statement in lcaCompound on the LABEL's path (the construct that
+// transitively contains the label's branch), and anchorIndex is its index.
+function findHoistTarget(gotoInfo, labelInfo) {
+  const k = commonPrefixLength(gotoInfo.trace, labelInfo.trace);
+  // Walk up from index k-1 to find the deepest SCompound that's a common
+  // ancestor.
+  let lcaCompound = null;
+  for (let i = k - 1; i >= 0; i--) {
+    if (gotoInfo.trace[i] instanceof AST.SCompound) {
+      lcaCompound = gotoInfo.trace[i];
+      break;
+    }
+  }
+  if (!lcaCompound) return null;
+  // Find the position of the next-level node on the LABEL's trace within
+  // lcaCompound.statements. The next-level node is labelInfo.trace[lcaIdx+1]
+  // where lcaIdx is the index of lcaCompound in labelInfo.trace.
+  const lcaIdx = labelInfo.trace.indexOf(lcaCompound);
+  if (lcaIdx < 0) return null;
+  const childOnLabelPath = labelInfo.trace[lcaIdx + 1];
+  if (!childOnLabelPath) return null;
+  const anchorIndex = lcaCompound.statements.indexOf(childOnLabelPath);
+  if (anchorIndex < 0) {
+    // child is not directly in statements; it's wrapped by some control-flow
+    // node that IS in statements. Find which statement contains it.
+    for (let i = 0; i < lcaCompound.statements.length; i++) {
+      if (containsNode(lcaCompound.statements[i], childOnLabelPath)) {
+        return { lcaCompound, anchorStmt: lcaCompound.statements[i], anchorIndex: i };
+      }
+    }
+    return null;
+  }
+  return { lcaCompound, anchorStmt: childOnLabelPath, anchorIndex };
+}
+
+// True if `tree` contains `node` somewhere in its sub-tree (matches by
+// reference identity).
+function containsNode(tree, node) {
+  if (tree === node) return true;
+  if (tree instanceof AST.SCompound) {
+    return tree.statements.some(s => containsNode(s, node));
+  }
+  if (tree instanceof AST.SIf) {
+    return containsNode(tree.thenBranch, node) ||
+           (tree.elseBranch && containsNode(tree.elseBranch, node));
+  }
+  if (tree instanceof AST.SWhile || tree instanceof AST.SDoWhile) {
+    return containsNode(tree.body, node);
+  }
+  if (tree instanceof AST.SFor) {
+    return (tree.init && containsNode(tree.init, node)) ||
+           containsNode(tree.body, node);
+  }
+  if (tree instanceof AST.SSwitch) return containsNode(tree.body, node);
+  if (tree instanceof AST.STryCatch) {
+    return containsNode(tree.tryBody, node) ||
+           tree.catches.some(c => containsNode(c.body, node));
+  }
+  return false;
+}
+
+// Safety: check that hoisting `label` (in `labelInfo.compound`) up to
+// `lcaCompound` is sound. Returns { ok: true } or { ok: false, reason: '...' }.
+function checkHoistSafe(labelInfo, hoistTarget, body, switchBodies) {
+  // Condition 1: lcaCompound must NOT itself be a switch body. Hoisting
+  // into a switch body would interleave label/tail statements between case
+  // blocks; the codegen's case-dispatch machinery already handles cross-
+  // case-compound gotos directly, so leave those alone.
+  if (switchBodies.has(hoistTarget.lcaCompound)) {
+    return { ok: false, reason: `cannot hoist into a switch body — codegen handles cross-case gotos directly` };
+  }
+
+  // Condition 2: label and its tail (label + post-label stmts) are at the
+  // END of labelCompound. In our simple model, the tail consists of
+  // [labelCompound.statements from labelIdx onward]; we always include all
+  // of those, so the tail-collapsing is safe within the labelCompound
+  // itself. (The post-label stmts move with the tail.)
+
+  // Condition 3: the path from labelCompound up to lcaCompound must NOT
+  // cross a loop or switch body. Hoisting a label out of a loop body
+  // changes the loop's iteration semantics; out of a switch changes case
+  // dispatch + break semantics.
+  const trace = labelInfo.trace;
+  const lcaIdx = trace.indexOf(hoistTarget.lcaCompound);
+  for (let i = lcaIdx + 1; i < trace.length; i++) {
+    const node = trace[i];
+    if (node instanceof AST.SWhile || node instanceof AST.SDoWhile || node instanceof AST.SFor) {
+      return { ok: false, reason: `cannot hoist label '${labelInfo.label?.name || '?'}' out of a loop body` };
+    }
+    if (node instanceof AST.SSwitch) {
+      return { ok: false, reason: `cannot hoist label '${labelInfo.label?.name || '?'}' out of a switch body` };
+    }
+  }
+
+  // Condition 4: the path from labelCompound up to (and through) the
+  // anchor statement must consist of constructs whose fall-through naturally
+  // exits to the position right after the anchor. This holds for SIf
+  // branches (any branch falls out to right after the if) and SCompound
+  // nesting; loops/switches are already ruled out.
+
+  return { ok: true };
+}
+
+// Collect the set of SCompound nodes that are the body of an SSwitch in the
+// function. Used by safety check to reject hoisting into a switch body.
+function collectSwitchBodies(body) {
+  const set = new Set();
+  function visit(node) {
+    if (!node) return;
+    if (node instanceof AST.SCompound) {
+      for (const s of node.statements) visit(s);
+    } else if (node instanceof AST.SIf) {
+      visit(node.thenBranch);
+      visit(node.elseBranch);
+    } else if (node instanceof AST.SWhile || node instanceof AST.SDoWhile) {
+      visit(node.body);
+    } else if (node instanceof AST.SFor) {
+      visit(node.init);
+      visit(node.body);
+    } else if (node instanceof AST.SSwitch) {
+      if (node.body instanceof AST.SCompound) set.add(node.body);
+      visit(node.body);
+    } else if (node instanceof AST.STryCatch) {
+      visit(node.tryBody);
+      for (const cc of node.catches) visit(cc.body);
+    }
+  }
+  visit(body);
+  return set;
+}
+
+// Perform the hoist transform. Returns the new function body (rebuilt).
+//
+// Layout of the resulting LCA compound (around the anchor stmt):
+//
+//   ...stmts before anchor...
+//   modified anchor      (label-compound replaced with `goto L`)
+//   goto __hoist_skip_N  (skip the hoisted region on natural fall-through)
+//   L: ...tail...        (hoisted body)
+//   __hoist_skip_N:      (resume natural fall-through)
+//   ...stmts after anchor...
+//
+// The `goto __hoist_skip` + `__hoist_skip:` pair is essential: without it,
+// any natural fall-through past the anchor that DIDN'T originally execute
+// the label's body would now run the hoisted body inadvertently. With the
+// skip-jump, only goto-driven and "explicit branch into the modified
+// anchor" paths reach the hoisted body.
+//
+// The transform rebuilds every SCompound on the path from body down to
+// labelCompound, plus lcaCompound itself.
+let __hoistSkipCounter = 0;
+function applyHoist(body, labelInfo, hoistTarget) {
+  const labelCompound = labelInfo.compound;
+  const labelIdx = labelInfo.indexInCompound;
+  const lcaCompound = hoistTarget.lcaCompound;
+  const anchorIndex = hoistTarget.anchorIndex;
+  const labelStmt = labelCompound.statements[labelIdx];
+
+  // Tail = label + everything after in labelCompound
+  const tail = labelCompound.statements.slice(labelIdx);
+
+  // New labelCompound: original stmts before label + a single SGoto
+  const gotoReplacement = new AST.SGoto(labelStmt.loc, labelStmt.name);
+  gotoReplacement.target = labelStmt;
+  // Mark the original label as having gotos (it now has at least our new one).
+  labelStmt.hasGotos = true;
+  if (labelStmt.labelKind === Types.LabelKind.LOOP) {
+    labelStmt.labelKind = Types.LabelKind.BOTH;
+  } // else stays FORWARD
+
+  const newLabelCompoundStmts = [
+    ...labelCompound.statements.slice(0, labelIdx),
+    gotoReplacement,
+  ];
+  const newLabelCompound = new AST.SCompound(labelCompound.loc, newLabelCompoundStmts, labelCompound.labels);
+
+  // Walk anchor subtree; replace labelCompound deep inside with the modified
+  // version. This rebuilds the SIf/SCompound chain on the way down.
+  const oldAnchor = lcaCompound.statements[anchorIndex];
+  const newAnchor = rebuildAlongPath(oldAnchor, labelCompound, newLabelCompound);
+
+  // Update the label's enclosingBlock pointer to point to the lcaCompound
+  // (its new parent compound after hoist).
+  labelStmt.enclosingBlock = lcaCompound;
+
+  // Synthesize a unique skip-label and the goto+label pair.
+  const skipName = `__hoist_skip_${labelStmt.name}_${++__hoistSkipCounter}`;
+  const skipLabel = new AST.SLabel(labelStmt.loc, skipName, lcaCompound);
+  skipLabel.hasGotos = true;
+  skipLabel.labelKind = Types.LabelKind.FORWARD;
+  const skipGoto = new AST.SGoto(labelStmt.loc, skipName);
+  skipGoto.target = skipLabel;
+
+  const newLcaStmts = [
+    ...lcaCompound.statements.slice(0, anchorIndex),
+    newAnchor,
+    skipGoto,
+    ...tail,
+    skipLabel,
+    ...lcaCompound.statements.slice(anchorIndex + 1),
+  ];
+  const newLcaCompound = new AST.SCompound(lcaCompound.loc, newLcaStmts, lcaCompound.labels);
+
+  // Update the SCompound.labels references on lcaCompound to include the
+  // hoisted label and the new skip-label.
+  if (!newLcaCompound.labels.includes(labelStmt)) {
+    newLcaCompound.labels.push(labelStmt);
+  }
+  newLcaCompound.labels.push(skipLabel);
+  // Remove the label from the (old) labelCompound's labels list (it lives
+  // there from parser registration; we want consistency).
+  if (newLabelCompound.labels) {
+    const idx = newLabelCompound.labels.indexOf(labelStmt);
+    if (idx >= 0) newLabelCompound.labels.splice(idx, 1);
+  }
+
+  // Now rebuild the body to install newLcaCompound in place of lcaCompound.
+  return rebuildAlongPath(body, lcaCompound, newLcaCompound);
+}
+
+// Walk `tree` looking for `oldNode`; return a new tree where every node on
+// the path to oldNode is rebuilt, and oldNode itself is replaced by newNode.
+// Returns `tree` unchanged if oldNode is not found.
+function rebuildAlongPath(tree, oldNode, newNode) {
+  if (tree === oldNode) return newNode;
+  if (tree instanceof AST.SCompound) {
+    const newStmts = tree.statements.map(s => rebuildAlongPath(s, oldNode, newNode));
+    if (newStmts.some((s, i) => s !== tree.statements[i])) {
+      return new AST.SCompound(tree.loc, newStmts, tree.labels);
+    }
+    return tree;
+  }
+  if (tree instanceof AST.SIf) {
+    const newThen = rebuildAlongPath(tree.thenBranch, oldNode, newNode);
+    const newElse = tree.elseBranch ? rebuildAlongPath(tree.elseBranch, oldNode, newNode) : null;
+    if (newThen !== tree.thenBranch || newElse !== tree.elseBranch) {
+      return new AST.SIf(tree.loc, tree.condition, newThen, newElse);
+    }
+    return tree;
+  }
+  if (tree instanceof AST.SWhile) {
+    const newBody = rebuildAlongPath(tree.body, oldNode, newNode);
+    if (newBody !== tree.body) return new AST.SWhile(tree.loc, tree.condition, newBody);
+    return tree;
+  }
+  if (tree instanceof AST.SDoWhile) {
+    const newBody = rebuildAlongPath(tree.body, oldNode, newNode);
+    if (newBody !== tree.body) return new AST.SDoWhile(tree.loc, newBody, tree.condition);
+    return tree;
+  }
+  if (tree instanceof AST.SFor) {
+    const newBody = rebuildAlongPath(tree.body, oldNode, newNode);
+    if (newBody !== tree.body) return new AST.SFor(tree.loc, tree.init, tree.condition, tree.increment, newBody);
+    return tree;
+  }
+  if (tree instanceof AST.SSwitch) {
+    const newBody = rebuildAlongPath(tree.body, oldNode, newNode);
+    if (newBody !== tree.body) return new AST.SSwitch(tree.loc, tree.expr, tree.cases, newBody);
+    return tree;
+  }
+  if (tree instanceof AST.STryCatch) {
+    const newTry = rebuildAlongPath(tree.tryBody, oldNode, newNode);
+    let changed = newTry !== tree.tryBody;
+    const newCatches = tree.catches.map(c => {
+      const nb = rebuildAlongPath(c.body, oldNode, newNode);
+      if (nb !== c.body) { changed = true; return { ...c, body: nb }; }
+      return c;
+    });
+    if (changed) return new AST.STryCatch(tree.loc, newTry, newCatches);
+    return tree;
+  }
+  return tree;
+}
+
+// Top-level entry: run the pass on a function body. Iteratively transforms
+// cross-block goto/label pairs. Reports any unhandled cases via `sink`.
+function normalize(funcDecl, sink) {
+  if (!funcDecl.body) return;
+  let body = funcDecl.body;
+  const MAX_ITERATIONS = 256;  // upper bound on transformations per function
+  for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+    const { labels, gotos } = collectTraces(body);
+    const switchBodies = collectSwitchBodies(body);
+    let transformedThisRound = false;
+    for (const [gotoNode, gotoInfo] of gotos) {
+      if (!gotoNode.target) continue;  // unresolved goto; codegen will report
+      const labelInfo = labels.get(gotoNode.target);
+      if (!labelInfo) continue;
+      // Hoist requires the label to be a direct child of a compound (so we
+      // can replace it with a goto). Skip pathological cases like
+      // `if (cond) name: stmt;`.
+      if (labelInfo.indexInCompound < 0) continue;
+      const cls = classifyPair(gotoInfo, labelInfo);
+      if (cls !== "needs-transform") continue;
+      const target = findHoistTarget(gotoInfo, labelInfo);
+      if (!target) continue;
+      const labelInfoWithLabel = { ...labelInfo, label: gotoNode.target };
+      const safe = checkHoistSafe(labelInfoWithLabel, target, body, switchBodies);
+      if (!safe.ok) {
+        // Leave it alone; codegen will surface its own diagnostic.
+        continue;
+      }
+      body = applyHoist(body, labelInfoWithLabel, target);
+      transformedThisRound = true;
+      break;  // re-collect traces after a transform
+    }
+    if (!transformedThisRound) break;
+  }
+  funcDecl.body = body;
+}
+
+// Optimize all functions with bodies in a translation unit. This includes
+// both extern-linkage `definedFunctions` and `static` functions.
+function optimize(unit) {
+  for (const fn of unit.definedFunctions || []) normalize(fn);
+  for (const fn of unit.staticFunctions || []) normalize(fn);
+}
+
+return { normalize, optimize, collectTraces, classifyPair };
+
+})();
+
 // LEB128 encoding utilities (shared between Parser and Wasm)
 function lebU(out, value) {
   do {
@@ -18386,6 +18844,11 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // time at each construction site.
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
     INLINER.optimize(unit, { noUndefined: !!options?.compilerOptions?.noUndefined });
+    // Cross-block goto normalization: hoist labels in sibling/cousin scopes
+    // up to a structurally-enclosing position so the codegen's wasm `block`-
+    // based forward goto handling can reach them. Runs after INLINER (which
+    // may have eliminated some dead branches) and before codegen.
+    GOTO_NORMALIZER.optimize(unit);
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
       hasErrors = true;

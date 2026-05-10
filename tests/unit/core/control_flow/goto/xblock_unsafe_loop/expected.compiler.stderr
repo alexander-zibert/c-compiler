@@ -1,0 +1,1 @@
+tests/unit/core/control_flow/goto/xblock_unsafe_loop/main.c:5: error: goto 'inside': target label not in scope (in function 'main') (label may be in a nested block, or a loop label's scope was closed by a forward label)
