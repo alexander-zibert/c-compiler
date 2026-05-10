@@ -1,0 +1,3 @@
+opt=n arg=alice
+opt=o arg=/tmp/x
+optind=3

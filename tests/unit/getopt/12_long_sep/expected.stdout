@@ -1,0 +1,2 @@
+opt=c arg=42
+optind=3

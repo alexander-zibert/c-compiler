@@ -1,0 +1,4 @@
+opt=a
+optind=3
+rest[3]=-b
+rest[4]=file

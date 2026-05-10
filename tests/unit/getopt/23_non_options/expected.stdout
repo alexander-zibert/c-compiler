@@ -1,0 +1,5 @@
+opt=a
+optind=2
+rest[2]=file1
+rest[3]=-b
+rest[4]=file2

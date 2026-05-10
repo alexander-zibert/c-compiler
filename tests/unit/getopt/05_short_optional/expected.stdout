@@ -1,0 +1,5 @@
+opt=x arg=foo
+opt=y (no arg)
+opt=z (no arg)
+optind=4
+rest=notarg

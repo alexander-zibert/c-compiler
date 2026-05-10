@@ -1,0 +1,3 @@
+opt=o arg=OUT.TXT
+opt=n arg=42
+optind=3

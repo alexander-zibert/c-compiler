@@ -1,0 +1,4 @@
+opt=c arg=red
+opt=c (no arg)
+optind=3
+rest=next-arg

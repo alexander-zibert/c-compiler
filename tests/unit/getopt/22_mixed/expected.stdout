@@ -1,0 +1,7 @@
+opt=a
+opt=b
+opt=n arg=alice
+opt=c
+opt=v
+optind=5
+rest=input.txt

@@ -1,0 +1,3 @@
+opt=o arg=out.txt
+opt=n arg=42
+optind=5

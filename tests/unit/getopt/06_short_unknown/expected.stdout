@@ -1,0 +1,3 @@
+opt=a
+err optopt=q
+opt=b
