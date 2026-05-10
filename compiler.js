@@ -1938,29 +1938,6 @@ return {
 
 const Types = (() => {
 
-const TypeKind = Object.freeze({
-  UNKNOWN: "unknown", VOID: "void", BOOL: "_Bool",
-  CHAR: "char", SCHAR: "signed char", UCHAR: "unsigned char",
-  SHORT: "short", USHORT: "unsigned short",
-  INT: "int", UINT: "unsigned int",
-  LONG: "long", ULONG: "unsigned long",
-  LLONG: "long long", ULLONG: "unsigned long long",
-  FLOAT: "float", DOUBLE: "double", LDOUBLE: "long double",
-  POINTER: "pointer", ARRAY: "array", FUNCTION: "function",
-  TAG: "tag", EXTERNREF: "externref", REFEXTERN: "refextern",
-  GC_STRUCT_HEAP: "gc_struct_heap", GC_STRUCT: "gc_struct", GC_ARRAY: "gc_array",
-  EQREF: "eqref",
-  AUTO: "auto",  // C23 type-inference sentinel (set during parse, resolved at init)
-  // The bottom type for error recovery. After a parser diagnostic
-  // (undeclared identifier, missing struct field, unknown exception
-  // tag, etc.) we synthesize a placeholder decl typed DIVERGENT so the
-  // parse can continue without nulls leaking downstream. DIVERGENT
-  // absorbs in arithmetic/conversion contexts so further operations on
-  // it stay well-typed. Codegen never sees it — `hasErrors` halts the
-  // pipeline before then.
-  DIVERGENT: "divergent",
-});
-
 const TagKind = Object.freeze({
   STRUCT: "struct", UNION: "union", ENUM: "enum",
   GC_STRUCT: "gc_struct",
@@ -2011,12 +1988,13 @@ const UopStr = Object.freeze({
 // canonical instances (one PointerType per pointee, one ArrayType per
 // (elem, size), etc.), so `t1 === t2` is meaningful for structural equality.
 //
-// `kind` is kept as a string discriminator (parallel to the JS class) so
-// that existing `t.kind === TypeKind.X` checks throughout the codebase keep
-// working alongside the more precise `t instanceof XType` form.
+// To narrow a type, use `instanceof XType` for parametric/aggregate kinds
+// (`PointerType`, `ArrayType`, `TagType`, `GCStructHeapType`, ...) or `===`
+// identity against the singletons (`t === Types.TINT`, `t === Types.TVOID`,
+// etc.) for primitive and ref-singleton kinds. Predicate methods on
+// `TypeInfo` (`isInteger`, `isPointer`, `isVoid`, ...) wrap the common ones.
 class TypeInfo {
-  constructor(kind, size, align, isComplete) {
-    this.kind = kind;
+  constructor(size, align, isComplete) {
     this.size = size;
     this.align = align;
     this.isComplete = isComplete;
@@ -2142,20 +2120,21 @@ class TypeInfo {
     return out;
   }
   // Subclass override: kind-specific spelling without qualifiers.
-  // Default falls back to the kind discriminator (sufficient for primitives).
-  _toString() { return this.kind; }
+  // Subclasses must implement; the abstract base intentionally throws.
+  _toString() { throw new Error(`${this.constructor.name}._toString not implemented`); }
 
-  // Top-level structural equality. Common shape: same kind, same qualifiers,
+  // Top-level structural equality. Common shape: same class, same qualifiers,
   // then per-subclass `_eqStructure`. Identity (===) short-circuits since
   // factories canonicalize.
   isCompatibleWith(other, _seen) {
     if (this === other) return true;
-    if (!other || this.kind !== other.kind) return false;
+    if (!other || this.constructor !== other.constructor) return false;
     if (this.isConst !== other.isConst || this.isVolatile !== other.isVolatile) return false;
     return this._eqStructure(other, _seen);
   }
-  // Subclass override: structural comparison given matching kind+qualifiers.
-  // Default true — primitives are equal by kind alone.
+  // Subclass override: structural comparison given matching class + qualifiers.
+  // Default true — singleton primitives that reach here are equal because
+  // identity already matched above.
   _eqStructure(_other, _seen) { return true; }
 }
 
@@ -2168,42 +2147,53 @@ class TypeInfo {
 // DivergentType. They share the trivial qualifier-clone idiom — each
 // concrete subclass is also the cloning factory for its own kind.
 class PrimitiveType extends TypeInfo {
-  constructor(kind, size, align, isComplete) {
-    super(kind, size, align, isComplete);
+  constructor(size, align, isComplete) {
+    super(size, align, isComplete);
   }
+  // Two primitive instances of the same class but different identity (e.g.
+  // TINT vs TUINT — both IntegerType, distinct singletons) are NOT
+  // compatible. The base `isCompatibleWith` short-circuits true on identity,
+  // so reaching `_eqStructure` means they're different — return false.
+  _eqStructure(_other, _seen) { return false; }
 }
 
 // Integer types: bool, char, signed/unsigned char/short/int/long/long long.
-// `isSigned` distinguishes the signedness of a given width.
+// `isSigned` distinguishes the signedness of a given width. `name` is the C
+// spelling used by `toString()` (e.g. `"int"`, `"_Bool"`, `"unsigned long"`).
 class IntegerType extends PrimitiveType {
-  constructor(kind, size, align, isSigned) {
-    super(kind, size, align, true);
+  constructor(name, size, align, isSigned) {
+    super(size, align, true);
+    this.name = name;
     this.isSigned = isSigned;
     Object.seal(this);
   }
   isInteger()  { return true; }
   isUnsigned() { return !this.isSigned; }
-  _cloneForQualifier() { return new IntegerType(this.kind, this.size, this.align, this.isSigned); }
+  _toString()  { return this.name; }
+  _cloneForQualifier() { return new IntegerType(this.name, this.size, this.align, this.isSigned); }
 }
 
 // Floating-point types: float, double, long double.
 class FloatingType extends PrimitiveType {
-  constructor(kind, size, align) {
-    super(kind, size, align, true);
+  constructor(name, size, align) {
+    super(size, align, true);
+    this.name = name;
     Object.seal(this);
   }
   isFloatingPoint() { return true; }
-  _cloneForQualifier() { return new FloatingType(this.kind, this.size, this.align); }
+  _toString() { return this.name; }
+  _cloneForQualifier() { return new FloatingType(this.name, this.size, this.align); }
 }
 
 // `void`. Singleton; carried through pointer types as `void *` etc.
 // Has size/align of 0 and isComplete = false (cannot be a value type).
 class VoidType extends PrimitiveType {
   constructor() {
-    super(TypeKind.VOID, 0, 0, false);
+    super(0, 0, false);
     Object.seal(this);
   }
-  isVoid() { return true; }
+  isVoid()    { return true; }
+  _toString() { return "void"; }
   _cloneForQualifier() { return new VoidType(); }
 }
 
@@ -2211,9 +2201,10 @@ class VoidType extends PrimitiveType {
 // type once the initializer is known. Identity-compared (`t === TAUTO`).
 class AutoType extends PrimitiveType {
   constructor() {
-    super(TypeKind.AUTO, 0, 0, false);
+    super(0, 0, false);
     Object.seal(this);
   }
+  _toString() { return "auto"; }
   _cloneForQualifier() { return new AutoType(); }
 }
 
@@ -2221,9 +2212,10 @@ class AutoType extends PrimitiveType {
 // Identity-compared sentinel.
 class UnknownType extends PrimitiveType {
   constructor() {
-    super(TypeKind.UNKNOWN, 0, 0, false);
+    super(0, 0, false);
     Object.seal(this);
   }
+  _toString() { return "unknown"; }
   _cloneForQualifier() { return new UnknownType(); }
 }
 
@@ -2232,17 +2224,18 @@ class UnknownType extends PrimitiveType {
 // divergent operand as absorbing — the result is divergent.
 class DivergentType extends PrimitiveType {
   constructor() {
-    super(TypeKind.DIVERGENT, 0, 0, false);
+    super(0, 0, false);
     Object.seal(this);
   }
   isDivergent() { return true; }
+  _toString()   { return "divergent"; }
   _cloneForQualifier() { return new DivergentType(); }
 }
 
 // `T *` — a C pointer to T. Always 4 bytes (wasm32).
 class PointerType extends TypeInfo {
   constructor(baseType) {
-    super(TypeKind.POINTER, 4, 4, true);
+    super(4, 4, true);
     this.baseType = baseType;
     Object.seal(this);
   }
@@ -2256,7 +2249,7 @@ class PointerType extends TypeInfo {
 // incomplete array (e.g., `extern int a[];`).
 class ArrayType extends TypeInfo {
   constructor(baseType, size) {
-    super(TypeKind.ARRAY, baseType.size * size, baseType.align, size > 0);
+    super(baseType.size * size, baseType.align, size > 0);
     this.baseType = baseType;
     this.arraySize = size;
     Object.seal(this);
@@ -2276,7 +2269,7 @@ class ArrayType extends TypeInfo {
 // params" for the `f()` form vs `f(void)`).
 class FunctionType extends TypeInfo {
   constructor(returnType, paramTypes, isVarArg, hasUnspecifiedParams) {
-    super(TypeKind.FUNCTION, 0, 0, true);
+    super(0, 0, true);
     this.returnType = returnType;
     this.paramTypes = paramTypes;
     this.isVarArg = !!isVarArg;
@@ -2313,7 +2306,7 @@ class FunctionType extends TypeInfo {
 // AST.DTag with members (filled in once the body is parsed).
 class TagType extends TypeInfo {
   constructor(tagKind, tagName, size, align) {
-    super(TypeKind.TAG, size, align, false);
+    super(size, align, false);
     this.tagKind = tagKind;
     this.tagName = tagName;
     this.tagDecl = null;
@@ -2343,7 +2336,7 @@ class TagType extends TypeInfo {
 // link), and lazily produces its ref form via `pointer()`.
 class GCStructHeapType extends TypeInfo {
   constructor(tagName) {
-    super(TypeKind.GC_STRUCT_HEAP, 0, 0, false);
+    super(0, 0, false);
     this.tagKind = TagKind.GC_STRUCT;
     this.tagName = tagName;
     this.tagDecl = null;       // set when struct definition is parsed
@@ -2393,7 +2386,7 @@ class GCStructHeapType extends TypeInfo {
 // forward-declared struct gets defined later).
 class GCStructRefType extends TypeInfo {
   constructor(heap) {
-    super(TypeKind.GC_STRUCT, 0, 0, heap.isComplete);
+    super(0, 0, heap.isComplete);
     this._heap = heap;
     Object.seal(this);
   }
@@ -2425,7 +2418,7 @@ class GCStructRefType extends TypeInfo {
 // already references by design).
 class GCArrayType extends TypeInfo {
   constructor(elementType) {
-    super(TypeKind.GC_ARRAY, 0, 0, true);
+    super(0, 0, true);
     this.baseType = elementType;
     this._wasmGCTypeIdx = -1;
     Object.seal(this);
@@ -2443,19 +2436,23 @@ class GCArrayType extends TypeInfo {
 // `__externref` (nullable) and `__refextern` (non-nullable) — opaque host
 // references. Singletons.
 class ExternRefType extends TypeInfo {
-  constructor() { super(TypeKind.EXTERNREF, 0, 0, false); Object.seal(this); }
+  constructor() { super(0, 0, false); Object.seal(this); }
   isRef() { return true; }
+  // Historically the spelling has been the bare wasm name (no `__` prefix).
+  // Several test diagnostics check this string verbatim — keep it.
+  _toString() { return "externref"; }
   _cloneForQualifier() { return new ExternRefType(); }
 }
 class RefExternType extends TypeInfo {
-  constructor() { super(TypeKind.REFEXTERN, 0, 0, false); Object.seal(this); }
+  constructor() { super(0, 0, false); Object.seal(this); }
   isRef() { return true; }
+  _toString() { return "refextern"; }
   _cloneForQualifier() { return new RefExternType(); }
 }
 
 // `__eqref` — the GC-universe top type (eq lattice). Singleton.
 class EqRefType extends TypeInfo {
-  constructor() { super(TypeKind.EQREF, 0, 0, true); Object.seal(this); }
+  constructor() { super(0, 0, true); Object.seal(this); }
   isRef()   { return true; }
   isGCRef() { return true; }
   pointer() { return this; }   // collapse — `__eqref *` is meaningless
@@ -2469,23 +2466,23 @@ class EqRefType extends TypeInfo {
 const TUNKNOWN = new UnknownType();
 const TVOID = new VoidType();
 const TDIVERGENT = new DivergentType();
-const TBOOL   = new IntegerType(TypeKind.BOOL,   1, 1, /* isSigned */ false);
+const TBOOL   = new IntegerType("_Bool",          1, 1, /* isSigned */ false);
 // `char` signedness is implementation-defined in C; we treat plain char as
 // signed (matching most platforms and the existing isUnsigned() behavior).
-const TCHAR   = new IntegerType(TypeKind.CHAR,   1, 1, true);
-const TSCHAR  = new IntegerType(TypeKind.SCHAR,  1, 1, true);
-const TUCHAR  = new IntegerType(TypeKind.UCHAR,  1, 1, false);
-const TSHORT  = new IntegerType(TypeKind.SHORT,  2, 2, true);
-const TUSHORT = new IntegerType(TypeKind.USHORT, 2, 2, false);
-const TINT    = new IntegerType(TypeKind.INT,    4, 4, true);
-const TUINT   = new IntegerType(TypeKind.UINT,   4, 4, false);
-const TLONG   = new IntegerType(TypeKind.LONG,   4, 4, true);
-const TULONG  = new IntegerType(TypeKind.ULONG,  4, 4, false);
-const TLLONG  = new IntegerType(TypeKind.LLONG,  8, 8, true);
-const TULLONG = new IntegerType(TypeKind.ULLONG, 8, 8, false);
-const TFLOAT   = new FloatingType(TypeKind.FLOAT,   4, 4);
-const TDOUBLE  = new FloatingType(TypeKind.DOUBLE,  8, 8);
-const TLDOUBLE = new FloatingType(TypeKind.LDOUBLE, 8, 8);
+const TCHAR   = new IntegerType("char",           1, 1, true);
+const TSCHAR  = new IntegerType("signed char",    1, 1, true);
+const TUCHAR  = new IntegerType("unsigned char",  1, 1, false);
+const TSHORT  = new IntegerType("short",          2, 2, true);
+const TUSHORT = new IntegerType("unsigned short", 2, 2, false);
+const TINT    = new IntegerType("int",            4, 4, true);
+const TUINT   = new IntegerType("unsigned int",   4, 4, false);
+const TLONG   = new IntegerType("long",           4, 4, true);
+const TULONG  = new IntegerType("unsigned long",  4, 4, false);
+const TLLONG  = new IntegerType("long long",      8, 8, true);
+const TULLONG = new IntegerType("unsigned long long", 8, 8, false);
+const TFLOAT   = new FloatingType("float",       4, 4);
+const TDOUBLE  = new FloatingType("double",      8, 8);
+const TLDOUBLE = new FloatingType("long double", 8, 8);
 const TEXTERNREF = new ExternRefType();
 const TREFEXTERN = new RefExternType();
 const TEQREF = new EqRefType();
@@ -2540,13 +2537,12 @@ function validateNoHeapInValueType(type, errorFn) {
     if (!t || seen.has(t)) return;
     seen.add(t);
     const u = t.removeQualifiers();
-    if (u.kind === TypeKind.GC_STRUCT_HEAP) {
+    if (u.isGCStructHeap()) {
       errorFn(`'${u.toString()}' (heap form) cannot appear as a value type — use the ref form '${u.toString()} *'`);
       return;
     }
-    if (u.kind === TypeKind.POINTER || u.kind === TypeKind.ARRAY) walk(u.baseType);
-    else if (u.kind === TypeKind.GC_ARRAY) walk(u.baseType);
-    else if (u.kind === TypeKind.FUNCTION) {
+    if (u.isPointer() || u.isArray() || u.isGCArray()) walk(u.baseType);
+    else if (u.isFunction()) {
       walk(u.returnType);
       for (const pt of (u.paramTypes || [])) walk(pt);
     }
@@ -2600,7 +2596,11 @@ function computeStructLayout(members, isPacked = false) {
         continue;
       }
 
-      if (inBitField && m.type.kind === bfUnitType.kind && m.type.size === bfUnitType.size &&
+      // Bit-fields share a storage unit only if they have the same primitive
+      // type (including signedness — `int : 4` and `unsigned : 4` go in
+      // separate units). Identity comparison on removeQualifiers handles that:
+      // each integer flavor is a unique singleton.
+      if (inBitField && m.type.removeQualifiers() === bfUnitType.removeQualifiers() &&
           bfBitsUsed + bw <= unitBits) {
         // Fits in current storage unit
         m.bitOffset = bfBitsUsed;
@@ -2726,7 +2726,7 @@ function usualArithmeticConversions(a, b) {
 }
 
 return {
-  TypeKind, TagKind, StorageClass, AllocClass, LabelKind,
+  TagKind, StorageClass, AllocClass, LabelKind,
   IntrinsicKind, BopStr, UopStr,
   TypeInfo,
   PrimitiveType, IntegerType, FloatingType,
@@ -3095,13 +3095,10 @@ class Expr {
       if (!(type instanceof Types.TypeInfo) || !type.isArray()) {
         throw new Error(`EString: type must be an array; got ${type}`);
       }
-      const elemKind = type.baseType?.kind;
-      const validElem =
-        elemKind === Types.TypeKind.CHAR || elemKind === Types.TypeKind.SCHAR ||
-        elemKind === Types.TypeKind.UCHAR || elemKind === Types.TypeKind.SHORT ||
-        elemKind === Types.TypeKind.USHORT || elemKind === Types.TypeKind.INT ||
-        elemKind === Types.TypeKind.UINT;
-      if (!validElem) {
+      // String literal element types: any integer up to 32 bits (CHAR..UINT
+      // covers narrow string, wide string, char32_t-style literals).
+      const elem = type.baseType;
+      if (!elem || !elem.isInteger() || elem.size > 4) {
         throw new Error(`EString: element type must be a character/integer kind suitable for a string literal; got ${type.baseType}`);
       }
       if (!Array.isArray(value)) {
@@ -3245,8 +3242,8 @@ class Expr {
       // longjmp lowering) do the same.
       const calleeType = callee.type;
       let returnType = Types.TINT;
-      if (calleeType.kind === Types.TypeKind.POINTER &&
-          calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
+      if (calleeType.isPointer() &&
+          calleeType.baseType.isFunction()) {
         returnType = calleeType.baseType.returnType;
       }
       super(loc, returnType, [callee, ...args], Linearity.LINEAR);
@@ -4056,7 +4053,7 @@ function makeUnary(loc, op, operand) {
         fatalError(loc, `Cannot take address of bit-field member '${operand.memberDecl.name}'`);
       }
       if (isRef) {
-        fatalError(loc, `Cannot take address of ${operand.type.removeQualifiers().kind} variable`);
+        fatalError(loc, `Cannot take address of ${operand.type.removeQualifiers().toString()} variable`);
       }
       if (operand instanceof EMember && operand.base && operand.base.type &&
           operand.base.type.removeQualifiers().isGCStruct()) {
@@ -4228,12 +4225,12 @@ function makeArrow(loc, base, name) {
   // struct type and silently build an EArrow with a non-pointer base
   // — codegen later crashes dereferencing tagDecl on something that
   // isn't a tag.
-  if (bt.kind !== Types.TypeKind.POINTER && !bt.isDivergent()) {
+  if (!bt.isPointer() && !bt.isDivergent()) {
     reportError(loc,
       `left operand of '->' must be a pointer to struct or union, got '${base.type.toString()}'`);
     return new EArrow(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
   }
-  if (bt.kind === Types.TypeKind.POINTER) {
+  if (bt.isPointer()) {
     const pointee = bt.baseType.removeQualifiers();
     if (!pointee.isStruct() && !pointee.isUnion() && !pointee.isDivergent()) {
       reportError(loc,
@@ -4284,7 +4281,7 @@ function makeSubscript(loc, base, index) {
   // Reverse-order subscript (`5[arr]`) — rejected as our compiler
   // doesn't support C99's commutative form.
   if (baseUt.isInteger() &&
-      (idxUt.kind === Types.TypeKind.POINTER || idxUt.kind === Types.TypeKind.ARRAY)) {
+      (idxUt.isPointer() || idxUt.isArray())) {
     reportError(loc, "Commutative subscript (e.g. 0[arr]) is not supported; write arr[0] instead");
   }
   // Base must be pointer / array / GC-array. Without this check
@@ -4292,9 +4289,9 @@ function makeSubscript(loc, base, index) {
   // non-pointer base value (e.g. a struct's wasm representation),
   // producing a wild memory read.
   const baseIsIndexable =
-    baseUt.kind === Types.TypeKind.ARRAY ||
-    baseUt.kind === Types.TypeKind.POINTER ||
-    baseUt.kind === Types.TypeKind.GC_ARRAY;
+    baseUt.isArray() ||
+    baseUt.isPointer() ||
+    baseUt.isGCArray();
   // Refs that aren't GC arrays (e.g. eqref, GC structs, externref) —
   // give the helpful `__array(T)` hint. GC_ARRAY is handled as
   // indexable above; isRef() also matches it, so the order matters.
@@ -4315,7 +4312,7 @@ function makeSubscript(loc, base, index) {
   let elemType = Types.TINT;
   if (baseIsIndexable) elemType = baseUt.baseType;
   // GC arrays don't decay; keep them as the array operand.
-  const arrayOperand = baseUt.kind === Types.TypeKind.GC_ARRAY ? base : maybeDecay(base);
+  const arrayOperand = baseUt.isGCArray() ? base : maybeDecay(base);
   return new ESubscript(loc, elemType, arrayOperand, index);
 }
 
@@ -4333,8 +4330,8 @@ function makeCall(loc, callee, args) {
   callee = maybeDecay(callee);
   const calleeType = callee.type;
   let funcType = null;
-  if (calleeType.kind === Types.TypeKind.POINTER &&
-      calleeType.baseType.kind === Types.TypeKind.FUNCTION) {
+  if (calleeType.isPointer() &&
+      calleeType.baseType.isFunction()) {
     funcType = calleeType.baseType;
   } else if (!calleeType.isDivergent()) {
     // The callee must be a function or pointer-to-function (after
@@ -6483,7 +6480,7 @@ class Parser {
 
           const { type: mType, name: mName } = this.parseDeclarator(memType);
           if (mType.removeQualifiers().isRef()) {
-            this.error(this.peek(), `${mType.removeQualifiers().kind} cannot be used as a struct/union member`);
+            this.error(this.peek(), `${mType.removeQualifiers().toString()} cannot be used as a struct/union member`);
           }
           Types.validateNoHeapInValueType(mType, msg => this.error(this.peek(), msg));
 
@@ -6545,7 +6542,7 @@ class Parser {
         const varMembers = members.filter(m => m instanceof AST.DVar);
         for (let i = 0; i < varMembers.length; i++) {
           const mv = varMembers[i];
-          if (mv.type.kind === Types.TypeKind.ARRAY && mv.type.arraySize === 0) {
+          if (mv.type.isArray() && mv.type.arraySize === 0) {
             if (tagKind === Types.TagKind.UNION) {
               this.error(this.peek(), "flexible array member not allowed in a union");
             }
@@ -6632,10 +6629,10 @@ class Parser {
           firstM = false;
           const { type: mType, name: mName } = this.parseDeclarator(memBaseType);
           if (!mName) this.error(this.peek(), "GC struct members must be named");
-          if (mType.kind === Types.TypeKind.ARRAY) {
+          if (mType.isArray()) {
             this.error(this.peek(), "C arrays are not allowed as GC struct members; use __array(T) instead");
           }
-          if (mType.kind === Types.TypeKind.FUNCTION) {
+          if (mType.isFunction()) {
             this.error(this.peek(), "function types are not allowed as GC struct members");
           }
           Types.validateNoHeapInValueType(mType, msg => this.error(this.peek(), msg));
@@ -6700,10 +6697,10 @@ class Parser {
       elemType = decl.type;
     }
     this.expect(")");
-    if (elemType.kind === Types.TypeKind.ARRAY) {
+    if (elemType.isArray()) {
       this.error(this.peek(), "C arrays are not allowed as __array element type");
     }
-    if (elemType.kind === Types.TypeKind.FUNCTION) {
+    if (elemType.isFunction()) {
       this.error(this.peek(), "function types are not allowed as __array element type");
     }
     return Types.gcArrayOf(elemType);
@@ -6788,14 +6785,14 @@ class Parser {
       }
       return r;
     }
-    if (innerType.kind === Types.TypeKind.POINTER) {
+    if (innerType.isPointer()) {
       const newBase = this.combineDeclaratorTypes(innerType.baseType, outerBase, outerResult);
       const result = newBase.pointer();
       if (innerType.isConst) return result.addConst();
       if (innerType.isVolatile) return result.addVolatile();
       return result;
     }
-    if (innerType.kind === Types.TypeKind.ARRAY) {
+    if (innerType.isArray()) {
       const newBase = this.combineDeclaratorTypes(innerType.baseType, outerBase, outerResult);
       return Types.arrayOf(newBase, innerType.arraySize);
     }
@@ -6913,12 +6910,12 @@ class Parser {
           // Compound literal
           let initList = this.parseInitList(castType);
           // Handle string-initialized char array (e.g., `(char[]){"hi"}`).
-          if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
+          if (castType.isArray() && castType.arraySize === 0 &&
               initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
             castType = initList.elements[0].type;
             initList = new AST.EInitList(initList.loc, castType,
               initList.elements, initList.designators, initList.unionMemberIndex);
-          } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
+          } else if (castType.isArray() && castType.arraySize === 0) {
             initList = normalizeInitList(initList, castType);
             castType = initList.type;
           } else if (castType.isAggregate()) {
@@ -6957,7 +6954,7 @@ class Parser {
             sType = decl.type;
           }
           this.expect(")");
-          if (sType.removeQualifiers().isRef()) this.error(this.peek(-1), `sizeof(${sType.removeQualifiers().kind}) is not allowed`);
+          if (sType.removeQualifiers().isRef()) this.error(this.peek(-1), `sizeof(${sType.removeQualifiers().toString()}) is not allowed`);
           return new AST.ESizeofType(sizeofLoc, Types.TULONG, sType);
         }
         const expr = this.parseExpression();
@@ -6981,7 +6978,7 @@ class Parser {
           aType = decl.type;
         }
         this.expect(")");
-        if (aType.kind === Types.TypeKind.FUNCTION) {
+        if (aType.isFunction()) {
           this.error(this.peek(-1), "_Alignof cannot be applied to a function type");
         }
         if (!aType.isComplete) {
@@ -7056,7 +7053,7 @@ class Parser {
         const decl = this.parseDeclarator(elemType);
         elemType = decl.type;
       }
-      if (elemType.kind === Types.TypeKind.ARRAY || elemType.kind === Types.TypeKind.FUNCTION) {
+      if (elemType.isArray() || elemType.isFunction()) {
         this.error(newTok, `__array_new element type must not be a C array or function`);
       }
       const arrType = Types.gcArrayOf(elemType);
@@ -7245,7 +7242,7 @@ class Parser {
       const args = [];
       while (this.matchText(",")) args.push(this.parseAssignmentExpression());
       this.expect(")");
-      if (elemType.kind === Types.TypeKind.ARRAY || elemType.kind === Types.TypeKind.FUNCTION) {
+      if (elemType.isArray() || elemType.isFunction()) {
         this.error(tok, `__array_of element type must not be a C array or function`);
       }
       // Reject implicit non-zero int → non-eqref ref element (silent-null bug).
@@ -7713,12 +7710,12 @@ class Parser {
           if (this.atText("{")) {
             // Compound literal: (type){...}
             let initList = this.parseInitList(castType);
-            if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0 &&
+            if (castType.isArray() && castType.arraySize === 0 &&
                 initList.elements.length === 1 && initList.elements[0] instanceof AST.EString) {
               castType = initList.elements[0].type;
               initList = new AST.EInitList(initList.loc, castType,
                 initList.elements, initList.designators, initList.unionMemberIndex);
-            } else if (castType.kind === Types.TypeKind.ARRAY && castType.arraySize === 0) {
+            } else if (castType.isArray() && castType.arraySize === 0) {
               initList = normalizeInitList(initList, castType);
               castType = initList.type;
             } else if (castType.isAggregate()) {
@@ -7974,8 +7971,8 @@ class Parser {
         if (this.atText("{")) {
           // Nested init list - determine element type for sub-list
           let elemType = Types.TINT;
-          if (type.kind === Types.TypeKind.ARRAY) elemType = type.baseType;
-          else if (type.kind === Types.TypeKind.TAG && type.tagDecl && type.tagDecl.members) {
+          if (type.isArray()) elemType = type.baseType;
+          else if (type.isTag() && type.tagDecl && type.tagDecl.members) {
             const varMembers = getVarMembers(type.tagDecl);
             if (elements.length < varMembers.length) {
               elemType = varMembers[elements.length].type;
@@ -8366,7 +8363,7 @@ class Parser {
       Types.validateNoHeapInValueType(type, msg => this.error(this.peek(), msg));
 
       // Local extern function declaration (e.g. extern int f(void);)
-      if (type.kind === Types.TypeKind.FUNCTION) {
+      if (type.isFunction()) {
         if (specs.requestedAlignment > 0) {
           this.error(this.peek(-1), "_Alignas cannot be applied to a function declaration");
         }
@@ -8423,14 +8420,14 @@ class Parser {
           }
         }
         // Handle string-initialized char array
-        if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
+        if (type.isArray() && type.arraySize === 0 && dvar.initExpr &&
             dvar.initExpr instanceof AST.EString) {
           type = dvar.initExpr.type;
           dvar.type = type;
         }
         // Normalize init list
         if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
-          if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
+          if (type.isArray() && type.arraySize === 0) {
             dvar.initExpr = normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
             dvar.type = type;
@@ -8519,7 +8516,7 @@ class Parser {
       Types.validateNoHeapInValueType(type, msg => this.error(this.peek(), msg));
 
       // K&R parameter declarations: parse type declarations between ')' and '{'
-      if (decl._isKnR && type.kind === Types.TypeKind.FUNCTION &&
+      if (decl._isKnR && type.isFunction() &&
           !this.atText("{") && !this.atText(";") && !this.atText(",")) {
         const knrParamNames = decl._paramNames || [];
         const knrParamTypes = [...(type.paramTypes || [])];
@@ -8543,7 +8540,7 @@ class Parser {
       // pointer/array/function types so a typedef like
       //   typedef __struct Foo *(*Fp)(int); Fp get_fp(void);
       // also gets caught when Foo is incomplete.
-      if (type.kind === Types.TypeKind.FUNCTION) {
+      if (type.isFunction()) {
         const seen = new Set();
         const checkComplete = (t) => {
           if (!t || seen.has(t)) return;
@@ -8552,9 +8549,9 @@ class Parser {
           if (u.isGCStruct() && !u.isComplete) {
             this.error(this.peek(), `function '${name}' references incomplete GC struct '${u.tagName}' in its signature; define '${u.tagName}' first`);
           }
-          if (u.kind === Types.TypeKind.POINTER || u.kind === Types.TypeKind.ARRAY) checkComplete(u.baseType);
-          else if (u.kind === Types.TypeKind.GC_ARRAY) checkComplete(u.baseType);
-          else if (u.kind === Types.TypeKind.FUNCTION) {
+          if (u.isPointer() || u.isArray()) checkComplete(u.baseType);
+          else if (u.isGCArray()) checkComplete(u.baseType);
+          else if (u.isFunction()) {
             checkComplete(u.returnType);
             for (const pt of (u.paramTypes || [])) checkComplete(pt);
           }
@@ -8564,7 +8561,7 @@ class Parser {
       }
 
       // Check if this is a function definition
-      if (type.kind === Types.TypeKind.FUNCTION && this.atText("{")) {
+      if (type.isFunction() && this.atText("{")) {
         if (specs.requestedAlignment > 0) {
           this.error(this.peek(-1), "_Alignas cannot be applied to a function declaration");
         }
@@ -8639,7 +8636,7 @@ class Parser {
       }
 
       // Function declaration (no body)
-      if (type.kind === Types.TypeKind.FUNCTION) {
+      if (type.isFunction()) {
         if (specs.requestedAlignment > 0) {
           this.error(this.peek(-1), "_Alignas cannot be applied to a function declaration");
         }
@@ -8709,14 +8706,14 @@ class Parser {
           }
         }
         // Handle string-initialized char array
-        if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0 && dvar.initExpr &&
+        if (type.isArray() && type.arraySize === 0 && dvar.initExpr &&
             dvar.initExpr instanceof AST.EString) {
           type = Types.arrayOf(type.baseType, dvar.initExpr.type.arraySize);
           dvar.type = type;
         }
         // Normalize init list
         if (dvar.initExpr && dvar.initExpr instanceof AST.EInitList) {
-          if (type.kind === Types.TypeKind.ARRAY && type.arraySize === 0) {
+          if (type.isArray() && type.arraySize === 0) {
             dvar.initExpr = normalizeInitList(dvar.initExpr, type);
             type = dvar.initExpr.type;
             dvar.type = type;
@@ -8756,7 +8753,7 @@ class Parser {
       const starTok = this.peek(-1);
       // GC arrays don't take the `*` sugar — there's no C "pointer to array"
       // idiom to mirror. Reject it explicitly so users use `__array(T)` directly.
-      if (type.kind === Types.TypeKind.GC_ARRAY) {
+      if (type.isGCArray()) {
         this.error(starTok, `'__array(...)' types do not take a '*' — write '__array(T) name' (the array is already a reference)`);
       }
       // Double-`*` on a GC struct (`__struct Foo **`) — wasm has no `(ref ref T)`.
@@ -8857,7 +8854,7 @@ class Parser {
               // pointer itself: `T *const` is a const pointer to T.
               while (this.matchText("*")) {
                 const starTok = this.peek(-1);
-                if (pType.kind === Types.TypeKind.GC_ARRAY) {
+                if (pType.isGCArray()) {
                   this.error(starTok, `'__array(...)' types do not take a '*' — write '__array(T) name' (the array is already a reference)`);
                 }
                 if (pType.isGCStruct()) {
@@ -10412,7 +10409,7 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
         if (fieldEntries.length > 0) wmod.fieldNames.push({ typeIdx: idx, fields: fieldEntries });
       }
     }
-  } else if (type.kind === Types.TypeKind.GC_ARRAY) {
+  } else if (type.isGCArray()) {
     const elem = gcStorageTypeOf(wmod, type.baseType);
     const key = 'A(' + gcStorageKey(elem) + ')';
     const pending = wmod._gcPendingIdx.get(type);
@@ -12528,7 +12525,7 @@ class CodeGenerator {
     switch (expr.constructor) {
       case AST.EInt: {
         const type = expr.type;
-        if (type.kind === Types.TypeKind.LLONG || type.kind === Types.TypeKind.ULLONG) {
+        if (type === Types.TLLONG || type === Types.TULLONG) {
           this.body.i64Const(expr.value);
         } else {
           this.body.i32Const(Number(BigInt.asIntN(32, expr.value)));
@@ -19110,7 +19107,6 @@ var _exports = {
   formatToken: Lexer.formatToken,
   encodeUtf8: Lexer.encodeUtf8,
   // Types
-  TypeKind: Types.TypeKind,
   TagKind: Types.TagKind,
   StorageClass: Types.StorageClass,
   TypeInfo: Types.TypeInfo,
