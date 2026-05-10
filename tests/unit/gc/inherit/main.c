@@ -43,18 +43,18 @@ int main(void) {
 
   // ref.test through inheritance chain
   __struct Animal *aref = p;
-  printf("aref is Animal: %d\n", __ref_test(__struct Animal *, aref));   // 1
-  printf("aref is Dog: %d\n", __ref_test(__struct Dog *, aref));         // 1
-  printf("aref is Puppy: %d\n", __ref_test(__struct Puppy *, aref));     // 1
+  printf("aref is Animal: %d\n", __ref_test(__struct Animal, aref));   // 1
+  printf("aref is Dog: %d\n", __ref_test(__struct Dog, aref));         // 1
+  printf("aref is Puppy: %d\n", __ref_test(__struct Puppy, aref));     // 1
 
   __struct Animal *aref2 = d;
-  printf("aref2 is Puppy: %d\n", __ref_test(__struct Puppy *, aref2));   // 0 (Dog isn't a Puppy)
+  printf("aref2 is Puppy: %d\n", __ref_test(__struct Puppy, aref2));   // 0 (Dog isn't a Puppy)
 
   // Explicit downcast
-  __struct Dog *d2 = __ref_cast(__struct Dog *, aref);
+  __struct Dog *d2 = __ref_cast(__struct Dog, aref);
   printf("downcast d2: %d %d\n", d2->id, d2->paws);
 
-  __struct Puppy *p2 = __ref_cast(__struct Puppy *, aref);
+  __struct Puppy *p2 = __ref_cast(__struct Puppy, aref);
   printf("downcast p2: %d %d %d\n", p2->id, p2->paws, p2->cuteness);
 
   return 0;

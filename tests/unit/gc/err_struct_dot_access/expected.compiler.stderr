@@ -1,0 +1,2 @@
+Got 1 parse errors in tests/unit/gc/err_struct_dot_access/main.c.
+tests/unit/gc/err_struct_dot_access/main.c:6: error: '.' on GC struct ref '__struct Foo *' is not allowed — use '->'

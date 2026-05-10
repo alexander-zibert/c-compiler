@@ -10,7 +10,7 @@ int main(void) {
   __externref ext = __ref_as_extern(f);
   printf("ext null: %d\n", ext == 0);
   __eqref any = __ref_as_eq(ext);
-  __struct Foo *f2 = __ref_cast(__struct Foo *, any);
+  __struct Foo *f2 = __ref_cast(__struct Foo, any);
   printf("recovered: %d %d\n", f2->x, f2->y);
   printf("same ref: %d\n", f == f2);
 
@@ -18,9 +18,9 @@ int main(void) {
   __struct Bar *b = __new(__struct Bar, 99);
   __eqref any_f = __ref_as_eq(__ref_as_extern(f));
   __eqref any_b = __ref_as_eq(__ref_as_extern(b));
-  printf("any_f is Foo: %d\n", __ref_test(__struct Foo *, any_f));   // 1
-  printf("any_f is Bar: %d\n", __ref_test(__struct Bar *, any_f));   // 0
-  printf("any_b is Bar: %d\n", __ref_test(__struct Bar *, any_b));   // 1
+  printf("any_f is Foo: %d\n", __ref_test(__struct Foo, any_f));   // 1
+  printf("any_f is Bar: %d\n", __ref_test(__struct Bar, any_f));   // 0
+  printf("any_b is Bar: %d\n", __ref_test(__struct Bar, any_b));   // 1
 
   // anyref + array
   __array(int) arr = __array_of(int, 1, 2, 3);

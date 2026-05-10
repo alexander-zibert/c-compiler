@@ -29,7 +29,7 @@ void test_gc_ref_via_anyref(void) {
   printf("=== gc ref via anyref ===\n");
   __struct Point *p = __new(__struct Point, 7, 11);
   __eqref ap = __cast(__eqref, p);          // upcast (no-op)
-  __struct Point *p2 = __cast(__struct Point *, ap);  // downcast (ref.cast)
+  __struct Point *p2 = __cast(__struct Point, ap);  // downcast (ref.cast)
   printf("recovered: %d %d\n", p2->x, p2->y);
   printf("identity: %d\n", p == p2);           // 1 (same ref)
 }
@@ -46,11 +46,11 @@ void test_discriminated_union(void) {
     else if (i == 2) store = __cast(__eqref, c);
     else store = __cast(__eqref, 2.5);
 
-    if (__ref_test(__struct Point *, store)) {
-      __struct Point *q = __cast(__struct Point *, store);
+    if (__ref_test(__struct Point, store)) {
+      __struct Point *q = __cast(__struct Point, store);
       printf("point: (%d,%d)\n", q->x, q->y);
-    } else if (__ref_test(__struct Color *, store)) {
-      __struct Color *col = __cast(__struct Color *, store);
+    } else if (__ref_test(__struct Color, store)) {
+      __struct Color *col = __cast(__struct Color, store);
       printf("color: (%d,%d,%d)\n", col->r, col->g, col->b);
     } else {
       // Could be int, double, or any other shape — we don't introspect
@@ -66,7 +66,7 @@ void test_extern_bridge(void) {
   // GC → extern → anyref → GC (full round trip)
   __externref e = __cast(__externref, p);
   __eqref a = __cast(__eqref, e);
-  __struct Point *p2 = __cast(__struct Point *, a);
+  __struct Point *p2 = __cast(__struct Point, a);
   printf("round-trip: %d %d\n", p2->x, p2->y);
   printf("identity preserved: %d\n", p == p2);
 }

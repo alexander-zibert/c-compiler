@@ -45,14 +45,14 @@ int main(void) {
 
   // Cast result via __ref_cast
   __struct Animal *a = d;
-  auto downcast = __ref_cast(__struct Dog *, a);
+  auto downcast = __ref_cast(__struct Dog, a);
   printf("%d %d\n", downcast->id, downcast->paws);
 
   // anyref / extern bridge with auto
   auto ext = __ref_as_extern(p);
   printf("ext null: %d\n", ext == 0);
   auto any = __ref_as_eq(ext);
-  printf("any is Point: %d\n", __ref_test(__struct Point *, any));
+  printf("any is Point: %d\n", __ref_test(__struct Point, any));
 
   return 0;
 }

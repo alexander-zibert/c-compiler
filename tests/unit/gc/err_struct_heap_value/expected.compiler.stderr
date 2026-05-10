@@ -1,0 +1,2 @@
+Got 1 parse errors in tests/unit/gc/err_struct_heap_value/main.c.
+tests/unit/gc/err_struct_heap_value/main.c:5: error: '__struct Foo' (heap form) cannot appear as a value type — use the ref form '__struct Foo *'

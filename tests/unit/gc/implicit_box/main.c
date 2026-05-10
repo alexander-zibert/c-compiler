@@ -3,8 +3,8 @@
 __struct Point { int x; int y; };
 
 void describe(__eqref x) {
-  if (__ref_test(__struct Point *, x)) {
-    __struct Point *p = __cast(__struct Point *, x);
+  if (__ref_test(__struct Point, x)) {
+    __struct Point *p = __cast(__struct Point, x);
     printf("point %d %d\n", p->x, p->y);
   } else {
     printf("primitive\n");
@@ -55,7 +55,7 @@ int main(void) {
   // GC ref → __eqref (subtype upcast — already worked before, kept here)
   __struct Point *p = __new(__struct Point, 5, 10);
   __eqref ep = p;                                // implicit upcast
-  __struct Point *p2 = __cast(__struct Point *, ep);
+  __struct Point *p2 = __cast(__struct Point, ep);
   printf("identity: %d\n", p == p2);
 
   // Explicit non-zero int → typed ref still rejected (only __eqref auto-boxes)

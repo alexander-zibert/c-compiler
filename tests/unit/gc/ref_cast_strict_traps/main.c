@@ -6,7 +6,7 @@ __struct Foo { int x; };
 
 int main(void) {
   __eqref e = 0;
-  __struct Foo *p = __ref_cast(__struct Foo *, e);
+  __struct Foo *p = __ref_cast(__struct Foo, e);
   printf("UNREACHABLE x=%d\n", p->x);
   return 0;
 }

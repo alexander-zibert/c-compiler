@@ -1,0 +1,2 @@
+Got 1 parse errors in tests/unit/gc/err_intrinsic_ref_form/main.c.
+tests/unit/gc/err_intrinsic_ref_form/main.c:7: error: __ref_test target takes the heap form '__struct Foo' (no '*'), got '__struct Foo *'

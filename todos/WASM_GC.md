@@ -8,19 +8,26 @@ The compiler supports Wasm GC heap-allocated structs and arrays managed by the e
 
 Wasm GC lets the host engine manage object lifetimes — no manual `malloc`/`free`, no linear-memory allocator, interop with host GC (JS objects can reference GC structs and vice versa without preventing collection). Enables C programs to create objects the JS side can inspect field-by-field, not just opaque blobs.
 
-## Preferred syntax (read this first)
+## Heap type vs. ref type
 
-A GC struct **value** is conceptually a reference to a heap-allocated object. To match C's pointer idioms (and to keep clang IDE tooling happy when shimmed), **always spell GC struct refs with `*`** and access fields with `->`:
+Mirroring real wasm, the C surface splits a GC struct into two distinct types:
+
+- **Heap type** `__struct Foo` — names the heap-allocated object type. It is *not* a value type. It only appears in heap-type-arg slots: struct definitions, `__new`, `__ref_test` / `__ref_cast` / `__ref_null`, `__extends`, and `__cast` when the target is a struct.
+- **Ref type** `__struct Foo *` — a reference to a `__struct Foo` on the heap. This is the value type — locals, fields, params, returns, and any other value position must use the ref form. Field access uses `->`.
 
 ```c
 __struct Point { int x; int y; };
 
-__struct Point *p = __new(__struct Point, 3, 7);
-p->x = 99;
+__struct Point *p = __new(__struct Point, 3, 7);   // value position → ref form
+p->x = 99;                                         // -> for field access
 printf("%d\n", p->x);
 ```
 
-For GC arrays, **never** add `*` — arrays don't have a "pointer to" idiom in C, and the compiler will reject `__array(T) *`:
+Bare `__struct Point` cannot be used as a value type — `__struct Point p;` is rejected with a hint to write `__struct Point *p;`. Likewise `__struct Point **` is rejected (no `(ref ref T)` in wasm). `.` on a struct ref is rejected — only `->` works.
+
+### GC arrays don't have a heap-form spelling
+
+For GC arrays we keep the existing `__array(T)` spelling as the value type — there's no parallel `__array(T) *` ref form, since C has no "pointer to array" idiom worth mirroring. The compiler rejects `__array(T) *`:
 
 ```c
 __array(int) arr = __array_new(int, 5);       // OK
@@ -30,18 +37,16 @@ __array_len(arr);
 __array(int) *bad = ...;                      // ERROR — write `__array(int) name`
 ```
 
-When an array's element type is a GC struct, spell that with `*` too:
+When an array's element type is a GC struct, spell that with `*` (the element type is itself a value type, which is the ref form):
 
 ```c
 __array(__struct Point *) ps = __array_of(__struct Point *,
     __new(__struct Point, 1, 2),
     __new(__struct Point, 3, 4));
-ps[0]->x;   // works because element type already says `*`
+ps[0]->x;
 ```
 
-### `__new` takes `__struct Foo` (no `*`)
-
-`__new` takes a struct type spelled as `__struct Foo` — keep the `__struct` keyword (so the IDE can navigate the type) but drop the `*` (since `__new` always returns a struct ref). `__struct_new` is an alias for `__new` if you prefer the more explicit spelling.
+### Allocation table
 
 | Allocation | Always write |
 |---|---|
@@ -50,17 +55,24 @@ ps[0]->x;   // works because element type already says `*`
 | Array (filled) | `__array_new(T, n, val)` |
 | Array (literal values) | `__array_of(T, v1, v2, ...)` |
 
-The first argument to `__new` is parsed as a general type expression, so any type that resolves to a GC struct works — including typedefs (`typedef __struct Foo MyT; __new(MyT, ...)`) and trailing `*` (`__new(__struct Foo *, ...)` is tolerated since `__struct Foo` and `__struct Foo *` are the same WASM type). The error case (e.g. `__new(int, ...)`) is caught after parsing.
+The first argument to `__new` must be a heap-form GC struct — including typedefs of the heap form (`typedef __struct Foo MyT; __new(MyT, ...)`). A typedef of the ref form (`typedef __struct Foo *PFoo; __new(PFoo, ...)`) is rejected.
 
 IDE macro shims: `#define __new(T, ...) ((T*){0})` (T = `__struct Foo` → `((struct Foo*){0})` with the `__struct=struct` shim), `#define __array_new(T, ...) ((__array(T)){0})`, `#define __array_of(T, ...) ((__array(T)){0})`.
 
-The same `*` consistency applies to type-arg intrinsics that can take a struct ref: `__ref_test(__struct Foo *, x)`, `__ref_cast(__struct Foo *, x)`, `__ref_null(__struct Foo *)`. **Exception**: `__extends(__struct Animal)` stays bare — it names a parent class (mirroring C++'s `class Dog : public Animal`), and the parent is always a struct, never an array, so there's no consistency pressure from another form.
+### Type-arg spellings (heap form everywhere)
 
-### Why both forms work
+All intrinsics that take a target *type* (not a value) use the heap form:
 
-Because GC refs are already "one level of indirection" semantically, the compiler treats `__struct Foo` and `__struct Foo *` (and `**`, `***` ...) as the same WASM type — they're aliases. Bare `__struct Foo p; p.x = 1;` works exactly the same as `__struct Foo *p; p->x = 1;`. The `*`/`->` form is just the **preferred** spelling because it matches C convention and is shimmable for clang IDE tooling.
+| Intrinsic | Spelling |
+|---|---|
+| `__new(T, ...)` | `__new(__struct Foo, ...)` |
+| `__ref_test(T, x)` / `__ref_test_null(T, x)` | `__ref_test(__struct Foo, x)` |
+| `__ref_cast(T, x)` / `__ref_cast_null(T, x)` | `__ref_cast(__struct Foo, x)` |
+| `__ref_null(T)` | `__ref_null(__struct Foo)` |
+| `__cast(T, x)` (when T is a GC struct) | `__cast(__struct Foo, x)` |
+| `__extends(T)` | `__extends(__struct Animal)` |
 
-The `gc/pointer_sugar` test exercises this equivalence explicitly. Every other test uses the preferred form.
+For `__array(T)` operands they accept the array type as-is (no separate heap-form spelling). For `__externref` / `__eqref` (which have no concrete heap-form spelling in C), pass the ref type itself: `__ref_null(__externref)`, `__cast(__eqref, x)`.
 
 ## `__struct` definition
 
@@ -98,7 +110,7 @@ __struct Dog {
 
 The compiler validates the prefix-match strictly. Fields after the parent's are the new additions for the subclass.
 
-Implicit upcast works automatically (Dog → Animal in function calls or assignments). Explicit downcast uses `__ref_cast(__struct Dog *, animal)`.
+Implicit upcast works automatically (Dog → Animal in function calls or assignments). Explicit downcast uses `__ref_cast(__struct Dog, animal)`.
 
 ## `__array(T)`
 
@@ -125,11 +137,11 @@ Packed field types (i8, i16) are supported for both struct fields and array elem
 |-----------|-------------|-------------|
 | `__ref_is_null(ref)` | `ref.is_null` | Null check |
 | `__ref_eq(a, b)` | `ref.eq` | Reference identity |
-| `__ref_null(__struct Foo *)` | `ref.null` | Typed null reference |
-| `__ref_test(__struct Foo *, ref)` | `ref.test` | Type test — false on null (instance-of) |
-| `__ref_test_null(__struct Foo *, ref)` | `ref.test null` | Type-lattice test — true on null |
-| `__ref_cast(__struct Foo *, ref)` | `ref.cast` | Downcast — traps on null or type mismatch |
-| `__ref_cast_null(__struct Foo *, ref)` | `ref.cast null` | Downcast — null passes through, traps only on type mismatch |
+| `__ref_null(__struct Foo)` | `ref.null` | Typed null reference (heap form) |
+| `__ref_test(__struct Foo, ref)` | `ref.test` | Type test — false on null (instance-of) |
+| `__ref_test_null(__struct Foo, ref)` | `ref.test null` | Type-lattice test — true on null |
+| `__ref_cast(__struct Foo, ref)` | `ref.cast` | Downcast — traps on null or type mismatch |
+| `__ref_cast_null(__struct Foo, ref)` | `ref.cast null` | Downcast — null passes through, traps only on type mismatch |
 | `__array_len(arr)` | `array.len` | Array length |
 | `__array_fill(...)` | `array.fill` | Bulk fill |
 | `__array_copy(...)` | `array.copy` | Bulk copy |
@@ -183,8 +195,8 @@ Discriminated unions become idiomatic:
 
 ```c
 __eqref store = ...;
-if (__ref_test(__struct Point *, store)) { ... }
-else if (__ref_test(__struct Color *, store)) { ... }
+if (__ref_test(__struct Point, store)) { ... }
+else if (__ref_test(__struct Color, store)) { ... }
 // boxed primitives don't have user-visible test types — treat the
 // "doesn't match any user struct" case as the primitive case.
 ```

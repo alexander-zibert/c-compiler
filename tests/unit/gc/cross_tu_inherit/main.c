@@ -21,12 +21,12 @@ int main(void) {
 
   // Downcast a Dog returned from helper TU
   __struct Animal *a = d;
-  __struct Dog *d2 = __ref_cast(__struct Dog *, a);
+  __struct Dog *d2 = __ref_cast(__struct Dog, a);
   printf("d2: %d %d\n", d2->id, d2->paws);
 
   // ref.test through inheritance
-  printf("d is Animal: %d\n", __ref_test(__struct Animal *, d));
-  printf("d is Dog: %d\n", __ref_test(__struct Dog *, d));
+  printf("d is Animal: %d\n", __ref_test(__struct Animal, d));
+  printf("d is Dog: %d\n", __ref_test(__struct Dog, d));
 
   return 0;
 }

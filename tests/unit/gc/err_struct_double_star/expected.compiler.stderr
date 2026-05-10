@@ -1,0 +1,2 @@
+Got 1 parse errors in tests/unit/gc/err_struct_double_star/main.c.
+tests/unit/gc/err_struct_double_star/main.c:5: error: '__struct Foo *' is already a reference; '__struct Foo **' is not allowed

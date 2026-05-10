@@ -1948,7 +1948,7 @@ const TypeKind = Object.freeze({
   FLOAT: "float", DOUBLE: "double", LDOUBLE: "long double",
   POINTER: "pointer", ARRAY: "array", FUNCTION: "function",
   TAG: "tag", EXTERNREF: "externref", REFEXTERN: "refextern",
-  GC_STRUCT: "gc_struct", GC_ARRAY: "gc_array",
+  GC_STRUCT_HEAP: "gc_struct_heap", GC_STRUCT: "gc_struct", GC_ARRAY: "gc_array",
   EQREF: "eqref",
   AUTO: "auto",  // C23 type-inference sentinel (set during parse, resolved at init)
   // The bottom type for error recovery. After a parser diagnostic
@@ -2047,8 +2047,10 @@ class TypeInfo {
       out += "[" + this.arraySize + "]" + this.baseType.toString();
     } else if (this.kind === TypeKind.TAG) {
       out += this.tagKind + " " + this.tagName;
-    } else if (this.kind === TypeKind.GC_STRUCT) {
+    } else if (this.kind === TypeKind.GC_STRUCT_HEAP) {
       out += "__struct " + this.tagName;
+    } else if (this.kind === TypeKind.GC_STRUCT) {
+      out += "__struct " + this.tagName + " *";
     } else if (this.kind === TypeKind.GC_ARRAY) {
       out += "__array(" + this.baseType.toString() + ")";
     } else if (this.kind === TypeKind.EQREF) {
@@ -2067,14 +2069,28 @@ class TypeInfo {
   }
 
   pointer() {
-    // GC ref types are already "one level of indirection" semantically — the
-    // value IS a reference to a heap object. Allowing `__struct Foo *` (and
-    // `**`, etc.) to collapse to `__struct Foo` lets users write the C-pointer
-    // form for IDE friendliness (clang accepts `struct Foo *`) without
-    // changing the underlying WASM type.
-    if (this.kind === TypeKind.GC_STRUCT || this.kind === TypeKind.GC_ARRAY ||
-        this.kind === TypeKind.EQREF) {
+    // `__array(T)` and `__eqref` collapse on `*` (treated as ref-only spellings).
+    if (this.kind === TypeKind.GC_ARRAY || this.kind === TypeKind.EQREF) {
       return this;
+    }
+    // `__struct Foo` (heap) becomes `__struct Foo *` (ref) on first `*`.
+    // The ref form carries `baseType = heap`. tagDecl/isComplete are also
+    // mirrored on ref so member-access and codegen completeness checks work
+    // uniformly. parentType lives canonically on the heap; inheritance
+    // checks normalize via gcHeap(). See parseGCStructSpecifier for the sync
+    // when struct is defined after a forward-ref ref form is created.
+    if (this.kind === TypeKind.GC_STRUCT_HEAP) {
+      if (this._pointer) return this._pointer;
+      const ref = new TypeInfo(TypeKind.GC_STRUCT, 0, 0, this.isComplete, {
+        baseType: this, tagKind: this.tagKind, tagName: this.tagName, tagDecl: this.tagDecl,
+      });
+      this._pointer = ref;
+      return ref;
+    }
+    // Applying `*` to a GC struct ref form is rejected (no `(ref ref T)`).
+    // Caller is the parser, which will catch and report; return null sentinel.
+    if (this.kind === TypeKind.GC_STRUCT) {
+      return null;
     }
     if (this._pointer) return this._pointer;
     const p = new TypeInfo(TypeKind.POINTER, 4, 4, true, { baseType: this });
@@ -2154,11 +2170,23 @@ class TypeInfo {
         this.kind === TypeKind.EQREF;
   }
   isGCRef() {
-    // GC universe — eqref + concrete GC types. Excludes externref/refextern.
+    // GC universe — eqref + concrete GC types (ref forms). Excludes externref/refextern
+    // and heap forms (heap forms are not values).
     return this.kind === TypeKind.GC_STRUCT || this.kind === TypeKind.GC_ARRAY ||
         this.kind === TypeKind.EQREF;
   }
   isGCStruct() { return this.kind === TypeKind.GC_STRUCT; }
+  isGCStructHeap() { return this.kind === TypeKind.GC_STRUCT_HEAP; }
+  isGCStructRefOrHeap() {
+    return this.kind === TypeKind.GC_STRUCT || this.kind === TypeKind.GC_STRUCT_HEAP;
+  }
+  // Normalize a GC struct type (heap or ref) to its heap form. tagDecl,
+  // parentType, isComplete live on the heap; refs delegate via baseType.
+  gcHeap() {
+    if (this.kind === TypeKind.GC_STRUCT_HEAP) return this;
+    if (this.kind === TypeKind.GC_STRUCT) return this.baseType;
+    return null;
+  }
   isGCArray() { return this.kind === TypeKind.GC_ARRAY; }
   isArray() { return this.kind === TypeKind.ARRAY; }
   isFunction() { return this.kind === TypeKind.FUNCTION; }
@@ -2200,7 +2228,10 @@ class TypeInfo {
       case TypeKind.GC_ARRAY:
         // GC types are structural — element compatibility is enough.
         return this.baseType.isCompatibleWith(other.baseType, _seen);
-      case TypeKind.GC_STRUCT: {
+      case TypeKind.GC_STRUCT:
+        // Ref form: structurally compatible iff the underlying heap types match.
+        return this.baseType.isCompatibleWith(other.baseType, _seen);
+      case TypeKind.GC_STRUCT_HEAP: {
         // GC structs are structural: same number of fields, each pairwise compatible.
         if (!this.isComplete || !other.isComplete) return false;
         // Cycle detection for recursive types (Node.next of type Node).
@@ -2314,10 +2345,40 @@ function getOrCreateTagType(tagTypeCache, tagKind, name) {
   return t;
 }
 
-// GC struct type cache: name -> TypeInfo (TypeKind.GC_STRUCT)
+// Walk a type and report every GC_STRUCT_HEAP that appears in a value-position
+// slot (the type itself, pointer/array bases, GC array element, function
+// return / parameter types). Heap forms are only legal as the type-arg of
+// `__new`, `__ref_test`, `__ref_cast`, `__ref_null`, `__extends`, and inside
+// struct definitions — not as values. The ref form `__struct Foo *` is the
+// value spelling.
+function validateNoHeapInValueType(type, errorFn) {
+  const seen = new Set();
+  const walk = (t) => {
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    const u = t.removeQualifiers();
+    if (u.kind === TypeKind.GC_STRUCT_HEAP) {
+      errorFn(`'${u.toString()}' (heap form) cannot appear as a value type — use the ref form '${u.toString()} *'`);
+      return;
+    }
+    if (u.kind === TypeKind.POINTER || u.kind === TypeKind.ARRAY) walk(u.baseType);
+    else if (u.kind === TypeKind.GC_ARRAY) walk(u.baseType);
+    else if (u.kind === TypeKind.FUNCTION) {
+      walk(u.returnType);
+      for (const pt of (u.paramTypes || [])) walk(pt);
+    }
+  };
+  walk(type);
+}
+
+// GC struct type cache: name -> TypeInfo (TypeKind.GC_STRUCT_HEAP)
+// Returns the heap form. The ref form (`__struct Foo *`) is created lazily via
+// `.pointer()`. Heap forms appear only in heap-type positions (struct
+// definitions, intrinsic type-args). Values (vars, fields, params) use the ref
+// form.
 function getOrCreateGCStructType(gcStructTypeCache, name) {
   if (gcStructTypeCache.has(name)) return gcStructTypeCache.get(name);
-  const t = new TypeInfo(TypeKind.GC_STRUCT, 0, 0, false, { tagKind: TagKind.GC_STRUCT, tagName: name });
+  const t = new TypeInfo(TypeKind.GC_STRUCT_HEAP, 0, 0, false, { tagKind: TagKind.GC_STRUCT, tagName: name });
   gcStructTypeCache.set(name, t);
   return t;
 }
@@ -2489,7 +2550,7 @@ return {
   TINT, TUINT, TLONG, TULONG, TLLONG, TULLONG, TFLOAT, TDOUBLE, TLDOUBLE, TEXTERNREF, TREFEXTERN, TEQREF, TAUTO,
   TDIVERGENT,
   arrayOf, functionType, getOrCreateTagType,
-  getOrCreateGCStructType, gcArrayOf,
+  getOrCreateGCStructType, gcArrayOf, validateNoHeapInValueType,
   computeStructLayout, computeUnionLayout, computeUnaryType,
   usualArithmeticConversions, truncateConstInt,
 };
@@ -3440,10 +3501,12 @@ function typesAreAssignmentCompatible(srcType, targetType, expr) {
       // the other direction would erase the nullability invariant.
       if (s === Types.TREFEXTERN && t === Types.TEXTERNREF) return true;
       // GC struct inheritance: a Dog ref flows into an Animal ref if
-      // Animal is an ancestor in the parentType chain.
+      // Animal is an ancestor in the parentType chain. parentType lives on
+      // the heap form, so normalize both sides via gcHeap.
       if (s.isGCStruct() && t.isGCStruct()) {
-        for (let p = s.parentType; p; p = p.parentType) {
-          if (p === t) return true;
+        const th = t.gcHeap();
+        for (let p = s.gcHeap().parentType; p; p = p.parentType) {
+          if (p === th) return true;
         }
       }
       // Any GC ref widens to __eqref (top of the GC lattice).
@@ -3552,8 +3615,9 @@ function maybeImplicitCast(expr, targetType) {
     // Specialize the message for non-ref → ref (the old rejectNonZeroToRef
     // case) — the user almost certainly wants either __cast or __ref_null.
     if (targetType.isRef() && !srcType.isRef()) {
+      const castSpelling = castTypeArgSpelling(targetType);
       reportError(expr.loc,
-        `cannot convert '${srcType.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+        `cannot convert '${srcType.toString()}' to reference type '${targetType.toString()}' (use __cast(${castSpelling}, x) for an explicit conversion, or __ref_null for null)`);
     } else {
       reportError(expr.loc,
         `incompatible types: cannot implicitly convert '${srcType.toString()}' to '${targetType.toString()}'`);
@@ -3561,6 +3625,15 @@ function maybeImplicitCast(expr, targetType) {
     return expr;
   }
   return new EImplicitCast(expr.loc, targetType, expr);
+}
+
+// The spelling to suggest for the type-arg of `__cast(T, x)` and similar
+// intrinsics. GC struct refs collapse to their heap form (the ref form's `*`
+// is not allowed in heap-type-arg positions).
+function castTypeArgSpelling(type) {
+  const u = type.removeQualifiers();
+  if (u.isGCStruct()) return `__struct ${u.tagName}`;
+  return type.toString();
 }
 
 // Wrap an expression in EDecay if its type is array or function.
@@ -3593,7 +3666,7 @@ function rejectNonZeroToRef(targetType, expr, loc) {
   if (isNullPointerConstant(expr)) return;
   if (t === Types.TEQREF && s.isArithmetic()) return;
   reportError(loc,
-    `cannot convert '${expr.type.toString()}' to reference type '${targetType.toString()}' (use __cast(${targetType.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+    `cannot convert '${expr.type.toString()}' to reference type '${targetType.toString()}' (use __cast(${castTypeArgSpelling(targetType)}, x) for an explicit conversion, or __ref_null for null)`);
 }
 
 // Pointer arithmetic: given the operand types of a binary `+`/`-`,
@@ -3724,7 +3797,7 @@ function makeBinary(loc, op, left, right) {
       !typesAreAssignmentCompatible(right.type, left.type, right)) {
     if (left.type.removeQualifiers().isRef() && !right.type.removeQualifiers().isRef()) {
       reportError(loc,
-        `cannot convert '${right.type.toString()}' to reference type '${left.type.toString()}' (use __cast(${left.type.toString()}, x) for an explicit conversion, or __ref_null for null)`);
+        `cannot convert '${right.type.toString()}' to reference type '${left.type.toString()}' (use __cast(${castTypeArgSpelling(left.type)}, x) for an explicit conversion, or __ref_null for null)`);
     } else {
       reportError(loc,
         `incompatible types in assignment: cannot convert '${right.type.toString()}' to '${left.type.toString()}'`);
@@ -3917,11 +3990,16 @@ function _placeholderDVar(loc, name) {
 // DVar (divergent-typed) so the parse can continue. After this returns,
 // EMember always has a non-null memberDecl.
 function makeMember(loc, base, name) {
-  // The `.` operator requires struct/union (or our GC struct) on the
-  // left. Without this gate, `int x; x.foo` would crash later in
-  // lookupMemberChain or in codegen.
+  // The `.` operator requires struct/union on the left. GC struct refs use
+  // `->` (they are reference values, not aggregates). Without this gate,
+  // `int x; x.foo` would crash later in lookupMemberChain or in codegen.
   const bt = base.type.removeQualifiers();
-  if (!bt.isStruct() && !bt.isUnion() && !bt.isGCStruct() && !bt.isDivergent()) {
+  if (bt.isGCStruct()) {
+    reportError(loc,
+      `'.' on GC struct ref '${base.type.toString()}' is not allowed — use '->'`);
+    return new EMember(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
+  }
+  if (!bt.isStruct() && !bt.isUnion() && !bt.isDivergent()) {
     reportError(loc,
       `left operand of '.' must have struct or union type, got '${base.type.toString()}'`);
     return new EMember(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
@@ -3939,13 +4017,21 @@ function makeMember(loc, base, name) {
 }
 
 // Build a pointer-arrow expression `base->name`. For GC struct refs
-// (one-indirection by design), this is equivalent to `.` and builds an
-// EMember chain. For other pointer-to-struct types, decay the base if
+// (one-indirection by design), build an EMember chain directly — GC field
+// access is dispatched in codegen by checking that the EMember base is a
+// GC struct ref. For other pointer-to-struct types, decay the base if
 // needed and build EArrow + EMember chain.
 function makeArrow(loc, base, name) {
   let bt = base.type.removeQualifiers();
   if (bt.kind === Types.TypeKind.GC_STRUCT) {
-    return makeMember(loc, base, name);
+    const chain = lookupMemberChain(bt, name);
+    if (!chain) {
+      reportError(loc, `'${base.type.toString()}' has no member named '${name}'`);
+      return new EMember(loc, Types.TDIVERGENT, base, _placeholderDVar(loc, name));
+    }
+    let result = base;
+    for (const m of chain) result = new EMember(loc, m.type, result, m);
+    return result;
   }
   base = maybeDecay(base);
   bt = base.type.removeQualifiers();
@@ -6211,6 +6297,7 @@ class Parser {
           if (mType.removeQualifiers().isRef()) {
             this.error(this.peek(), `${mType.removeQualifiers().kind} cannot be used as a struct/union member`);
           }
+          Types.validateNoHeapInValueType(mType, msg => this.error(this.peek(), msg));
 
           // Parse __attribute__ after member declarator
           const memAttrs = this.parseGCCAttributes();
@@ -6337,12 +6424,13 @@ class Parser {
           this.error(extTok, "__extends(...) requires a __struct type");
         }
         parentType = this.parseGCStructSpecifier();
-        // Allow trailing `*` (collapses for GC ref types) for IDE-friendly
-        // consistency with the preferred __struct Foo * spelling everywhere.
-        while (this.matchText("*")) { /* collapse */ }
+        // Heap form only — reject `__extends(__struct Foo *)`.
+        if (this.atText("*")) {
+          this.error(this.peek(), "__extends(...) takes a heap-type spelling — write '__extends(__struct Foo)' without '*'");
+        }
         this.expect(")");
         this.expect(";");
-        if (!parentType.isGCStruct() || !parentType.isComplete) {
+        if (!parentType.isGCStructHeap() || !parentType.isComplete) {
           this.error(extTok, `__extends parent must be a complete __struct, got '${parentType.toString()}'`);
         }
       }
@@ -6362,6 +6450,7 @@ class Parser {
           if (mType.kind === Types.TypeKind.FUNCTION) {
             this.error(this.peek(), "function types are not allowed as GC struct members");
           }
+          Types.validateNoHeapInValueType(mType, msg => this.error(this.peek(), msg));
           const mVar = new AST.DVar({ filename: this.peek().filename, line: this.peek().line },
             mName, mType, Types.StorageClass.NONE, null);
           members.push(mVar);
@@ -6395,6 +6484,14 @@ class Parser {
       gcType.tagDecl = tagDecl;
       gcType.isComplete = true;
       gcType.parentType = parentType;
+      // Sync the ref form (`__struct Foo *`) if it was already created during
+      // a forward reference. tagDecl/isComplete must be visible on both forms
+      // so codegen and completeness checks work uniformly. parentType lives
+      // canonically on the heap; inheritance checks normalize via gcHeap().
+      if (gcType._pointer) {
+        gcType._pointer.tagDecl = tagDecl;
+        gcType._pointer.isComplete = true;
+      }
       this.tagScope.set(name, gcType);
       return gcType;
     }
@@ -6402,7 +6499,7 @@ class Parser {
     // Forward reference
     if (!name) this.error(this.peek(), "Expected GC struct name or '{'");
     let gcType = this.tagScope.get(name);
-    if (!gcType || gcType.kind !== Types.TypeKind.GC_STRUCT) {
+    if (!gcType || gcType.kind !== Types.TypeKind.GC_STRUCT_HEAP) {
       gcType = Types.getOrCreateGCStructType(this.gcStructTypeCache, name);
       this.tagScope.set(name, gcType);
     }
@@ -6732,7 +6829,8 @@ class Parser {
 
     // __struct_new(__struct Foo, args...) — struct.new / struct.new_default
     // __new(__struct Foo, args...) — alias for __struct_new
-    // Accepts any type expression that resolves to a GC struct (including typedefs).
+    // The type-arg is the bare heap form (e.g. `__struct Foo`, possibly via a
+    // typedef). The expression's value type is the corresponding ref form.
     if (this.matchKW(Lexer.Keyword.X_STRUCT_NEW) || this.matchKW(Lexer.Keyword.X_NEW)) {
       const newTok = this.peek(-1);
       const callName = newTok.text;
@@ -6745,8 +6843,8 @@ class Parser {
         nType = decl.type;
       }
       const nq = nType.removeQualifiers();
-      if (!nq.isGCStruct()) {
-        this.error(newTok, `${callName} requires a __struct type, got '${nType.toString()}'`);
+      if (!nq.isGCStructHeap()) {
+        this.error(newTok, `${callName} requires a heap-form __struct type (e.g. '__struct Foo', no '*'), got '${nType.toString()}'`);
       }
       if (!nq.isComplete) this.error(newTok, `${callName} of incomplete GC struct '${nq.tagName}'`);
       const args = [];
@@ -6761,7 +6859,7 @@ class Parser {
       for (let i = 0; i < args.length; i++) {
         AST.rejectNonZeroToRef(fields[i].type, args[i], newLoc);
       }
-      return new AST.EGCNew(newLoc, nq, args);
+      return new AST.EGCNew(newLoc, nq.pointer(), args);
     }
 
     // __array_new(elemType, length [, init]) — array.new / array.new_default
@@ -6833,7 +6931,10 @@ class Parser {
       return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), Types.TINT, Types.IntrinsicKind.REF_EQ, [a, b]);
     }
 
-    // __ref_null(type) — produces a null of the given reference type
+    // __ref_null(type) — produces a null of the given reference type.
+    // The type-arg is the heap form for GC structs (`__struct Foo`, no `*`)
+    // mirroring wasm's `ref.null heaptype`. For arrays / externref / eqref
+    // (which have no separate heap-form spelling), pass the type directly.
     if (this.matchKW(Lexer.Keyword.X_REF_NULL)) {
       const tok = this.peek(-1);
       this.expect("(");
@@ -6846,13 +6947,18 @@ class Parser {
       }
       this.expect(")");
       const nq = nType.removeQualifiers();
-      if (!nq.isRef()) {
+      if (nq.isGCStruct()) {
+        this.error(tok, `__ref_null takes the heap form '__struct ${nq.tagName}' (no '*'), got '${nType.toString()}'`);
+      } else if (!nq.isRef() && !nq.isGCStructHeap()) {
         this.error(tok, `__ref_null requires a reference type, got '${nType.toString()}'`);
       }
       if (nq === Types.TREFEXTERN) {
         this.error(tok, `__ref_null(__refextern) is not allowed — non-nullable refs cannot be null; use __externref instead`);
       }
-      return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), nq, Types.IntrinsicKind.REF_NULL, [], nq);
+      // The expression's value type is the ref form (for GC structs) or the
+      // type itself (already a ref for externref/eqref/array).
+      const valueType = nq.isGCStructHeap() ? nq.pointer() : nq;
+      return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), valueType, Types.IntrinsicKind.REF_NULL, [], nq);
     }
 
     // __ref_test(target_type, ref) — runtime type test
@@ -6868,7 +6974,7 @@ class Parser {
         const opName = isNullable ? "__ref_test_null" : "__ref_test";
         const tok = this.peek(-1);
         this.expect("(");
-        if (!this.isTypeName()) this.error(tok, `${opName} requires a target reference type`);
+        if (!this.isTypeName()) this.error(tok, `${opName} requires a target heap-type`);
         const specs = this.parseDeclSpecifiers();
         let tType = specs.type;
         if (this.atText("*") || this.atText("[") || this.atText("(")) {
@@ -6879,8 +6985,10 @@ class Parser {
         const refExpr = this.parseAssignmentExpression();
         this.expect(")");
         const tq = tType.removeQualifiers();
-        if (tq === Types.TEQREF || !tq.isGCRef()) {
-          this.error(tok, `${opName} target must be a concrete __struct or __array type, got '${tType.toString()}'`);
+        if (tq.isGCStruct()) {
+          this.error(tok, `${opName} target takes the heap form '__struct ${tq.tagName}' (no '*'), got '${tType.toString()}'`);
+        } else if (!tq.isGCStructHeap() && !tq.isGCArray()) {
+          this.error(tok, `${opName} target must be a heap-form __struct or __array type, got '${tType.toString()}'`);
         }
         if (!refExpr.type.removeQualifiers().isGCRef()) {
           this.error(tok, `${opName} second argument must be a GC-universe ref, got '${refExpr.type.toString()}'`);
@@ -6902,7 +7010,7 @@ class Parser {
         const opName = isNullable ? "__ref_cast_null" : "__ref_cast";
         const tok = this.peek(-1);
         this.expect("(");
-        if (!this.isTypeName()) this.error(tok, `${opName} requires a target reference type`);
+        if (!this.isTypeName()) this.error(tok, `${opName} requires a target heap-type`);
         const specs = this.parseDeclSpecifiers();
         let tType = specs.type;
         if (this.atText("*") || this.atText("[") || this.atText("(")) {
@@ -6913,14 +7021,18 @@ class Parser {
         const refExpr = this.parseAssignmentExpression();
         this.expect(")");
         const tq = tType.removeQualifiers();
-        if (tq === Types.TEQREF || !tq.isGCRef()) {
-          this.error(tok, `${opName} target must be a concrete __struct or __array type, got '${tType.toString()}'`);
+        if (tq.isGCStruct()) {
+          this.error(tok, `${opName} target takes the heap form '__struct ${tq.tagName}' (no '*'), got '${tType.toString()}'`);
+        } else if (!tq.isGCStructHeap() && !tq.isGCArray()) {
+          this.error(tok, `${opName} target must be a heap-form __struct or __array type, got '${tType.toString()}'`);
         }
         if (!refExpr.type.removeQualifiers().isGCRef()) {
           this.error(tok, `${opName} second argument must be a GC-universe ref, got '${refExpr.type.toString()}'`);
         }
+        // Result value type: the ref form (for struct heap) or the array (already a ref).
+        const valueType = tq.isGCStructHeap() ? tq.pointer() : tq;
         const kind = isNullable ? Types.IntrinsicKind.REF_CAST_NULL : Types.IntrinsicKind.REF_CAST;
-        return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), tq, kind, [refExpr], tq);
+        return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), valueType, kind, [refExpr], tq);
       }
     }
 
@@ -7033,6 +7145,13 @@ class Parser {
       const expr = this.parseAssignmentExpression();
       this.expect(")");
       const tq = tType.removeQualifiers();
+      // For GC structs, require heap-form spelling (matches __ref_cast).
+      if (tq.isGCStruct()) {
+        this.error(tok, `__cast target takes the heap form '__struct ${tq.tagName}' (no '*'), got '${tType.toString()}'`);
+      }
+      // Result value type and codegen-target are the ref form for GC struct heap;
+      // for everything else the user-spelled type is already a value type.
+      const valueType = tq.isGCStructHeap() ? tq.pointer() : tq;
       const sq = expr.type.removeQualifiers();
       // Validate combinations at parse time. The codegen path handles the
       // mechanics; here we just reject combos that don't have a defined
@@ -7040,20 +7159,20 @@ class Parser {
       const isPrim = (t) => t.isArithmetic();
       const isEqref = (t) => t === Types.TEQREF;
       const isExternref = (t) => t === Types.TEXTERNREF || t === Types.TREFEXTERN;
-      const ok = (sq === tq) ||
+      const ok = (sq === valueType) ||
         (isPrim(sq) && isPrim(tq)) ||
         (isPrim(sq) && isEqref(tq)) ||                        // box
         (isEqref(sq) && isPrim(tq)) ||                        // unbox
         (sq.isGCRef() && isEqref(tq)) ||                      // upcast
-        (isEqref(sq) && tq.isGCRef()) ||                      // downcast
-        (sq.isGCRef() && tq.isGCRef()) ||                      // GC sidecast/downcast
+        (isEqref(sq) && valueType.isGCRef()) ||               // downcast
+        (sq.isGCRef() && valueType.isGCRef()) ||              // GC sidecast/downcast
         (sq.isGCRef() && isExternref(tq)) ||                   // GC → extern bridge
         (isExternref(sq) && tq === Types.TEQREF);             // extern → any bridge
       if (!ok) {
         this.error(tok,
           `__cast: no conversion defined from '${expr.type.toString()}' to '${tType.toString()}'`);
       }
-      return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), tq, Types.IntrinsicKind.CAST, [expr], tq);
+      return new AST.EIntrinsic(Lexer.Loc.fromTok(tok), valueType, Types.IntrinsicKind.CAST, [expr], valueType);
     }
 
     // __array_copy(dst, dst_off, src, src_off, count) — bulk copy between GC arrays
@@ -7112,7 +7231,13 @@ class Parser {
       this.expect("(");
       const retSpecs = this.parseDeclSpecifiers();
       let retType = retSpecs.type;
-      while (this.matchText("*")) retType = retType.pointer();
+      while (this.matchText("*")) {
+        if (retType.kind === Types.TypeKind.GC_STRUCT) {
+          this.error(this.peek(-1), `'${retType.toString()}' is already a reference; '__struct Foo **' is not allowed`);
+          break;
+        }
+        retType = retType.pointer();
+      }
       const args = [];
       const bytes = [];
       // Parse required argument list
@@ -8054,6 +8179,9 @@ class Parser {
         continue;
       }
 
+      // Reject heap-form GC struct types in value-position slots.
+      Types.validateNoHeapInValueType(type, msg => this.error(this.peek(), msg));
+
       // Local extern function declaration (e.g. extern int f(void);)
       if (type.kind === Types.TypeKind.FUNCTION) {
         if (specs.requestedAlignment > 0) {
@@ -8202,6 +8330,10 @@ class Parser {
         this.typeScope.set(name, type);
         continue;
       }
+
+      // Reject heap-form GC struct types at any value-position slot of the
+      // declared variable / function (return type, params).
+      Types.validateNoHeapInValueType(type, msg => this.error(this.peek(), msg));
 
       // K&R parameter declarations: parse type declarations between ')' and '{'
       if (decl._isKnR && type.kind === Types.TypeKind.FUNCTION &&
@@ -8444,6 +8576,11 @@ class Parser {
       if (type.kind === Types.TypeKind.GC_ARRAY) {
         this.error(starTok, `'__array(...)' types do not take a '*' — write '__array(T) name' (the array is already a reference)`);
       }
+      // Double-`*` on a GC struct (`__struct Foo **`) — wasm has no `(ref ref T)`.
+      if (type.kind === Types.TypeKind.GC_STRUCT) {
+        this.error(starTok, `'${type.toString()}' is already a reference; '__struct Foo **' is not allowed`);
+        break;
+      }
       ptrCount++;
       type = type.pointer();
       while (true) {
@@ -8536,6 +8673,14 @@ class Parser {
               // Handle pointer prefix. Qualifiers after `*` apply to the
               // pointer itself: `T *const` is a const pointer to T.
               while (this.matchText("*")) {
+                const starTok = this.peek(-1);
+                if (pType.kind === Types.TypeKind.GC_ARRAY) {
+                  this.error(starTok, `'__array(...)' types do not take a '*' — write '__array(T) name' (the array is already a reference)`);
+                }
+                if (pType.kind === Types.TypeKind.GC_STRUCT) {
+                  this.error(starTok, `'${pType.toString()}' is already a reference; '__struct Foo **' is not allowed`);
+                  break;
+                }
                 pType = pType.pointer();
                 while (true) {
                   if (this.matchKW(Lexer.Keyword.CONST)) pType = pType.addConst();
@@ -8680,7 +8825,13 @@ function parseTokens(tokens, options) {
           while (true) {
             const pSpecs = parser.parseDeclSpecifiers();
             let pType = pSpecs.type;
-            while (parser.matchText("*")) pType = pType.pointer();
+            while (parser.matchText("*")) {
+              if (pType.kind === Types.TypeKind.GC_STRUCT) {
+                parser.error(parser.peek(-1), `'${pType.toString()}' is already a reference; '__struct Foo **' is not allowed`);
+                break;
+              }
+              pType = pType.pointer();
+            }
             if (parser.atKind(Lexer.TokenKind.IDENT)) parser.advance(); // skip param name
             paramTypes.push(pType);
             if (!parser.matchText(",")) break;
@@ -9917,7 +10068,8 @@ function cToWasmType(type, wmod) {
   if (type === Types.TEXTERNREF) return WT_EXTERNREF;
   if (type === Types.TREFEXTERN) return WT_REFEXTERN;
   if (type === Types.TEQREF) return WT_EQREF;
-  if (type.kind === Types.TypeKind.GC_STRUCT || type.kind === Types.TypeKind.GC_ARRAY) {
+  if (type.kind === Types.TypeKind.GC_STRUCT || type.kind === Types.TypeKind.GC_STRUCT_HEAP ||
+      type.kind === Types.TypeKind.GC_ARRAY) {
     if (!wmod) throw new Error(`cToWasmType: GC type '${type.toString()}' requires wmod for registration`);
     return WT_GCREF(getOrCreateGCWasmTypeIdx(wmod, type), true);
   }
@@ -10002,6 +10154,8 @@ function boxStorageWtFor(type) {
 
 function getOrCreateGCWasmTypeIdx(wmod, type) {
   type = type.removeQualifiers();
+  // Normalize struct ref form to heap form — wasm type idx lives on the heap.
+  if (type.kind === Types.TypeKind.GC_STRUCT) type = type.baseType;
   if (type._wasmGCTypeIdx >= 0) return type._wasmGCTypeIdx;
 
   if (!wmod._gcInProgress) wmod._gcInProgress = new Set();
@@ -10011,7 +10165,7 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
     // Cycle — must reserve a placeholder so the recursive ref resolves.
     let pending = wmod._gcPendingIdx.get(type);
     if (pending === undefined) {
-      pending = (type.kind === Types.TypeKind.GC_STRUCT)
+      pending = (type.kind === Types.TypeKind.GC_STRUCT_HEAP)
         ? wmod.reserveGCStructTypeId()
         : wmod.reserveGCArrayTypeId();
       wmod._gcPendingIdx.set(type, pending);
@@ -10022,7 +10176,7 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
   wmod._gcInProgress.add(type);
 
   let idx;
-  if (type.kind === Types.TypeKind.GC_STRUCT) {
+  if (type.kind === Types.TypeKind.GC_STRUCT_HEAP) {
     if (!type.isComplete) {
       wmod._gcInProgress.delete(type);
       throw new Error(`Cannot use incomplete GC struct '${type.tagName}'`);
@@ -11640,7 +11794,8 @@ class CodeGenerator {
     if (type === Types.TEXTERNREF) return WT_EXTERNREF;
     if (type === Types.TREFEXTERN) return WT_REFEXTERN;
     if (type === Types.TEQREF) return WT_EQREF;
-    if (type.kind === Types.TypeKind.GC_STRUCT || type.kind === Types.TypeKind.GC_ARRAY) {
+    if (type.kind === Types.TypeKind.GC_STRUCT || type.kind === Types.TypeKind.GC_STRUCT_HEAP ||
+        type.kind === Types.TypeKind.GC_ARRAY) {
       return WT_GCREF(getOrCreateGCWasmTypeIdx(this.wmod, type), true);
     }
     if (type === Types.TFLOAT) return WT_F32;
