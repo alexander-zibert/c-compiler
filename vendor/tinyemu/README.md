@@ -69,8 +69,8 @@ Not wired (host stubs return success or zero):
 
 The disk image ships with a minimal BusyBox userland — no C compiler
 inside the guest. `/` is 2.6 MB used of 3.9 MB. For a richer guest
-(buildroot with toolchain, more disk space) you'd need to point the
-cfg at a different `root-riscv32.bin` and rebuild.
+(buildroot with toolchain, more disk space) see "Getting tcc / a
+richer guest" below.
 
 ## Disk image and isolation
 
@@ -108,6 +108,77 @@ port:
 `load_file` path behind `#ifndef EMSCRIPTEN`; with `-DEMSCRIPTEN` set
 for the JS demo, it calls `abort()`. The patch removes the gate so the
 file-backed path always works.
+
+## Getting tcc / a richer guest
+
+The shipped disk image (`disk/root-riscv32.bin`, 4 MB ext2) is the
+minimal busybox userland Bellard distributes with the TinyEMU tarball.
+It has no compiler. Bellard's larger demos at https://bellard.org/jslinux
+(`buildroot-riscv64.cfg`, `fedora33-riscv.cfg`) DO ship a full
+buildroot with tcc — but there's no offline tarball for them. The
+cfgs reference URLs like:
+
+```
+fs0: { file: "https://vfsync.org/u/os/buildroot-riscv64" },
+```
+
+`vfsync.org` serves the rootfs over a **custom HTTP-9P protocol** that
+TinyEMU's `fs_net.c` / `fs_wget.c` consume lazily — there is no
+directory listing, no tarball download, no public file URL. To use
+that image we'd need to implement HTTP fetching on the host side and
+wire up `fs_net_init` / `fs_wget` (currently stubbed in `host.js`).
+Roughly an afternoon of work; ties operation to vfsync.org staying up.
+
+Alternative: build a buildroot ext2 disk image with tcc included and
+swap it in. The TinyEMU `cfg` only needs the new `root-*.bin` path —
+the existing virtio-blk + `block_device_init` plumbing handles any
+size. Likely 50–200 MB image; would need separate hosting since the
+repo doesn't want big binaries.
+
+Neither path is wired up today. The current setup is a "Linux boots,
+console works" demo, not a development environment.
+
+## x86: why it doesn't work from this source
+
+The `vendor/tinyemu/bin.json` build is RISC-V 32-bit only.
+TinyEMU's source DOES contain `x86_machine.c` (PCI bus, PIT, PIC, RTC,
+IDE, etc — 2569 lines, real working code) and the JSLinux demo shows
+x86 running in a browser. But you cannot build a working x86 emulator
+from these sources, because:
+
+- **`x86_cpu.c` is a stub** (96 lines, every function exits or
+  returns 0). It is the placeholder for a KVM frontend, not a
+  software interpreter.
+- Per the upstream readme: *"It is not really an emulator because it
+  uses the Linux KVM API to run the x86 code at near native
+  performance."* On a real x86 Linux host the build links to KVM
+  ioctls. KVM is a hardware-virtualization API — it requires the host
+  CPU to be x86 and **cannot be compiled to wasm under any
+  circumstance**.
+- The x86 emulator visible at https://bellard.org/jslinux is a
+  separate codebase Bellard wrote in 2011 for the original JS/Linux
+  demo. It IS a software interpreter and IT compiles to wasm
+  (`x86emu-wasm.wasm` in the jslinux tarball, ~600 KB), but Bellard
+  has never released its source. He distributes only the compiled
+  binary.
+
+So TinyEMU and JSLinux share configs, disk images, and devices, but
+TinyEMU has never had an open-source x86 CPU emulator. The
+`x86_machine.c` PC platform code is dead weight without a CPU.
+
+To add x86 to this project we'd need a different emulator entirely.
+Open-source options:
+
+- [v86](https://github.com/copy/v86) — JS-native x86 software
+  emulator, runs Linux/Windows/DOS in browsers. ~30 KLOC JavaScript;
+  would need substantial work to integrate.
+- [Bochs](https://bochs.sourceforge.io/) — mature C++ x86 emulator,
+  much heavier (~150 KLOC), would test our C++ support (we don't
+  have any).
+- An old QEMU TCG backend (i386 only) — large and complex.
+- Hand-roll an x86 interpreter — months of work for a useful subset.
+
+None of these are currently planned.
 
 ## Architecture notes
 

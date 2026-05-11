@@ -267,7 +267,7 @@ The compiler is tested against real-world C projects:
 - **Lua 5.5.0** — Full interpreter, compiles and passes the official test suite
 - **DOOM** — doomgeneric port with Nuked-OPL3 music synthesis, runs in the browser
 - **Snake** — Terminal-based snake game using termios raw mode, ANSI escape codes, and `select()` for input handling
-- **TinyEMU** — Fabrice Bellard's RISC-V emulator. The headless 32-bit build boots Linux 4.15 to a BusyBox shell with interactive stdin (no compiler in the guest userland; see `vendor/tinyemu/README.md`)
+- **TinyEMU** — Fabrice Bellard's RISC-V emulator. The headless 32-bit build boots Linux 4.15 to a BusyBox shell with interactive stdin. The guest userland is minimal (no compiler); x86 isn't supported because TinyEMU's open source ships only a KVM frontend for x86, not a software interpreter. See `vendor/tinyemu/README.md`
 
 ### Building vendored projects
 
