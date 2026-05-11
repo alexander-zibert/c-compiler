@@ -5867,6 +5867,12 @@ const Term = {
 // `decls` are stripped of initExprs.
 function hoistDeclarations(funcDef) {
   const hoisted = [];
+  // Old SCompound → new SCompound after rebuild. Hoist creates fresh
+  // SCompound objects (the old ones are frozen), but SSwitch cases
+  // store references to parse-time compounds; we use this map to
+  // remap them so the lowering walker can still identify nested
+  // case-label positions.
+  const compoundRemap = new Map();
   // names seen anywhere in this function so far — used to detect
   // shadowing. A second `int x;` in a nested scope gets renamed.
   const used = new Set();
@@ -5923,7 +5929,9 @@ function hoistDeclarations(funcDef) {
     }
     if (stmt instanceof AST.SCompound) {
       const rewritten = stmt.statements.map(rewrite);
-      return new AST.SCompound(stmt.loc, rewritten, stmt.labels);
+      const newCompound = new AST.SCompound(stmt.loc, rewritten, stmt.labels);
+      compoundRemap.set(stmt, newCompound);
+      return newCompound;
     }
     if (stmt instanceof AST.SIf) {
       return new AST.SIf(stmt.loc, stmt.condition,
@@ -5943,7 +5951,18 @@ function hoistDeclarations(funcDef) {
         rewrite(stmt.body));
     }
     if (stmt instanceof AST.SSwitch) {
-      return new AST.SSwitch(stmt.loc, stmt.expr, stmt.cases, rewrite(stmt.body));
+      const newBody = rewrite(stmt.body);
+      // Rewrite case entries to point at the freshly-rebuilt compounds.
+      // Case `localCompound` references survive hoisting only if we
+      // remap them — the lowering walker uses (compound, localIndex)
+      // pairs to identify case-label positions in nested compounds.
+      const newCases = stmt.cases.map(c => {
+        if (!c.localCompound) return c;
+        const newComp = compoundRemap.get(c.localCompound);
+        if (!newComp) return c;
+        return { ...c, localCompound: newComp };
+      });
+      return new AST.SSwitch(stmt.loc, stmt.expr, newCases, newBody);
     }
     return stmt;  // SExpr, SReturn, SGoto, SLabel, SBreak, SContinue, SEmpty, etc.
   }
@@ -5968,6 +5987,10 @@ function buildSegments(body) {
   // Loop stack: each entry is { breakId, continueId? }. Switches push
   // entries without continueId (SContinue must skip past switches).
   const loopStack = [];
+  // For each in-flight switch, a map from SCompound → Map<localIndex,
+  // segmentId>. Lets the walker recognize nested case labels and open
+  // the appropriate segment at each label's exact position.
+  const caseSegByPosStack = [];
 
   function allocId() { return nextId++; }
   function openSeg(id) {
@@ -6014,7 +6037,24 @@ function buildSegments(body) {
       // body into per-case segments. We detect "this compound is a switch
       // body" by the caller passing a `_switchContext`. For non-switch
       // compounds, just walk children in order.
-      for (const s of node.statements) visit(s);
+      // If we're inside an in-flight switch, check this compound for
+      // case-label positions and open the right segment at each one.
+      // Disabled experimentally: helps SQLite-style nested cases but
+      // appears to interact badly with deeper SQLite structure.
+      const topSegByPos = (caseSegByPosStack.length > 0 && process.env.IRRED_NESTED_CASES)
+        ? caseSegByPosStack[caseSegByPosStack.length - 1]
+        : null;
+      const compoundCaseMap = topSegByPos ? topSegByPos.get(node) : null;
+      for (let i = 0; i < node.statements.length; i++) {
+        if (compoundCaseMap) {
+          const caseId = compoundCaseMap.get(i);
+          if (caseId !== undefined) {
+            if (curSeg !== null) close(Term.fallthrough(caseId));
+            openSeg(caseId);
+          }
+        }
+        visit(node.statements[i]);
+      }
       return;
     }
 
@@ -6117,13 +6157,48 @@ function buildSegments(body) {
     }
 
     if (node instanceof AST.SSwitch) {
-      // Allocate one segment per case + one for the post-switch join.
-      // Multiple cases at the same stmtIndex (e.g. `case 1: case 2: ...`
-      // or `case 1: default: ...`) collapse onto a single primary
-      // segment — we compute the primary up front so the dispatch table
-      // and defaultTarget refer to it directly, no post-hoc rewriting.
       const postId = allocId();
-      // Pre-pick a primary id per stmtIndex (first case at that index).
+      if (process.env.IRRED_NESTED_CASES) {
+        // Nested-case-aware path (gated until SQLite issue diagnosed):
+        // build a (compound, localIndex) → segment map, push it onto
+        // the case stack, and let the SCompound walker open segments
+        // at exact case-label positions inside any nested compound.
+        const segByPos = new Map();
+        const ensureSeg = (comp, idx) => {
+          if (!comp) return null;
+          let m = segByPos.get(comp);
+          if (!m) { m = new Map(); segByPos.set(comp, m); }
+          if (!m.has(idx)) m.set(idx, allocId());
+          return m.get(idx);
+        };
+        for (const c of node.cases) {
+          if (c.localCompound) ensureSeg(c.localCompound, c.localIndex);
+        }
+        let defaultTarget = postId;
+        const dispatchCases = [];
+        for (const c of node.cases) {
+          const id = c.localCompound
+            ? segByPos.get(c.localCompound).get(c.localIndex)
+            : null;
+          if (id === null) continue;
+          if (c.isDefault) defaultTarget = id;
+          else dispatchCases.push({ value: c.value, target: id });
+        }
+        close(Term.switchDispatch(node.expr, dispatchCases, defaultTarget));
+        caseSegByPosStack.push(segByPos);
+        loopStack.push({ breakId: postId, continueId: null });
+        openSeg(allocId());
+        visit(node.body);
+        loopStack.pop();
+        caseSegByPosStack.pop();
+        if (curSeg !== null) close(Term.fallthrough(postId));
+        openSeg(postId);
+        return;
+      }
+      // Legacy top-level-cases-only path: pre-pick a primary id per
+      // stmtIndex (first case at that position). Cases buried inside
+      // nested compounds collide with their containing top-level stmt's
+      // dispatch and may execute the wrong path.
       const primaryByIdx = new Map();
       for (let i = 0; i < node.cases.length; i++) {
         const c = node.cases[i];
@@ -6139,14 +6214,10 @@ function buildSegments(body) {
         else dispatchCases.push({ value: c.value, target: id });
       }
       close(Term.switchDispatch(node.expr, dispatchCases, defaultTarget));
-
-      // Walk the switch body, partitioning at each case's stmtIndex.
       const bodyStmts = node.body instanceof AST.SCompound
         ? node.body.statements
         : [node.body];
       loopStack.push({ breakId: postId, continueId: null });
-      // Open a "limbo" segment for any statements before the first case
-      // (unreachable, but the walker needs somewhere to put them).
       openSeg(allocId());
       for (let i = 0; i < bodyStmts.length; i++) {
         const primary = primaryByIdx.get(i);
@@ -6368,6 +6439,20 @@ function synthesizeWrapper(funcDef, hoistedDecls, segments) {
 function lower(funcDef) {
   const { decls, rewrittenBody } = hoistDeclarations(funcDef);
   const segments = buildSegments(rewrittenBody);
+  if (process.env.IRRED_DUMP) {
+    for (const s of segments) {
+      const t = s.term;
+      let td = '?';
+      if (t) {
+        if (t.kind === 'fallthrough') td = 'fall→' + t.nextId;
+        else if (t.kind === 'goto') td = 'goto→' + t.targetId;
+        else if (t.kind === 'branch') td = 'branch→' + t.thenId + '/' + t.elseId;
+        else if (t.kind === 'switch') td = 'sw[' + t.cases.map(c => c.value+'→'+c.target).join(',') + '] def→' + t.defaultTarget;
+        else td = t.kind;
+      }
+      console.error(`  seg ${s.id}: ${s.stmts.length} stmts → ${td}`);
+    }
+  }
   const newBody = synthesizeWrapper(funcDef, decls, segments);
   funcDef.body = newBody;
 }
@@ -9418,12 +9503,24 @@ class Parser {
         this.error(switchTok, `cannot switch on reference type '${expr.type.toString()}'`);
       }
       this.expect(")");
-      // Parse the body collecting case labels
+      // Parse the body collecting case labels. Track the index in the
+      // *outer* switch body's statement list, even when case labels are
+      // buried inside nested compounds (the "Duff's device" pattern that
+      // SQLite's VDBE uses heavily — `case OP_ReopenIdx: { ... case
+      // OP_OpenRead: ... }`). Without this, nested-case stmtIndex would
+      // point into the inner compound and the codegen would dispatch
+      // case OP_OpenRead to a totally unrelated outer-body statement.
       const cases = [];
       const savedCases = this._currentCases;
+      const savedSwBody = this._switchBodyCompound;
+      const savedSwIdx = this._currentSwitchOuterStmtIdx;
       this._currentCases = cases;
+      this._switchBodyCompound = null;  // first compound parsed below is it
+      this._currentSwitchOuterStmtIdx = 0;
       const body = this.parseStatement();
       this._currentCases = savedCases;
+      this._switchBodyCompound = savedSwBody;
+      this._currentSwitchOuterStmtIdx = savedSwIdx;
       return new AST.SSwitch(loc, expr, cases, body);
     }
 
@@ -9440,9 +9537,24 @@ class Parser {
       }
       this.expect(":");
       if (this._currentCases) {
-        const idx = this._currentCompoundStmtCount || 0;
+        // stmtIndex is the OUTER switch-body position (top-level for direct
+        // case labels; the position of the containing top-level stmt for
+        // nested case labels). The structured codegen uses this directly.
+        // localCompound + localIndex pin down the case's actual position
+        // (which compound is its parent, what index inside that compound) —
+        // the lowering pass needs this finer info to open the right segment
+        // when a case label is buried inside a nested compound (SQLite's
+        // Duff's-device VDBE pattern).
+        const idx = this._currentSwitchOuterStmtIdx !== undefined
+          ? this._currentSwitchOuterStmtIdx
+          : (this._currentCompoundStmtCount || 0);
+        const localCompound = this.currentCompound;
+        const localIndex = this._currentCompoundStmtCount || 0;
         for (let v = lo; v <= hi; v++) {
-          this._currentCases.push({ value: v, stmtIndex: idx, isDefault: false });
+          this._currentCases.push({
+            value: v, stmtIndex: idx, isDefault: false,
+            localCompound, localIndex,
+          });
         }
       }
       return this.parseStatement();
@@ -9452,8 +9564,15 @@ class Parser {
     if (this.matchKW(Lexer.Keyword.DEFAULT)) {
       this.expect(":");
       if (this._currentCases) {
-        const idx = this._currentCompoundStmtCount || 0;
-        this._currentCases.push({ value: 0, stmtIndex: idx, isDefault: true });
+        const idx = this._currentSwitchOuterStmtIdx !== undefined
+          ? this._currentSwitchOuterStmtIdx
+          : (this._currentCompoundStmtCount || 0);
+        const localCompound = this.currentCompound;
+        const localIndex = this._currentCompoundStmtCount || 0;
+        this._currentCases.push({
+          value: 0, stmtIndex: idx, isDefault: true,
+          localCompound, localIndex,
+        });
       }
       return this.parseStatement();
     }
@@ -9655,9 +9774,19 @@ class Parser {
     const savedCompound = this.currentCompound;
     this.currentCompound = compound;
 
+    // If we're parsing the switch's body (first compound after `switch
+    // (..)`), claim ownership so per-iteration we can record the outer
+    // stmtIndex for any nested case labels.
+    if (this._currentCases !== undefined && this._currentCases !== null
+        && this._switchBodyCompound === null) {
+      this._switchBodyCompound = compound;
+    }
     while (!this.atEnd() && !this.atText("}")) {
       // Handle case/default labels at compound level for switch tracking
       this._currentCompoundStmtCount = statements.length;
+      if (compound === this._switchBodyCompound) {
+        this._currentSwitchOuterStmtIdx = statements.length;
+      }
       const stmt = this.parseStatement();
       statements.push(stmt);
     }
