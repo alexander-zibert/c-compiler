@@ -6386,10 +6386,10 @@ function synthesizeWrapper(funcDef, hoistedDecls, segments) {
   return new AST.SCompound(loc, declStmts);
 }
 
-function lower(funcDef) {
+function lower(funcDef, debugLog) {
   const { decls, rewrittenBody } = hoistDeclarations(funcDef);
   const segments = buildSegments(rewrittenBody);
-  if (process.env.IRRED_DUMP) {
+  if (debugLog) {
     for (const s of segments) {
       const t = s.term;
       let td = '?';
@@ -6400,7 +6400,7 @@ function lower(funcDef) {
         else if (t.kind === 'switch') td = 'sw[' + t.cases.map(c => c.value+'→'+c.target).join(',') + '] def→' + t.defaultTarget;
         else td = t.kind;
       }
-      console.error(`  seg ${s.id}: ${s.stmts.length} stmts → ${td}`);
+      debugLog(`  seg ${s.id}: ${s.stmts.length} stmts → ${td}\n`);
     }
   }
   const newBody = synthesizeWrapper(funcDef, decls, segments);
@@ -6410,13 +6410,14 @@ function lower(funcDef) {
 function optimize(unit, options) {
   if (!unit) return;
   if (options && options.disable) return;
+  const debugLog = options && options.debugLog;
   const allFns = [...unit.definedFunctions, ...unit.staticFunctions];
   for (const fn of allFns) {
     if (needsLowering(fn)) {
-      if (process.env.IRRED_DEBUG) {
-        console.error(`[irreducible] lowering '${fn.name}'`);
+      if (debugLog) {
+        debugLog(`[irreducible] lowering '${fn.name}'\n`);
       }
-      lower(fn);
+      lower(fn, debugLog);
     }
   }
 }
@@ -12182,6 +12183,8 @@ class CodeGenerator {
   constructor(wmod, options) {
     this.wmod = wmod;
     this.compilerOptions = options?.compilerOptions || {};
+    this.writeErr = options?.writeErr
+      || (typeof process !== 'undefined' && process.stderr ? (s) => process.stderr.write(s) : (s) => console.error(s));
     this.funcDefToWasmFuncIdx = new Map();
     this.funcDefToTableIdx = new Map();
     this.globalVarToWasmGlobalIdx = new Map();
@@ -13267,8 +13270,8 @@ class CodeGenerator {
           const dense = nonDefaultCount >= 4 && range <= 512 &&
               (nonDefaultCount * 10 / range) >= 4; // density >= 40%
 
-          if (this.compilerOptions.debugSwitch && sw.loc) {
-            process.stderr.write(`${sw.loc.filename}:${sw.loc.line}: switch: ${dense ? "br_table" : "br_if"}\n`);
+          if (this.compilerOptions.debugSwitch && sw.loc && this.writeErr) {
+            this.writeErr(`${sw.loc.filename}:${sw.loc.line}: switch: ${dense ? "br_table" : "br_if"}\n`);
           }
 
           if (dense) {
@@ -14855,6 +14858,12 @@ function collectFileScopeCompoundLiterals(unit) {
 }
 
 function generateCode(units, outputFile, options) {
+  const writeErr = options && options.writeErr
+    ? options.writeErr
+    : (typeof process !== 'undefined' && process.stderr ? (s) => process.stderr.write(s) : () => {});
+  const fatalExit = options && options.fatalExit
+    ? options.fatalExit
+    : (typeof process !== 'undefined' && process.exit ? (code) => process.exit(code) : (code) => { throw new Error(`Fatal error (exit code ${code})`); });
   const wmod = new WasmModule();
   const cg = new CodeGenerator(wmod, options);
 
@@ -14905,8 +14914,8 @@ function generateCode(units, outputFile, options) {
     }
   }
   if (!foundMain) {
-    process.stderr.write("Error: no 'main' function defined\n");
-    process.exit(1);
+    writeErr("Error: no 'main' function defined\n");
+    fatalExit(1);
   }
 
   // Register exception tags
@@ -15136,20 +15145,20 @@ function generateCode(units, outputFile, options) {
         cg.gotoErrors.length = errLen;
         cg.sourceMapEntries.length = smLen;
         wmod.localNames.length = lnLen;
-        if (process.env.IRRED_DEBUG) {
-          console.error(`[irreducible] lowering '${fdef.name}' (retry after structured emit failed)`);
+        if (verbose) {
+          writeErr(`[irreducible] lowering '${fdef.name}' (retry after structured emit failed)\n`);
         }
-        IRREDUCIBLE_LOWERING.lower(fdef);
+        IRREDUCIBLE_LOWERING.lower(fdef, verbose ? writeErr : null);
         cg.emitFunctionBody(fdef);
         loweredFnNames.push(fdef.name);
       }
     }
   }
   if (verbose && loweredFnNames.length > 0) {
-    process.stderr.write(
+    writeErr(
       `note: ${loweredFnNames.length} function(s) required loop-switch lowering ` +
       `(irreducible / unresolved cross-block gotos):\n`);
-    for (const n of loweredFnNames) process.stderr.write(`  - ${n}\n`);
+    for (const n of loweredFnNames) writeErr(`  - ${n}\n`);
   }
 
   // Surface goto errors collected during emit. Out-of-scope gotos already
@@ -15157,9 +15166,9 @@ function generateCode(units, outputFile, options) {
   // diagnostics and exit. (Mirrors how the parser pass surfaces them.)
   if (cg.gotoErrors.length > 0) {
     for (const err of cg.gotoErrors) {
-      process.stderr.write(`${err.filename}:${err.line}: error: ${err.message}\n`);
+      writeErr(`${err.filename}:${err.line}: error: ${err.message}\n`);
     }
-    if (typeof process !== 'undefined' && process.exit) process.exit(1);
+    fatalExit(1);
   }
 
   // Finalize memory
@@ -19936,7 +19945,11 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     ? options.writeErr
     : (typeof process !== 'undefined' ? (s) => process.stderr.write(s) : () => {});
   const timing = options?.timing;
-  const hrtime = timing ? (() => { const [s, ns] = process.hrtime(); return s * 1000 + ns / 1e6; }) : null;
+  const hrtime = timing
+    ? (typeof process !== 'undefined' && process.hrtime
+      ? () => { const [s, ns] = process.hrtime(); return s * 1000 + ns / 1e6; }
+      : () => performance.now())
+    : null;
 
   // Auto-require __alloca.c
   requiredSources.add("__alloca.c");
