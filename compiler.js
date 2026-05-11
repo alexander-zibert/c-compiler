@@ -2979,6 +2979,8 @@ class Expr {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedCompoundLiterals));
     }
+    // Case labels can't appear inside expressions — empty by definition.
+    get caseBag() { return _EMPTY_TREE_BAG; }
     // Rebuild this node with replaced children, in the same order as
     // `this.children`. Leaf subclasses (no children) inherit this
     // identity-return; non-leaf subclasses must override.
@@ -3015,6 +3017,14 @@ class Expr {
     get referencedCompoundLiterals() {
       return new TreeBag(null,
         ...this.children.filter(c => c).map(c => c.referencedCompoundLiterals));
+    }
+    // Case labels visible from this subtree. Bubbles up through all
+    // intermediate Stmts; SSwitch overrides to return empty (its inner
+    // cases belong to itself, not the enclosing switch). Exprs return
+    // empty via Expr.caseBag — case labels can't appear inside expressions.
+    get caseBag() {
+      return new TreeBag(null,
+        ...this.children.filter(c => c).map(c => c.caseBag));
     }
     _withChildren(newChildren) {
       if (newChildren.length === 0) return this;
@@ -3559,12 +3569,30 @@ class Expr {
     }
   }
   class SSwitch extends Stmt {
-    constructor(loc, expr, cases, body) {
+    constructor(loc, expr, body) {
       super(loc, [expr, body]);
-      this.expr = expr; this.cases = cases; this.body = body;
+      this.expr = expr; this.body = body;
       Object.freeze(this);
     }
-    _withChildren([expr, body]) { return new SSwitch(this.loc, expr, this.cases, body); }
+    _withChildren([expr, body]) { return new SSwitch(this.loc, expr, body); }
+    // Barrier: case labels inside this switch's body belong to this
+    // switch, not the enclosing one. Readers that want this switch's
+    // cases read `sw.body.caseBag` directly.
+    get caseBag() { return _EMPTY_TREE_BAG; }
+  }
+  // A case (or default) label in a switch body. Standalone statement —
+  // the next statement in the enclosing compound is the case's target
+  // (parallel to how SLabel works for goto labels). `lo` / `hi` are
+  // BigInts giving the value range (inclusive). For a single-value
+  // case (`case 5:`), lo === hi. For a GNU range (`case 0 ... 9:`),
+  // lo < hi. For default, isDefault is true and lo/hi are ignored.
+  class SCase extends Stmt {
+    constructor(loc, lo, hi, isDefault) {
+      super(loc);
+      this.lo = lo; this.hi = hi; this.isDefault = !!isDefault;
+      Object.freeze(this);
+    }
+    get caseBag() { return new TreeBag([this]); }
   }
   // SGoto and SLabel are seal-only (not frozen) because the parser
   // backfills `target` (when a forward goto's label is later defined)
@@ -4442,7 +4470,7 @@ return {
   EAlignofExpr, EAlignofType, EComma, EInitList, EIntrinsic, EWasm,
   ECompoundLiteral, EImplicitCast, EDecay, EGCNew,
   SExpr, SDecl, SCompound, SIf, SWhile, SDoWhile, SFor,
-  SBreak, SContinue, SReturn, SSwitch, SGoto, SLabel, SEmpty,
+  SBreak, SContinue, SReturn, SSwitch, SCase, SGoto, SLabel, SEmpty,
   STryCatch, SThrow,
   makeTUnit,
   // C-semantics-aware builders
@@ -4828,6 +4856,7 @@ function foldStmt(stmt) {
     case AST.SContinue:
     case AST.SLabel:
     case AST.SGoto:
+    case AST.SCase:
       return stmt;
 
     case AST.SExpr: {
@@ -4911,7 +4940,7 @@ function foldStmt(stmt) {
       const body = foldStmt(stmt.body);
       return (e === stmt.expr && body === stmt.body)
         ? stmt
-        : new AST.SSwitch(stmt.loc, e, stmt.cases, body);
+        : new AST.SSwitch(stmt.loc, e, body);
     }
 
     case AST.STryCatch: {
@@ -5509,7 +5538,7 @@ function rebuildAlongPath(tree, oldNode, newNode) {
   }
   if (tree instanceof AST.SSwitch) {
     const newBody = rebuildAlongPath(tree.body, oldNode, newNode);
-    if (newBody !== tree.body) return new AST.SSwitch(tree.loc, tree.expr, tree.cases, newBody);
+    if (newBody !== tree.body) return new AST.SSwitch(tree.loc, tree.expr, newBody);
     return tree;
   }
   if (tree instanceof AST.STryCatch) {
@@ -5865,12 +5894,6 @@ const Term = {
 // `decls` are stripped of initExprs.
 function hoistDeclarations(funcDef) {
   const hoisted = [];
-  // Old SCompound → new SCompound after rebuild. Hoist creates fresh
-  // SCompound objects (the old ones are frozen), but SSwitch cases
-  // store references to parse-time compounds; we use this map to
-  // remap them so the lowering walker can still identify nested
-  // case-label positions.
-  const compoundRemap = new Map();
   // names seen anywhere in this function so far — used to detect
   // shadowing. A second `int x;` in a nested scope gets renamed.
   const used = new Set();
@@ -5927,9 +5950,7 @@ function hoistDeclarations(funcDef) {
     }
     if (stmt instanceof AST.SCompound) {
       const rewritten = stmt.statements.map(rewrite);
-      const newCompound = new AST.SCompound(stmt.loc, rewritten, stmt.labels);
-      compoundRemap.set(stmt, newCompound);
-      return newCompound;
+      return new AST.SCompound(stmt.loc, rewritten, stmt.labels);
     }
     if (stmt instanceof AST.SIf) {
       return new AST.SIf(stmt.loc, stmt.condition,
@@ -5950,17 +5971,7 @@ function hoistDeclarations(funcDef) {
     }
     if (stmt instanceof AST.SSwitch) {
       const newBody = rewrite(stmt.body);
-      // Rewrite case entries to point at the freshly-rebuilt compounds.
-      // Case `localCompound` references survive hoisting only if we
-      // remap them — the lowering walker uses (compound, localIndex)
-      // pairs to identify case-label positions in nested compounds.
-      const newCases = stmt.cases.map(c => {
-        if (!c.localCompound) return c;
-        const newComp = compoundRemap.get(c.localCompound);
-        if (!newComp) return c;
-        return { ...c, localCompound: newComp };
-      });
-      return new AST.SSwitch(stmt.loc, stmt.expr, newCases, newBody);
+      return new AST.SSwitch(stmt.loc, stmt.expr, newBody);
     }
     return stmt;  // SExpr, SReturn, SGoto, SLabel, SBreak, SContinue, SEmpty, etc.
   }
@@ -5985,10 +5996,10 @@ function buildSegments(body) {
   // Loop stack: each entry is { breakId, continueId? }. Switches push
   // entries without continueId (SContinue must skip past switches).
   const loopStack = [];
-  // For each in-flight switch, a map from SCompound → Map<localIndex,
-  // segmentId>. Lets the walker recognize nested case labels and open
-  // the appropriate segment at each label's exact position.
-  const caseSegByPosStack = [];
+  // Stack of Map<SCase, segmentId>. Pushed when entering an SSwitch's
+  // body; consumed when an SCase node is visited (so the visitor knows
+  // which segment id to open at that label).
+  const caseIdsStack = [];
 
   function allocId() { return nextId++; }
   function openSeg(id) {
@@ -6031,28 +6042,7 @@ function buildSegments(body) {
     if (node instanceof AST.SEmpty) return;
 
     if (node instanceof AST.SCompound) {
-      // Switch bodies need special handling — case labels partition the
-      // body into per-case segments. We detect "this compound is a switch
-      // body" by the caller passing a `_switchContext`. For non-switch
-      // compounds, just walk children in order.
-      // If we're inside an in-flight switch, check this compound for
-      // case-label positions and open the right segment at each one.
-      // Disabled experimentally: helps SQLite-style nested cases but
-      // appears to interact badly with deeper SQLite structure.
-      const topSegByPos = (caseSegByPosStack.length > 0 && process.env.IRRED_NESTED_CASES)
-        ? caseSegByPosStack[caseSegByPosStack.length - 1]
-        : null;
-      const compoundCaseMap = topSegByPos ? topSegByPos.get(node) : null;
-      for (let i = 0; i < node.statements.length; i++) {
-        if (compoundCaseMap) {
-          const caseId = compoundCaseMap.get(i);
-          if (caseId !== undefined) {
-            if (curSeg !== null) close(Term.fallthrough(caseId));
-            openSeg(caseId);
-          }
-        }
-        visit(node.statements[i]);
-      }
+      for (const s of node.statements) visit(s);
       return;
     }
 
@@ -6156,78 +6146,48 @@ function buildSegments(body) {
 
     if (node instanceof AST.SSwitch) {
       const postId = allocId();
-      if (process.env.IRRED_NESTED_CASES) {
-        // Nested-case-aware path (gated until SQLite issue diagnosed):
-        // build a (compound, localIndex) → segment map, push it onto
-        // the case stack, and let the SCompound walker open segments
-        // at exact case-label positions inside any nested compound.
-        const segByPos = new Map();
-        const ensureSeg = (comp, idx) => {
-          if (!comp) return null;
-          let m = segByPos.get(comp);
-          if (!m) { m = new Map(); segByPos.set(comp, m); }
-          if (!m.has(idx)) m.set(idx, allocId());
-          return m.get(idx);
-        };
-        for (const c of node.cases) {
-          if (c.localCompound) ensureSeg(c.localCompound, c.localIndex);
-        }
-        let defaultTarget = postId;
-        const dispatchCases = [];
-        for (const c of node.cases) {
-          const id = c.localCompound
-            ? segByPos.get(c.localCompound).get(c.localIndex)
-            : null;
-          if (id === null) continue;
-          if (c.isDefault) defaultTarget = id;
-          else dispatchCases.push({ value: c.value, target: id });
-        }
-        close(Term.switchDispatch(node.expr, dispatchCases, defaultTarget));
-        caseSegByPosStack.push(segByPos);
-        loopStack.push({ breakId: postId, continueId: null });
-        openSeg(allocId());
-        visit(node.body);
-        loopStack.pop();
-        caseSegByPosStack.pop();
-        if (curSeg !== null) close(Term.fallthrough(postId));
-        openSeg(postId);
-        return;
-      }
-      // Legacy top-level-cases-only path: pre-pick a primary id per
-      // stmtIndex (first case at that position). Cases buried inside
-      // nested compounds collide with their containing top-level stmt's
-      // dispatch and may execute the wrong path.
-      const primaryByIdx = new Map();
-      for (let i = 0; i < node.cases.length; i++) {
-        const c = node.cases[i];
-        if (!primaryByIdx.has(c.stmtIndex)) {
-          primaryByIdx.set(c.stmtIndex, allocId());
-        }
-      }
+      // Allocate a segment id per SCase in this switch's body. The
+      // mapping is stashed on caseIdsStack so the SCase visitor below
+      // can open the right segment at each label position — case
+      // labels deep inside nested compounds work naturally because
+      // they're just SCase nodes the visitor will encounter in order.
+      const caseIds = new Map();
       let defaultTarget = postId;
       const dispatchCases = [];
-      for (const c of node.cases) {
-        const id = primaryByIdx.get(c.stmtIndex);
-        if (c.isDefault) defaultTarget = id;
-        else dispatchCases.push({ value: c.value, target: id });
+      for (const sc of node.body.caseBag) {
+        const id = allocId();
+        caseIds.set(sc, id);
+        if (sc.isDefault) {
+          defaultTarget = id;
+        } else {
+          for (let v = sc.lo; v <= sc.hi; v++) {
+            dispatchCases.push({ value: v, target: id });
+          }
+        }
       }
       close(Term.switchDispatch(node.expr, dispatchCases, defaultTarget));
-      const bodyStmts = node.body instanceof AST.SCompound
-        ? node.body.statements
-        : [node.body];
+      caseIdsStack.push(caseIds);
       loopStack.push({ breakId: postId, continueId: null });
       openSeg(allocId());
-      for (let i = 0; i < bodyStmts.length; i++) {
-        const primary = primaryByIdx.get(i);
-        if (primary !== undefined) {
-          if (curSeg !== null) close(Term.fallthrough(primary));
-          openSeg(primary);
-        }
-        visit(bodyStmts[i]);
-      }
+      visit(node.body);
       loopStack.pop();
+      caseIdsStack.pop();
       if (curSeg !== null) close(Term.fallthrough(postId));
       openSeg(postId);
+      return;
+    }
+
+    if (node instanceof AST.SCase) {
+      // Close the current segment falling through into this case's
+      // segment, then open it. The id was assigned by the enclosing
+      // SSwitch handler above.
+      const top = caseIdsStack.length > 0 ? caseIdsStack[caseIdsStack.length - 1] : null;
+      const id = top ? top.get(node) : undefined;
+      if (id === undefined) {
+        throw new Error("irreducible lowering: SCase outside switch");
+      }
+      if (curSeg !== null) close(Term.fallthrough(id));
+      openSeg(id);
       return;
     }
 
@@ -6363,20 +6323,17 @@ function synthesizeWrapper(funcDef, hoistedDecls, segments) {
     }
     if (term.kind === "switch") {
       // Emit a structured switch into __state, then break to outer loop.
-      const cases = [];
       const bodyStmts = [];
-      let idx = 0;
       for (const c of term.cases) {
-        cases.push({ value: c.value, stmtIndex: idx, isDefault: false });
+        bodyStmts.push(new AST.SCase(loc, c.value, c.value, false));
         bodyStmts.push(setState(c.target));
         bodyStmts.push(new AST.SBreak(loc));
-        idx += 2;
       }
-      cases.push({ value: 0n, stmtIndex: idx, isDefault: true });
+      bodyStmts.push(new AST.SCase(loc, 0n, 0n, true));
       bodyStmts.push(setState(term.defaultTarget));
       bodyStmts.push(new AST.SBreak(loc));
       const switchBody = new AST.SCompound(loc, bodyStmts);
-      const inner = new AST.SSwitch(loc, term.scrutinee, cases, switchBody);
+      const inner = new AST.SSwitch(loc, term.scrutinee, switchBody);
       return [inner, continueWhile()];
     }
     if (term.kind === "return") {
@@ -6394,27 +6351,22 @@ function synthesizeWrapper(funcDef, hoistedDecls, segments) {
     throw new Error(`unknown terminator kind: ${term.kind}`);
   }
 
-  // Build the inner switch: cases by segment id.
-  const switchCases = [];
+  // Build the inner switch: emit one SCase per segment id at the head
+  // of that segment's body. Segments are sorted by id; per-segment bodies
+  // appear in id order in the switch body.
   const switchBodyStmts = [];
-  // Ensure segments are sorted by id; cases must follow source-position
-  // order (the codegen pre-scan does additional layout work).
   const ordered = [...segments].sort((a, b) => a.id - b.id);
-  let stmtCursor = 0;
   for (const seg of ordered) {
-    switchCases.push({ value: BigInt(seg.id), stmtIndex: stmtCursor, isDefault: false });
-    const caseBody = [...seg.stmts, ...termToStmts(seg.term)];
-    for (const s of caseBody) {
-      switchBodyStmts.push(s);
-      stmtCursor++;
-    }
+    switchBodyStmts.push(new AST.SCase(loc, BigInt(seg.id), BigInt(seg.id), false));
+    switchBodyStmts.push(...seg.stmts);
+    switchBodyStmts.push(...termToStmts(seg.term));
   }
   // Default: break out (unexpected state).
-  switchCases.push({ value: 0n, stmtIndex: stmtCursor, isDefault: true });
+  switchBodyStmts.push(new AST.SCase(loc, 0n, 0n, true));
   switchBodyStmts.push(new AST.SBreak(loc));
 
   const switchStmt = new AST.SSwitch(loc, stateRef(),
-    switchCases, new AST.SCompound(loc, switchBodyStmts));
+    new AST.SCompound(loc, switchBodyStmts));
 
   // The while loop wraps just the switch. Its body is one statement; in C
   // that's fine without braces, but we always wrap in a compound for sanity.
@@ -6761,15 +6713,22 @@ function dumpStmt(stmt, ctx, indent) {
       else ret += ind(indent + 1) + "(no increment)";
       ret += dumpStmt(stmt.body, ctx, indent + 1);
       break;
-    case AST.SSwitch:
+    case AST.SSwitch: {
       ret += dumpExpr(stmt.expr, ctx, indent + 1);
-      ret += ind(indent + 1) + stmt.cases.length + " cases";
-      for (const c of stmt.cases) {
+      const cases = [...stmt.body.caseBag];
+      ret += ind(indent + 1) + cases.length + " cases";
+      for (const c of cases) {
         ret += ind(indent + 2);
-        if (c.isDefault) ret += "default: @" + c.stmtIndex;
-        else ret += "case " + c.value + ": @" + c.stmtIndex;
+        if (c.isDefault) ret += "default:";
+        else if (c.lo === c.hi) ret += "case " + c.lo + ":";
+        else ret += "case " + c.lo + " ... " + c.hi + ":";
       }
       ret += dumpStmt(stmt.body, ctx, indent + 1);
+      break;
+    }
+    case AST.SCase:
+      ret += " " + (stmt.isDefault ? "default" :
+        (stmt.lo === stmt.hi ? "case " + stmt.lo : "case " + stmt.lo + " ... " + stmt.hi));
       break;
     case AST.STryCatch:
       ret += dumpStmt(stmt.tryBody, ctx, indent + 1);
@@ -9501,29 +9460,22 @@ class Parser {
         this.error(switchTok, `cannot switch on reference type '${expr.type.toString()}'`);
       }
       this.expect(")");
-      // Parse the body collecting case labels. Track the index in the
-      // *outer* switch body's statement list, even when case labels are
-      // buried inside nested compounds (the "Duff's device" pattern that
-      // SQLite's VDBE uses heavily — `case OP_ReopenIdx: { ... case
-      // OP_OpenRead: ... }`). Without this, nested-case stmtIndex would
-      // point into the inner compound and the codegen would dispatch
-      // case OP_OpenRead to a totally unrelated outer-body statement.
-      const cases = [];
-      const savedCases = this._currentCases;
-      const savedSwBody = this._switchBodyCompound;
-      const savedSwIdx = this._currentSwitchOuterStmtIdx;
-      this._currentCases = cases;
-      this._switchBodyCompound = null;  // first compound parsed below is it
-      this._currentSwitchOuterStmtIdx = 0;
+      // Body parses with `_inSwitch = true` so `case`/`default` labels
+      // are accepted (they are SCase nodes in the body's statement list).
+      // Nested switches save/restore the flag.
+      const savedInSwitch = this._inSwitch;
+      this._inSwitch = true;
       const body = this.parseStatement();
-      this._currentCases = savedCases;
-      this._switchBodyCompound = savedSwBody;
-      this._currentSwitchOuterStmtIdx = savedSwIdx;
-      return new AST.SSwitch(loc, expr, cases, body);
+      this._inSwitch = savedInSwitch;
+      return new AST.SSwitch(loc, expr, body);
     }
 
-    // case
+    // case — emits an SCase node and returns it. The next statement
+    // in the enclosing compound is the case's target (same pattern
+    // as SLabel for goto labels). Multiple cases for one target
+    // (`case 1: case 2: foo();`) produce consecutive SCase nodes.
     if (this.matchKW(Lexer.Keyword.CASE)) {
+      const caseTok = this.peek(-1);
       const caseExpr = this.parseAssignmentExpression();
       let lo = constEvalInt(caseExpr) ?? 0n;
       let hi = lo;
@@ -9534,45 +9486,20 @@ class Parser {
         hi = constEvalInt(highExpr) ?? 0n;
       }
       this.expect(":");
-      if (this._currentCases) {
-        // stmtIndex is the OUTER switch-body position (top-level for direct
-        // case labels; the position of the containing top-level stmt for
-        // nested case labels). The structured codegen uses this directly.
-        // localCompound + localIndex pin down the case's actual position
-        // (which compound is its parent, what index inside that compound) —
-        // the lowering pass needs this finer info to open the right segment
-        // when a case label is buried inside a nested compound (SQLite's
-        // Duff's-device VDBE pattern).
-        const idx = this._currentSwitchOuterStmtIdx !== undefined
-          ? this._currentSwitchOuterStmtIdx
-          : (this._currentCompoundStmtCount || 0);
-        const localCompound = this.currentCompound;
-        const localIndex = this._currentCompoundStmtCount || 0;
-        for (let v = lo; v <= hi; v++) {
-          this._currentCases.push({
-            value: v, stmtIndex: idx, isDefault: false,
-            localCompound, localIndex,
-          });
-        }
+      if (!this._inSwitch) {
+        this.error(caseTok, "'case' label not within a switch statement");
       }
-      return this.parseStatement();
+      return new AST.SCase(loc, lo, hi, false);
     }
 
-    // default
+    // default — same idea as case.
     if (this.matchKW(Lexer.Keyword.DEFAULT)) {
+      const defTok = this.peek(-1);
       this.expect(":");
-      if (this._currentCases) {
-        const idx = this._currentSwitchOuterStmtIdx !== undefined
-          ? this._currentSwitchOuterStmtIdx
-          : (this._currentCompoundStmtCount || 0);
-        const localCompound = this.currentCompound;
-        const localIndex = this._currentCompoundStmtCount || 0;
-        this._currentCases.push({
-          value: 0, stmtIndex: idx, isDefault: true,
-          localCompound, localIndex,
-        });
+      if (!this._inSwitch) {
+        this.error(defTok, "'default' label not within a switch statement");
       }
-      return this.parseStatement();
+      return new AST.SCase(loc, 0n, 0n, true);
     }
 
     // break
@@ -9766,30 +9693,13 @@ class Parser {
     this.expect("{");
     this.typeScope.push(); this.tagScope.push(); this.varScope.push();
     const statements = [];
-    const savedCount = this._currentCompoundStmtCount;
-    this._currentCompoundStmtCount = 0;
     const compound = new AST.SCompound(Lexer.Loc.fromTok(startTok), statements);
     const savedCompound = this.currentCompound;
     this.currentCompound = compound;
-
-    // If we're parsing the switch's body (first compound after `switch
-    // (..)`), claim ownership so per-iteration we can record the outer
-    // stmtIndex for any nested case labels.
-    if (this._currentCases !== undefined && this._currentCases !== null
-        && this._switchBodyCompound === null) {
-      this._switchBodyCompound = compound;
-    }
     while (!this.atEnd() && !this.atText("}")) {
-      // Handle case/default labels at compound level for switch tracking
-      this._currentCompoundStmtCount = statements.length;
-      if (compound === this._switchBodyCompound) {
-        this._currentSwitchOuterStmtIdx = statements.length;
-      }
       const stmt = this.parseStatement();
       statements.push(stmt);
     }
-
-    this._currentCompoundStmtCount = savedCount;
     this.currentCompound = savedCompound;
     this.expect("}");
     this.typeScope.pop(); this.tagScope.pop(); this.varScope.pop();
@@ -10708,7 +10618,7 @@ function lowerLongjmpInStmt(stmt, tag) {
     case AST.SSwitch: {
       const newBody = lowerLongjmpInStmt(stmt.body, tag);
       return newBody === stmt.body ? stmt
-        : new AST.SSwitch(stmt.loc, stmt.expr, stmt.cases, newBody);
+        : new AST.SSwitch(stmt.loc, stmt.expr, newBody);
     }
     case AST.STryCatch: {
       const newTry = lowerLongjmpInStmt(stmt.tryBody, tag);
@@ -13240,10 +13150,34 @@ class CodeGenerator {
       case AST.SSwitch: {
         const sw = stmt;
         const savedBreak = this.breakTarget;
-        let defaultIdx = -1;
-        for (let i = 0; i < sw.cases.length; i++) {
-          if (sw.cases[i].isDefault) { defaultIdx = i; break; }
+
+        // Top-level SCase nodes (direct statements of sw.body) in
+        // source order. Structured codegen can only dispatch to these
+        // positions; any SCase buried inside a nested compound is a
+        // Duff's-device pattern (SQLite VDBE) and requires the
+        // loop-switch lowering fallback.
+        const topLevelCases = [];
+        for (let si = 0; si < sw.body.statements.length; si++) {
+          const s = sw.body.statements[si];
+          if (s instanceof AST.SCase) topLevelCases.push({ caseNode: s, stmtPos: si });
         }
+        if (sw.body.caseBag.size > topLevelCases.length) {
+          const loc = sw.loc || {};
+          this.gotoErrors.push({
+            message: `switch contains nested case label(s); requires loop-switch lowering ` +
+                     `(in function '${this.currentFuncDef?.name || '?'}')`,
+            filename: loc.filename || '?',
+            line: loc.line || 0,
+          });
+          this.body.unreachable();
+          break;
+        }
+
+        let defaultIdx = -1;
+        for (let i = 0; i < topLevelCases.length; i++) {
+          if (topLevelCases[i].caseNode.isDefault) { defaultIdx = i; break; }
+        }
+
         // Collect forward labels and their statement positions in switch body
         const switchFwdLabels = [];
         for (let si = 0; si < sw.body.statements.length; si++) {
@@ -13266,17 +13200,17 @@ class CodeGenerator {
             }
           }
         }
-        const numCases = sw.cases.length;
+        const numCases = topLevelCases.length;
         const numFwdBlocks = switchFwdLabels.length;
 
         // Compute adjusted br index for each case.
         // A forward label at stmtPos P is interleaved between cases with
-        // stmtIndex <= P (inner) and cases with stmtIndex > P (outer).
+        // stmtPos <= P (inner) and cases with stmtPos > P (outer).
         const caseBrIdx = new Array(numCases);
         for (let i = 0; i < numCases; i++) {
           let adj = 0;
           for (const fl of switchFwdLabels) {
-            if (fl.stmtPos < sw.cases[i].stmtIndex) adj++;
+            if (fl.stmtPos < topLevelCases[i].stmtPos) adj++;
           }
           caseBrIdx[i] = i + adj;
         }
@@ -13288,7 +13222,7 @@ class CodeGenerator {
         // Sort by stmtPos descending (higher pos = outermost).
         const blockEntries = [];
         for (let i = 0; i < numCases; i++) {
-          blockEntries.push({ pos: sw.cases[i].stmtIndex, isForward: false, idx: i });
+          blockEntries.push({ pos: topLevelCases[i].stmtPos, isForward: false, idx: i });
         }
         for (let i = 0; i < switchFwdLabels.length; i++) {
           blockEntries.push({ pos: switchFwdLabels[i].stmtPos, isForward: true, idx: i });
@@ -13312,16 +13246,23 @@ class CodeGenerator {
           this.emitExpr(sw.expr);
           this.body.localSet(switchLocal);
 
-          // Count non-default cases and find min/max for density check
-          let nonDefaultCount = 0;
-          let minVal = 0x7FFFFFFF, maxVal = -0x80000000;
+          // Enumerate (value → caseIdx) pairs, expanding any GNU case
+          // ranges (`case lo ... hi:`). Each value gets one entry; the
+          // density check + br_table treat them as individual values.
+          const valueEntries = []; // [{ value: number, caseIdx: number }]
           for (let i = 0; i < numCases; i++) {
-            if (sw.cases[i].isDefault) continue;
-            const v = Number(sw.cases[i].value) | 0;
-            if (nonDefaultCount === 0 || v < minVal) minVal = v;
-            if (nonDefaultCount === 0 || v > maxVal) maxVal = v;
-            nonDefaultCount++;
+            const cn = topLevelCases[i].caseNode;
+            if (cn.isDefault) continue;
+            for (let v = cn.lo; v <= cn.hi; v++) {
+              valueEntries.push({ value: Number(v) | 0, caseIdx: i });
+            }
           }
+          let minVal = 0x7FFFFFFF, maxVal = -0x80000000;
+          for (const ve of valueEntries) {
+            if (ve.value < minVal) minVal = ve.value;
+            if (ve.value > maxVal) maxVal = ve.value;
+          }
+          const nonDefaultCount = valueEntries.length;
           const range = nonDefaultCount > 0 ? (maxVal - minVal + 1) >>> 0 : 0;
           const dense = nonDefaultCount >= 4 && range <= 512 &&
               (nonDefaultCount * 10 / range) >= 4; // density >= 40%
@@ -13334,10 +13275,8 @@ class CodeGenerator {
             // br_table path: build a jump table
             const fallbackIdx = defaultIdx >= 0 ? caseBrIdx[defaultIdx] : numCases + numFwdBlocks;
             const table = new Array(range).fill(fallbackIdx);
-            for (let i = 0; i < numCases; i++) {
-              if (sw.cases[i].isDefault) continue;
-              const v = Number(sw.cases[i].value) | 0;
-              table[(v - minVal) >>> 0] = caseBrIdx[i];
+            for (const ve of valueEntries) {
+              table[(ve.value - minVal) >>> 0] = caseBrIdx[ve.caseIdx];
             }
             this.body.localGet(switchLocal);
             this.body.i32Const(minVal);
@@ -13345,12 +13284,11 @@ class CodeGenerator {
             this.body.brTable(table, fallbackIdx);
           } else {
             // Linear br_if chain for sparse switches
-            for (let i = 0; i < numCases; i++) {
-              if (sw.cases[i].isDefault) continue;
+            for (const ve of valueEntries) {
               this.body.localGet(switchLocal);
-              this.body.i32Const(sw.cases[i].value);
+              this.body.i32Const(BigInt(ve.value));
               this.body.aop(WT_I32, ALU.OP_EQ);
-              this.body.brIf(caseBrIdx[i]);
+              this.body.brIf(caseBrIdx[ve.caseIdx]);
             }
             if (defaultIdx >= 0) this.body.br(caseBrIdx[defaultIdx]);
             else this.body.br(numCases + numFwdBlocks);
@@ -13378,10 +13316,11 @@ class CodeGenerator {
           }
           openLoopLabels.length = 0;
           this.blockDepth--; this.body.end();
-          const startIdx = sw.cases[i].stmtIndex;
-          const endIdx = (i + 1 < numCases) ? sw.cases[i + 1].stmtIndex : sw.body.statements.length;
+          const startIdx = topLevelCases[i].stmtPos;
+          const endIdx = (i + 1 < numCases) ? topLevelCases[i + 1].stmtPos : sw.body.statements.length;
           for (let j = startIdx; j < endIdx; j++) {
             const s = sw.body.statements[j];
+            if (s instanceof AST.SCase) continue;  // dispatch marker, no code
             if (s instanceof AST.SLabel) {
               if (!s.hasGotos) continue;
               if (s.labelKind === Types.LabelKind.FORWARD || s.labelKind === Types.LabelKind.BOTH) {
@@ -13439,6 +13378,7 @@ class CodeGenerator {
         break;
       }
       case AST.SLabel: break; // handled in COMPOUND
+      case AST.SCase: break;  // dispatch marker, handled in SSwitch
       case AST.SEmpty: break;
       case AST.SThrow: {
         const tagIdx = this.exceptionToWasmTagIdx.get(stmt.tag);
