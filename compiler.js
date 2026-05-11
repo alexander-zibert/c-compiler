@@ -2374,7 +2374,6 @@ class GCStructHeapType extends TypeInfo {
     this.tagName = tagName;
     this.tagDecl = null;       // set when struct definition is parsed
     this.parentType = null;    // GCStructHeapType | null
-    this._wasmGCTypeIdx = -1;  // codegen cache
     Object.seal(this);
   }
   isGCStructHeap() { return true; }
@@ -2453,7 +2452,6 @@ class GCArrayType extends TypeInfo {
   constructor(elementType) {
     super(0, 0, true);
     this.baseType = elementType;
-    this._wasmGCTypeIdx = -1;
     Object.seal(this);
   }
   isRef()     { return true; }
@@ -11199,6 +11197,12 @@ class WasmModule {
     this.funcTypeIndices = new Map(); // WasmFunctionType key -> index
     this.gcStructTypeIndices = new Map(); // struct fields key -> index
     this.gcArrayTypeIndices = new Map();  // array elem key -> index
+    // Per-module cache mapping C GC type -> wasm type index. Kept here
+    // (rather than as a field on the type object) because some GC types
+    // — notably `gcArrayOf(T)` for singleton T — are interned on the
+    // shared Types module and would otherwise carry indices from a
+    // previous compile.
+    this.gcTypeIdxByType = new Map();
     this.funcImports = [];      // section 2
     this.funcDefs = [];         // section 3 & 10
     this.memories = [];         // section 5
@@ -11834,7 +11838,8 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
   type = type.removeQualifiers();
   // Normalize struct ref form to heap form — wasm type idx lives on the heap.
   if (type.isGCStruct()) type = type.baseType;
-  if (type._wasmGCTypeIdx >= 0) return type._wasmGCTypeIdx;
+  const cached = wmod.gcTypeIdxByType.get(type);
+  if (cached !== undefined) return cached;
 
   if (!wmod._gcInProgress) wmod._gcInProgress = new Set();
   if (!wmod._gcPendingIdx) wmod._gcPendingIdx = new Map();
@@ -11873,7 +11878,7 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
       // handles the cross-canonical-form unification at instantiation.
       idx = pending;
       wmod._gcPendingIdx.delete(type);
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
       wmod.setGCStructFields(idx, fields, parentIdx);
       if (!wmod.gcStructTypeIndices.has(key)) wmod.gcStructTypeIndices.set(key, idx);
       if (type.tagName && !type.tagName.startsWith('__anon_gc_')) {
@@ -11888,10 +11893,10 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
     } else if (wmod.gcStructTypeIndices.has(key)) {
       // Cache hit, no reservation needed — no zombie typeDef.
       idx = wmod.gcStructTypeIndices.get(key);
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
     } else {
       idx = wmod.reserveGCStructTypeId();
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
       wmod.setGCStructFields(idx, fields, parentIdx);
       wmod.gcStructTypeIndices.set(key, idx);
       // Record names for the name custom section. First struct registered with
@@ -11915,15 +11920,15 @@ function getOrCreateGCWasmTypeIdx(wmod, type) {
     if (pending !== undefined) {
       idx = pending;
       wmod._gcPendingIdx.delete(type);
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
       wmod.setGCArrayElem(idx, elem);
       if (!wmod.gcArrayTypeIndices.has(key)) wmod.gcArrayTypeIndices.set(key, idx);
     } else if (wmod.gcArrayTypeIndices.has(key)) {
       idx = wmod.gcArrayTypeIndices.get(key);
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
     } else {
       idx = wmod.reserveGCArrayTypeId();
-      type._wasmGCTypeIdx = idx;
+      wmod.gcTypeIdxByType.set(type, idx);
       wmod.setGCArrayElem(idx, elem);
       wmod.gcArrayTypeIndices.set(key, idx);
     }

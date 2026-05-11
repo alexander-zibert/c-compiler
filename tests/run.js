@@ -114,24 +114,8 @@ function workerMain() {
   }
   function flush(arr) { return Buffer.concat(arr).toString('utf-8'); }
 
-  const COMPILER_PATH = path.join(ROOT, 'compiler.js');
-  const HOST_PATH = path.join(ROOT, 'host.js');
-  let compiler = require(COMPILER_PATH);
-  const runModule = require(HOST_PATH);
-
-  // The compiler module accumulates state across compile invocations (a
-  // PoC-level leak — root-causing it would invalidate the speedup
-  // argument). Periodically drop the require cache so each fresh compiler
-  // sees a clean slate. The cost is small (~10ms re-parse) amortized over
-  // many tests.
-  let testsSinceReset = 0;
-  const RESET_EVERY = 1; // conservative; bump up after the leak is fixed
-  function maybeResetCompiler() {
-    if (++testsSinceReset < RESET_EVERY) return;
-    testsSinceReset = 0;
-    delete require.cache[COMPILER_PATH];
-    compiler = require(COMPILER_PATH);
-  }
+  const compiler = require(path.join(ROOT, 'compiler.js'));
+  const runModule = require(path.join(ROOT, 'host.js'));
 
   function configureCompilerArgs(args, pp, compilerOptions, warningFlags) {
     for (let i = 0; i < args.length; i++) {
@@ -184,7 +168,6 @@ function workerMain() {
     if (WORKER_CHDIR_INCOMPATIBLE.has(td.name)) {
       return { name: td.name, status: 'skip', msg: 'uses chdir (worker_thread limitation)' };
     }
-    maybeResetCompiler();
 
     // ---- Compile ----
     const compilerStderrBuf = [];
@@ -196,7 +179,7 @@ function workerMain() {
 
     const pp = compiler.createDefaultPPRegistry();
     pp.fileReader = (filePath) => {
-      try { return compiler.spliceLines(fs.readFileSync(filePath, 'utf-8')); }
+      try { return fs.readFileSync(filePath, 'utf-8'); }
       catch { return null; }
     };
     pp.defines.set('TEST_TMPDIR', `"${TEST_TMPDIR}/"`);
