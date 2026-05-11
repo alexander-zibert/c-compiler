@@ -1,0 +1,18 @@
+--- starting balances ---
+1|alice|100
+2|bob|200
+--- commit: transfer 50 from alice to bob ---
+1|alice|50
+2|bob|250
+--- rollback: discard transfer ---
+* during txn: -950
+* after rollback: 50
+--- savepoint partial rollback ---
+* final bal id=1: 53
+--- multiple statements per txn ---
+1|alice|53
+2|bob|250
+3|carol|1000
+4|dave|2000
+--- read-only txn ---
+3303

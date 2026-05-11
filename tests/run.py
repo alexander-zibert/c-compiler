@@ -13,6 +13,7 @@ Categories:
     unit   — compile+run tests from tests/unit/
     extra  — compile+run tests from tests/extra/
     lua    — Lua official test suite (build VM, run .lua files)
+    sqlite — SQLite integration tests (build sqlite.wasm, run .sql scripts)
     disw   — WebAssembly disassembler output tests
     sourcemap — source map line number accuracy tests
     all    — all of the above
@@ -60,7 +61,10 @@ DISW_TEST_DIR = os.path.join(SCRIPT_DIR, "disw")
 SOURCEMAP_DIR = os.path.join(SCRIPT_DIR, "sourcemap")
 AST_DIR = os.path.join(SCRIPT_DIR, "ast")
 
-ALL_CATEGORIES = ["ast", "unit", "extra", "projects", "zlib", "lua", "freetype", "disw", "sourcemap"]
+SQLITE_DIR = os.path.join(VENDOR_DIR, "sqlite")
+SQLITE_TEST_DIR = os.path.join(SCRIPT_DIR, "sqlite")
+
+ALL_CATEGORIES = ["ast", "unit", "extra", "projects", "zlib", "lua", "freetype", "sqlite", "disw", "sourcemap"]
 DEFAULT_CATEGORIES = ["unit"]
 
 
@@ -580,14 +584,14 @@ def run_zlib_tests(results, filter_str=None):
 LUA_SKIP = {"files.lua", "heavy.lua", "verybig.lua", "big.lua", "memerr.lua", "cstack.lua", "main.lua"}
 
 
-def build_project(project_json_path):
+def build_project(project_json_path, timeout=60):
     """Build a project from its JSON file. Returns (wasm_path, error_string)."""
     with open(project_json_path) as f:
         proj = json.load(f)
     os.makedirs(BUILD_DIR, exist_ok=True)
     output = os.path.join(BUILD_DIR, f"{proj['name']}-js.wasm")
     cmd = [*COMPILER_CMD, "-o", output, project_json_path]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=ROOT_DIR)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=ROOT_DIR)
     if r.returncode != 0:
         return None, r.stderr
     return output, ""
@@ -675,6 +679,114 @@ def run_freetype_tests(results, filter_str=None):
     finally:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
+
+
+# --- SQLite tests ---
+#
+# Builds vendor/sqlite/bin.json once, then walks tests/sqlite/<name>/ entries.
+# Each directory is one test:
+#   test.sql        — fed to wasm sqlite on stdin
+#   expected.txt    — required, byte-exact stdout match
+#   expected_err.txt — optional, byte-exact stderr match
+#   config.json     — optional per-test overrides (see tests/sqlite/README.md)
+#
+# Exit code is intentionally ignored: SQLite reports per-statement constraint
+# failures via stderr + non-zero exit but continues processing — so we
+# compare stdout/stderr instead. Set `config.json: { "expectExitCode": 0 }`
+# to add an exit-code assertion.
+
+def run_sqlite_tests(results, filter_str=None):
+    if not os.path.isdir(SQLITE_TEST_DIR):
+        results.record("sqlite/build", False, f"Test dir not found: {SQLITE_TEST_DIR}")
+        return
+
+    # SQLite amalgamation is ~250k LOC; give the build a generous timeout.
+    bin_json = os.path.join(SQLITE_DIR, "bin.json")
+    if not os.path.exists(bin_json):
+        results.record("sqlite/build", False, f"Not found: {bin_json}")
+        return
+    wasm, err = build_project(bin_json, timeout=600)
+    if wasm is None:
+        results.record("sqlite/build", False, f"Failed to build sqlite.wasm:\n{err}")
+        return
+
+    subdirs = sorted(
+        d for d in os.listdir(SQLITE_TEST_DIR)
+        if os.path.isdir(os.path.join(SQLITE_TEST_DIR, d))
+    )
+    for d in subdirs:
+        test_name = f"sqlite/{d}"
+        if filter_str and filter_str not in test_name:
+            continue
+
+        test_dir = os.path.join(SQLITE_TEST_DIR, d)
+        sql_path = os.path.join(test_dir, "test.sql")
+        expected_path = os.path.join(test_dir, "expected.txt")
+        expected_err_path = os.path.join(test_dir, "expected_err.txt")
+        config_path = os.path.join(test_dir, "config.json")
+
+        if not os.path.exists(sql_path) or not os.path.exists(expected_path):
+            results.record(test_name, False,
+                           "Missing test.sql or expected.txt")
+            continue
+
+        cfg = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    cfg = json.load(f)
+            except Exception as e:
+                results.record(test_name, False, f"Bad config.json: {e}")
+                continue
+        if cfg.get("skip"):
+            results.skip(test_name)
+            continue
+
+        shell_args = cfg.get("shellArgs", ["-batch"])
+        with open(sql_path, "rb") as f:
+            stdin_bytes = f.read()
+
+        try:
+            r = subprocess.run(
+                ["node", "--experimental-wasm-exnref", HOST_JS, wasm, *shell_args],
+                input=stdin_bytes,
+                capture_output=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            results.record(test_name, False, "Timed out (60s)")
+            continue
+
+        stdout = r.stdout.decode("utf-8", errors="replace")
+        stderr = r.stderr.decode("utf-8", errors="replace")
+
+        with open(expected_path) as f:
+            expected_stdout = f.read()
+
+        if stdout != expected_stdout:
+            msg = (f"stdout mismatch\n"
+                   f"--- expected ---\n{expected_stdout}"
+                   f"--- got (exit={r.returncode}) ---\n{stdout}"
+                   f"--- stderr ---\n{stderr}")
+            results.record(test_name, False, msg)
+            continue
+
+        if os.path.exists(expected_err_path):
+            with open(expected_err_path) as f:
+                expected_stderr = f.read()
+            if stderr != expected_stderr:
+                msg = (f"stderr mismatch\n"
+                       f"--- expected ---\n{expected_stderr}"
+                       f"--- got ---\n{stderr}")
+                results.record(test_name, False, msg)
+                continue
+
+        expected_code = cfg.get("expectExitCode")
+        if expected_code is not None and r.returncode != expected_code:
+            results.record(test_name, False,
+                           f"Exit code {r.returncode}, expected {expected_code}\nstderr: {stderr}")
+            continue
+
+        results.record(test_name, True)
 
 
 # --- disw (WebAssembly disassembler) tests ---
@@ -912,6 +1024,10 @@ def main():
         elif cat == "freetype":
             results.section("freetype")
             run_freetype_tests(results, filter_str=args.filter)
+
+        elif cat == "sqlite":
+            results.section("sqlite")
+            run_sqlite_tests(results, filter_str=args.filter)
 
         elif cat == "disw":
             results.section("disw")

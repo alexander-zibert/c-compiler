@@ -1,0 +1,33 @@
+--- INNER JOIN ---
+asimov|foundation
+asimov|i_robot
+orwell|1984
+orwell|animal_farm
+tolkien|the_hobbit
+--- LEFT JOIN (authors with no books vs author with NULL ref) ---
+asimov|foundation
+asimov|i_robot
+orwell|1984
+orwell|animal_farm
+silent|
+tolkien|the_hobbit
+--- LEFT JOIN with NULL on right ---
+orphan|
+untitled|
+--- self join ---
+leaf|left
+left|root
+right|root
+--- CROSS JOIN ---
+blue_L
+blue_M
+blue_S
+red_L
+red_M
+red_S
+--- 3-way join ---
+asimov|foundation|scifi
+asimov|i_robot|scifi
+orwell|1984|dystopia
+orwell|animal_farm|dystopia
+tolkien|the_hobbit|fantasy

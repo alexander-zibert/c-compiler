@@ -1,0 +1,21 @@
+--- initial ---
+1|alpha|1
+2|beta|2
+3|gamma|3
+4|delta|4
+--- update single ---
+2|beta|20
+--- update many ---
+alpha|101
+beta|20
+gamma|103
+delta|104
+--- delete ---
+3
+1|alpha|101
+2|beta|20
+4|delta|104
+--- insert OR IGNORE on PK conflict ---
+1|alpha|101
+--- insert OR REPLACE on PK conflict ---
+1|replaced|999

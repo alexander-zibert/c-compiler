@@ -1,0 +1,23 @@
+--- initial ---
+1|alice
+2|bob
+10|1|100.0
+11|1|200.0
+12|2|50.0
+100|10|1
+101|11|0
+102|12|1
+--- FK violation: insert orphan ---
+--- ON DELETE CASCADE: delete customer 1, cascades to orders, sets invoice.order_id NULL ---
+* customers:
+2|bob
+* orders:
+12|2|50.0
+* invoices:
+100||1
+101||0
+102|12|1
+--- pragma foreign_key_check ---
+--- disable FKs, allow orphan ---
+* count after orphan insert with FKs off:
+2

@@ -1,0 +1,24 @@
+--- COUNT, SUM, AVG, MIN, MAX ---
+7|48|6.86|1|20
+--- GROUP BY ---
+east|1|1|2.50
+north|3|18|67.50
+south|3|29|123.00
+--- HAVING ---
+widget|4
+gadget|2
+--- DISTINCT ---
+3
+gadget
+thing
+widget
+--- aggregate filter (FILTER clause) ---
+48|34|29
+--- group_concat ---
+east|widget
+north|widget,gadget,widget
+south|widget,gadget,thing
+--- aggregate with CASE ---
+34|14
+--- empty aggregates ---
+0|||

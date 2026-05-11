@@ -1,0 +1,44 @@
+--- ROW_NUMBER per subject ---
+art|bob|92|1
+art|carol|85|2
+art|alice|70|3
+math|alice|95|1
+math|carol|82|2
+math|bob|60|3
+sci|carol|90|1
+sci|alice|88|2
+sci|bob|75|3
+--- RANK / DENSE_RANK with ties ---
+a|100|1|1
+b|90|2|2
+c|90|2|2
+d|80|4|3
+e|70|5|4
+--- LAG / LEAD ---
+1|10||15|
+2|15|10|12|5
+3|12|15|20|-3
+4|20|12|18|8
+5|18|20||-2
+--- running sum / avg ---
+1|10|10|10.00
+2|15|25|12.50
+3|12|37|13.50
+4|20|57|16.00
+5|18|75|19.00
+--- NTILE ---
+10|1
+12|1
+15|2
+18|2
+20|3
+--- FIRST_VALUE / LAST_VALUE ---
+art|bob|92|bob|alice
+art|carol|85|bob|alice
+art|alice|70|bob|alice
+math|alice|95|alice|bob
+math|carol|82|alice|bob
+math|bob|60|alice|bob
+sci|carol|90|carol|bob
+sci|alice|88|carol|bob
+sci|bob|75|carol|bob

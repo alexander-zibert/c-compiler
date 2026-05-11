@@ -1,0 +1,10 @@
+--- exercise triggers ---
+--- log contents ---
+insert|id=4 item=cheese qty=8
+update|id=1 qty_old=100 qty_new=95
+delete|id=3 item=milk
+--- conditional trigger (WHEN clause) ---
+big_qty: id=4 qty=200
+--- INSTEAD OF on a view ---
+view-update id=1 new_qty=999
+95

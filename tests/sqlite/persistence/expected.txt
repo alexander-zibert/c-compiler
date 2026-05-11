@@ -1,0 +1,17 @@
+--- write-side count ---
+100
+338350
+--- in-memory after switch (records should not exist) ---
+--- after re-open ---
+100
+338350
+--- sample rows ---
+1|item_0001|1
+2|item_0002|4
+3|item_0003|9
+98|item_0098|9604
+99|item_0099|9801
+100|item_0100|10000
+--- write again to existing db ---
+101
+101|appended|-1
