@@ -6798,6 +6798,648 @@ function dumpAst(units) {
   return out;
 }
 
+// ====================
+// C Pretty-Printer — AST→C source
+// ====================
+//
+// Emits re-compilable C code from the AST. The output parses to the same
+// AST (modulo source locations and cosmetic whitespace). EImplicitCast and
+// EDecay nodes are transparent — they're re-inserted deterministically by
+// the parser, so we skip them here.
+
+function printC(units, options) {
+  const showStdlib = !!(options && options.showStdlib);
+  const out = [];
+  const emittedTags = new Set();
+
+  function w(s) { out.push(s); }
+
+  // --- Type spelling (C's inside-out declaration syntax) ---
+  // spellType(type, declarator) returns a string like "int (*x)[10]".
+  // `declarator` is the "inner" part built outward from the variable name.
+  function spellType(type, declarator) {
+    type = type.removeQualifiers ? type : type;
+    const q = qualPrefix(type);
+    const uq = type.removeQualifiers();
+    if (uq instanceof Types.PointerType) {
+      let inner = "*" + q + declarator;
+      const base = uq.baseType.removeQualifiers();
+      if (base instanceof Types.ArrayType || base.isFunction()) inner = "(" + inner + ")";
+      return spellType(uq.baseType, inner);
+    }
+    if (uq instanceof Types.ArrayType) {
+      const sz = uq.arraySize >= 0 ? String(uq.arraySize) : "";
+      return spellType(uq.baseType, declarator + "[" + sz + "]");
+    }
+    if (uq.isFunction()) {
+      const params = [];
+      for (let i = 0; i < uq.paramTypes.length; i++) {
+        params.push(spellType(uq.paramTypes[i], ""));
+      }
+      if (uq.isVarArg) params.push("...");
+      else if (params.length === 0 && !uq.hasUnspecifiedParams) params.push("void");
+      return spellType(uq.returnType, declarator + "(" + params.join(", ") + ")");
+    }
+    return q + spellBaseType(uq) + (declarator ? " " + declarator : "");
+  }
+
+  function qualPrefix(type) {
+    let q = "";
+    if (type.isConst) q += "const ";
+    if (type.isVolatile) q += "volatile ";
+    return q;
+  }
+
+  function spellBaseType(type) {
+    const uq = type.removeQualifiers();
+    if (uq.isTag && uq.isTag()) {
+      return uq.tagKind + " " + uq.tagName;
+    }
+    if (uq instanceof Types.GCStructRefType) return "__struct " + uq.tagName + " *";
+    if (uq instanceof Types.GCStructHeapType) return "__struct " + uq.tagName;
+    if (uq instanceof Types.GCArrayType) return "__array(" + spellBaseType(uq.baseType) + ")";
+    if (uq instanceof Types.ExternRefType) return "__externref";
+    if (uq instanceof Types.RefExternType) return "__refextern";
+    if (uq instanceof Types.EqRefType) return "__eqref";
+    if (uq === Types.TVOID) return "void";
+    if (uq === Types.TBOOL) return "_Bool";
+    if (uq.name) return uq.name;
+    return uq.toString();
+  }
+
+  // Spell a declaration with a name: "int x", "void (*fp)(int)"
+  function spellDecl(type, name) {
+    return spellType(type, name);
+  }
+
+  // --- Tag (struct/union/enum) definition emission ---
+  function emitTagDef(tagDecl, indent) {
+    if (!tagDecl || emittedTags.has(tagDecl)) return;
+    emittedTags.add(tagDecl);
+    const ind = "  ".repeat(indent);
+    if (tagDecl.tagKind === "enum") {
+      w(ind + tagDecl.tagKind + " " + (tagDecl.name || "") + " {\n");
+      for (let i = 0; i < tagDecl.members.length; i++) {
+        const m = tagDecl.members[i];
+        w(ind + "  " + m.name + " = " + m.value);
+        if (i < tagDecl.members.length - 1) w(",");
+        w("\n");
+      }
+      w(ind + "}");
+      return;
+    }
+    // struct / union
+    w(ind + tagDecl.tagKind + " " + (tagDecl.name || ""));
+    if (!tagDecl.isComplete) return;
+    w(" {\n");
+    for (const m of tagDecl.members) {
+      if (!m.name && m.type && m.type.isTag && m.type.isTag() && m.type.tagDecl) {
+        emitTagDef(m.type.tagDecl, indent + 1);
+        w(";\n");
+        continue;
+      }
+      w(ind + "  " + spellDecl(m.type, m.name || ""));
+      if (m.bitWidth >= 0) w(" : " + m.bitWidth);
+      w(";\n");
+    }
+    w(ind + "}");
+    if (tagDecl.isPacked) w(" __attribute__((packed))");
+  }
+
+  // Emit tag definition inline if this type references a tag we haven't
+  // emitted yet. Returns the base type string to use.
+  function maybeEmitInlineTag(type) {
+    const uq = type.removeQualifiers();
+    if (uq.isTag && uq.isTag() && uq.tagDecl && uq.tagDecl.isComplete && !emittedTags.has(uq.tagDecl)) {
+      return true;
+    }
+    return false;
+  }
+
+  // --- Operator precedence for minimal parenthesization ---
+  const PREC = {
+    COMMA: 1,
+    ASSIGN: 2, ADD_ASSIGN: 2, SUB_ASSIGN: 2, MUL_ASSIGN: 2,
+    DIV_ASSIGN: 2, MOD_ASSIGN: 2, BAND_ASSIGN: 2, BOR_ASSIGN: 2,
+    BXOR_ASSIGN: 2, SHL_ASSIGN: 2, SHR_ASSIGN: 2,
+    TERNARY: 3,
+    LOR: 4, LAND: 5, BOR: 6, BXOR: 7, BAND: 8,
+    EQ: 9, NE: 9, LT: 10, GT: 10, LE: 10, GE: 10,
+    SHL: 11, SHR: 11, ADD: 12, SUB: 12, MUL: 13, DIV: 13, MOD: 13,
+    UNARY: 14, POSTFIX: 15, PRIMARY: 16,
+  };
+
+  function exprPrec(expr) {
+    if (!expr) return PREC.PRIMARY;
+    if (expr instanceof AST.EImplicitCast) return exprPrec(expr.expr);
+    if (expr instanceof AST.EDecay) return exprPrec(expr.operand);
+    if (expr instanceof AST.EBinary) return PREC[expr.op] || PREC.PRIMARY;
+    if (expr instanceof AST.EComma) return PREC.COMMA;
+    if (expr instanceof AST.ETernary) return PREC.TERNARY;
+    if (expr instanceof AST.EUnary) {
+      if (expr.op === "OP_POST_INC" || expr.op === "OP_POST_DEC") return PREC.POSTFIX;
+      return PREC.UNARY;
+    }
+    if (expr instanceof AST.ECast) return PREC.UNARY;
+    return PREC.PRIMARY;
+  }
+
+  function paren(inner, innerPrec, neededPrec) {
+    return innerPrec < neededPrec ? "(" + inner + ")" : inner;
+  }
+
+  // --- Expression emission ---
+  function emitExpr(expr) {
+    if (!expr) return "0";
+    if (expr instanceof AST.EImplicitCast) return emitExpr(expr.expr);
+    if (expr instanceof AST.EDecay) return emitExpr(expr.operand);
+
+    if (expr instanceof AST.EInt) {
+      const t = expr.type.removeQualifiers();
+      let s = String(expr.value);
+      if (expr.value < 0n) s = "(" + s + ")";
+      if (t === Types.TUINT || t === Types.TULONG) s += "U";
+      else if (t === Types.TLLONG) s += "LL";
+      else if (t === Types.TULLONG) s += "ULL";
+      else if (t === Types.TLONG) s += "L";
+      return s;
+    }
+    if (expr instanceof AST.EFloat) {
+      const t = expr.type.removeQualifiers();
+      let s;
+      if (!isFinite(expr.value)) {
+        if (expr.value === Infinity) s = "(1.0/0.0)";
+        else if (expr.value === -Infinity) s = "(-1.0/0.0)";
+        else s = "(0.0/0.0)";
+      } else {
+        s = expr.value.toString();
+        if (!s.includes(".") && !s.includes("e") && !s.includes("E")) s += ".0";
+      }
+      if (t === Types.TFLOAT) s += "f";
+      else if (t === Types.TLDOUBLE) s += "L";
+      return s;
+    }
+    if (expr instanceof AST.EString) {
+      return emitStringLiteral(expr);
+    }
+    if (expr instanceof AST.EIdent) {
+      return expr.decl.name;
+    }
+    if (expr instanceof AST.EBinary) {
+      const meta = AST.BinOp[expr.op];
+      const p = PREC[expr.op] || PREC.PRIMARY;
+      const isRightAssoc = meta.isAssign;
+      const left = paren(emitExpr(expr.left), exprPrec(expr.left), isRightAssoc ? p + 1 : p);
+      const right = paren(emitExpr(expr.right), exprPrec(expr.right), isRightAssoc ? p : p + 1);
+      return left + " " + meta.text + " " + right;
+    }
+    if (expr instanceof AST.EUnary) {
+      const meta = AST.UnOp[expr.op];
+      if (expr.op === "OP_POST_INC" || expr.op === "OP_POST_DEC") {
+        return paren(emitExpr(expr.operand), exprPrec(expr.operand), PREC.POSTFIX) + meta.text;
+      }
+      const inner = paren(emitExpr(expr.operand), exprPrec(expr.operand), PREC.UNARY);
+      return meta.text + inner;
+    }
+    if (expr instanceof AST.ETernary) {
+      const c = paren(emitExpr(expr.condition), exprPrec(expr.condition), PREC.TERNARY + 1);
+      const t = emitExpr(expr.thenExpr);
+      const e = paren(emitExpr(expr.elseExpr), exprPrec(expr.elseExpr), PREC.TERNARY);
+      return c + " ? " + t + " : " + e;
+    }
+    if (expr instanceof AST.ECall) {
+      const callee = paren(emitExpr(expr.callee), exprPrec(expr.callee), PREC.POSTFIX);
+      const args = expr.arguments.map(a => emitExpr(a)).join(", ");
+      return callee + "(" + args + ")";
+    }
+    if (expr instanceof AST.ESubscript) {
+      return paren(emitExpr(expr.array), exprPrec(expr.array), PREC.POSTFIX) + "[" + emitExpr(expr.index) + "]";
+    }
+    if (expr instanceof AST.EMember) {
+      return paren(emitExpr(expr.base), exprPrec(expr.base), PREC.POSTFIX) + "." + expr.memberDecl.name;
+    }
+    if (expr instanceof AST.EArrow) {
+      return paren(emitExpr(expr.base), exprPrec(expr.base), PREC.POSTFIX) + "->" + expr.memberDecl.name;
+    }
+    if (expr instanceof AST.ECast) {
+      return "(" + spellType(expr.targetType, "") + ")" + paren(emitExpr(expr.expr), exprPrec(expr.expr), PREC.UNARY);
+    }
+    if (expr instanceof AST.ESizeofExpr) {
+      return "sizeof(" + emitExpr(expr.expr) + ")";
+    }
+    if (expr instanceof AST.ESizeofType) {
+      return "sizeof(" + spellType(expr.operandType, "") + ")";
+    }
+    if (expr instanceof AST.EAlignofExpr) {
+      return "_Alignof(" + emitExpr(expr.expr) + ")";
+    }
+    if (expr instanceof AST.EAlignofType) {
+      return "_Alignof(" + spellType(expr.operandType, "") + ")";
+    }
+    if (expr instanceof AST.EComma) {
+      return emitExpr(expr.left) + ", " + emitExpr(expr.right);
+    }
+    if (expr instanceof AST.EInitList) {
+      return "{" + expr.elements.map(e => emitExpr(e)).join(", ") + "}";
+    }
+    if (expr instanceof AST.ECompoundLiteral) {
+      return "(" + spellType(expr.type, "") + ")" + emitExpr(expr.initList);
+    }
+    if (expr instanceof AST.EIntrinsic) {
+      return emitIntrinsic(expr);
+    }
+    if (expr instanceof AST.EWasm) {
+      return emitWasm(expr);
+    }
+    if (expr instanceof AST.EGCNew) {
+      return "__gc_new(" + expr.args.map(a => emitExpr(a)).join(", ") + ")";
+    }
+    return "/* unknown expr " + expr.constructor.name + " */0";
+  }
+
+  function emitStringLiteral(expr) {
+    const elemType = expr.type.baseType;
+    const elemSize = elemType.size;
+    let prefix = "";
+    if (elemSize === 2) prefix = "u";
+    else if (elemSize === 4) prefix = "U";
+    const bytes = expr.value;
+    let s = prefix + "\"";
+    // Decode elements from the byte array
+    const nullTermBytes = elemSize;
+    const contentLen = bytes.length - nullTermBytes;
+    for (let i = 0; i < contentLen; i += elemSize) {
+      let ch;
+      if (elemSize === 1) ch = bytes[i];
+      else if (elemSize === 2) ch = bytes[i] | (bytes[i + 1] << 8);
+      else ch = bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24);
+      if (ch === 0) s += "\\0";
+      else if (ch === 7) s += "\\a";
+      else if (ch === 8) s += "\\b";
+      else if (ch === 9) s += "\\t";
+      else if (ch === 10) s += "\\n";
+      else if (ch === 11) s += "\\v";
+      else if (ch === 12) s += "\\f";
+      else if (ch === 13) s += "\\r";
+      else if (ch === 27) s += "\\e";
+      else if (ch === 34) s += "\\\"";
+      else if (ch === 92) s += "\\\\";
+      else if (ch >= 32 && ch < 127) s += String.fromCharCode(ch);
+      else if (elemSize === 1) s += "\\x" + ch.toString(16).padStart(2, "0");
+      else if (elemSize === 2) s += "\\u" + ch.toString(16).padStart(4, "0");
+      else s += "\\U" + (ch >>> 0).toString(16).padStart(8, "0");
+    }
+    s += "\"";
+    return s;
+  }
+
+  function emitIntrinsic(expr) {
+    const args = expr.args.map(a => emitExpr(a)).join(", ");
+    switch (expr.intrinsicKind) {
+      case Types.IntrinsicKind.VA_START: return "__builtin_va_start(" + args + ")";
+      case Types.IntrinsicKind.VA_ARG: return "__builtin_va_arg(" + args + ")";
+      case Types.IntrinsicKind.VA_END: return "__builtin_va_end(" + args + ")";
+      case Types.IntrinsicKind.VA_COPY: return "__builtin_va_copy(" + args + ")";
+      case Types.IntrinsicKind.UNREACHABLE: return "__builtin_unreachable()";
+      case Types.IntrinsicKind.ALLOCA: return "__builtin(alloca" + (args ? ", " + args : "") + ")";
+      case Types.IntrinsicKind.MEMORY_SIZE: return "__builtin(memory_size)";
+      case Types.IntrinsicKind.MEMORY_GROW: return "__builtin(memory_grow, " + args + ")";
+      case Types.IntrinsicKind.MEMORY_COPY: return "__builtin(memory_copy, " + args + ")";
+      case Types.IntrinsicKind.MEMORY_FILL: return "__builtin(memory_fill, " + args + ")";
+      case Types.IntrinsicKind.HEAP_BASE: return "__builtin(heap_base)";
+      case Types.IntrinsicKind.REF_IS_NULL: return "__ref_is_null(" + args + ")";
+      case Types.IntrinsicKind.REF_EQ: return "__ref_eq(" + args + ")";
+      case Types.IntrinsicKind.REF_NULL: {
+        const t = expr.argType || expr.type;
+        return "__ref_null(" + spellType(t, "") + ")";
+      }
+      case Types.IntrinsicKind.REF_TEST: return "__ref_test(" + spellType(expr.argType, "") + ", " + args + ")";
+      case Types.IntrinsicKind.REF_TEST_NULL: return "__ref_test_null(" + spellType(expr.argType, "") + ", " + args + ")";
+      case Types.IntrinsicKind.REF_CAST: return "__ref_cast(" + spellType(expr.argType, "") + ", " + args + ")";
+      case Types.IntrinsicKind.REF_CAST_NULL: return "__ref_cast_null(" + spellType(expr.argType, "") + ", " + args + ")";
+      case Types.IntrinsicKind.ARRAY_LEN: return "__array_len(" + args + ")";
+      case Types.IntrinsicKind.GC_NEW_ARRAY: return "__gc_new_array(" + spellType(expr.argType, "") + ", " + args + ")";
+      case Types.IntrinsicKind.ARRAY_FILL: return "__array_fill(" + args + ")";
+      case Types.IntrinsicKind.ARRAY_COPY: return "__array_copy(" + args + ")";
+      case Types.IntrinsicKind.REF_AS_EXTERN: return "__ref_as_extern(" + args + ")";
+      case Types.IntrinsicKind.REF_AS_EQ: return "__ref_as_eq(" + args + ")";
+      case Types.IntrinsicKind.CAST: return "__cast(" + spellType(expr.argType, "") + ", " + args + ")";
+      default: return "/* intrinsic:" + expr.intrinsicKind + " */(" + args + ")";
+    }
+  }
+
+  function emitWasm(expr) {
+    const args = expr.args.map(a => emitExpr(a));
+    const hexBytes = Array.from(expr.bytes).map(b => b.toString(16).padStart(2, "0")).join(" ");
+    return "__wasm(\"" + hexBytes + "\"" + (args.length ? ", " + args.join(", ") : "") + ")";
+  }
+
+  // --- Statement emission ---
+  function emitStmt(stmt, indent) {
+    if (!stmt) return;
+    const ind = "  ".repeat(indent);
+    if (stmt instanceof AST.SCompound) {
+      w(ind + "{\n");
+      for (const s of stmt.statements) emitStmt(s, indent + 1);
+      w(ind + "}\n");
+      return;
+    }
+    if (stmt instanceof AST.SExpr) {
+      w(ind + emitExpr(stmt.expr) + ";\n");
+      return;
+    }
+    if (stmt instanceof AST.SDecl) {
+      for (const d of stmt.declarations) {
+        emitLocalDecl(d, indent);
+      }
+      return;
+    }
+    if (stmt instanceof AST.SReturn) {
+      if (stmt.expr) w(ind + "return " + emitExpr(stmt.expr) + ";\n");
+      else w(ind + "return;\n");
+      return;
+    }
+    if (stmt instanceof AST.SIf) {
+      w(ind + "if (" + emitExpr(stmt.condition) + ")\n");
+      emitBody(stmt.thenBranch, indent);
+      if (stmt.elseBranch) {
+        w(ind + "else\n");
+        emitBody(stmt.elseBranch, indent);
+      }
+      return;
+    }
+    if (stmt instanceof AST.SWhile) {
+      w(ind + "while (" + emitExpr(stmt.condition) + ")\n");
+      emitBody(stmt.body, indent);
+      return;
+    }
+    if (stmt instanceof AST.SDoWhile) {
+      w(ind + "do\n");
+      emitBody(stmt.body, indent);
+      w(ind + "while (" + emitExpr(stmt.condition) + ");\n");
+      return;
+    }
+    if (stmt instanceof AST.SFor) {
+      w(ind + "for (");
+      if (stmt.init) {
+        if (stmt.init instanceof AST.SDecl) {
+          const parts = [];
+          for (const d of stmt.init.declarations) {
+            let s = spellDecl(d.type, d.name);
+            if (d.initExpr) s += " = " + emitExpr(d.initExpr);
+            parts.push(s);
+          }
+          w(parts.join(", "));
+        } else if (stmt.init instanceof AST.SExpr) {
+          w(emitExpr(stmt.init.expr));
+        }
+      }
+      w("; ");
+      if (stmt.condition) w(emitExpr(stmt.condition));
+      w("; ");
+      if (stmt.increment) w(emitExpr(stmt.increment));
+      w(")\n");
+      emitBody(stmt.body, indent);
+      return;
+    }
+    if (stmt instanceof AST.SSwitch) {
+      w(ind + "switch (" + emitExpr(stmt.expr) + ")\n");
+      emitBody(stmt.body, indent);
+      return;
+    }
+    if (stmt instanceof AST.SCase) {
+      const cind = "  ".repeat(Math.max(0, indent - 1));
+      if (stmt.isDefault) w(cind + "default:\n");
+      else if (stmt.lo === stmt.hi) w(cind + "case " + stmt.lo + ":\n");
+      else w(cind + "case " + stmt.lo + " ... " + stmt.hi + ":\n");
+      return;
+    }
+    if (stmt instanceof AST.SGoto) {
+      w(ind + "goto " + stmt.label + ";\n");
+      return;
+    }
+    if (stmt instanceof AST.SLabel) {
+      w(stmt.name + ":\n");
+      return;
+    }
+    if (stmt instanceof AST.SBreak) { w(ind + "break;\n"); return; }
+    if (stmt instanceof AST.SContinue) { w(ind + "continue;\n"); return; }
+    if (stmt instanceof AST.SEmpty) { w(ind + ";\n"); return; }
+    if (stmt instanceof AST.STryCatch) {
+      w(ind + "__try\n");
+      emitBody(stmt.tryBody, indent);
+      for (const cc of stmt.catches) {
+        if (cc.tag) {
+          w(ind + "__catch " + cc.tag.name + "(" + cc.bindings.join(", ") + ")\n");
+        } else {
+          w(ind + "__catch\n");
+        }
+        emitBody(cc.body, indent);
+      }
+      return;
+    }
+    if (stmt instanceof AST.SThrow) {
+      w(ind + "__throw " + stmt.tag.name + "(" + stmt.args.map(a => emitExpr(a)).join(", ") + ");\n");
+      return;
+    }
+    w(ind + "/* unknown stmt: " + stmt.constructor.name + " */\n");
+  }
+
+  // Emit a stmt as a block body — if it's a compound, emit directly;
+  // otherwise wrap in braces for safety.
+  function emitBody(stmt, indent) {
+    if (stmt instanceof AST.SCompound) {
+      emitStmt(stmt, indent);
+    } else {
+      const ind = "  ".repeat(indent);
+      w(ind + "{\n");
+      emitStmt(stmt, indent + 1);
+      w(ind + "}\n");
+    }
+  }
+
+  // --- Local declarations ---
+  function emitLocalDecl(decl, indent) {
+    const ind = "  ".repeat(indent);
+    if (decl instanceof AST.DVar) {
+      let s = "";
+      if (decl.storageClass === Types.StorageClass.STATIC) s += "static ";
+      else if (decl.storageClass === Types.StorageClass.EXTERN) s += "extern ";
+      else if (decl.storageClass === Types.StorageClass.REGISTER) s += "register ";
+      s += spellDecl(decl.type, decl.name);
+      if (decl.initExpr) s += " = " + emitExpr(decl.initExpr);
+      w(ind + s + ";\n");
+    } else if (decl instanceof AST.DFunc) {
+      emitFuncDecl(decl, indent);
+    }
+  }
+
+  // --- Top-level declaration emission ---
+  function emitTopLevelDecl(decl) {
+    if (decl instanceof AST.DFunc) {
+      emitFuncDecl(decl, 0);
+    } else if (decl instanceof AST.DVar) {
+      emitVarDecl(decl, 0);
+    }
+  }
+
+  function storagePrefix(decl) {
+    if (decl.storageClass === Types.StorageClass.STATIC) return "static ";
+    if (decl.storageClass === Types.StorageClass.EXTERN) return "extern ";
+    if (decl.storageClass === Types.StorageClass.IMPORT) return "__import ";
+    return "";
+  }
+
+  function emitVarDecl(decl, indent) {
+    const ind = "  ".repeat(indent);
+    let s = storagePrefix(decl);
+    // Check if we need to emit the tag definition inline
+    const uq = decl.type.removeQualifiers();
+    if (maybeEmitInlineTag(decl.type)) {
+      emitTagDef(uq.tagDecl, indent);
+      w(" " + decl.name);
+    } else {
+      s += spellDecl(decl.type, decl.name);
+      w(ind + s);
+    }
+    if (decl.initExpr) w(" = " + emitExpr(decl.initExpr));
+    w(";\n");
+  }
+
+  function emitFuncDecl(decl, indent) {
+    const ind = "  ".repeat(indent);
+    let prefix = storagePrefix(decl);
+    if (decl.isInline) prefix += "inline ";
+
+    // Build parameter list with names
+    const paramStrs = [];
+    for (let i = 0; i < decl.parameters.length; i++) {
+      const p = decl.parameters[i];
+      paramStrs.push(spellDecl(p.type, p.name || ""));
+    }
+    if (decl.type.isVarArg) paramStrs.push("...");
+    else if (paramStrs.length === 0 && !decl.type.hasUnspecifiedParams) paramStrs.push("void");
+
+    const retType = decl.type.getReturnType();
+    const declStr = decl.name + "(" + paramStrs.join(", ") + ")";
+    w(ind + prefix + spellType(retType, declStr));
+
+    if (decl.body) {
+      w("\n");
+      emitStmt(decl.body, indent);
+    } else {
+      w(";\n");
+    }
+  }
+
+  // Collect all tag types referenced anywhere in a type tree
+  function collectTagsFromType(type, tags) {
+    if (!type) return;
+    const uq = type.removeQualifiers();
+    if (uq.isTag && uq.isTag() && uq.tagDecl && uq.tagDecl.isComplete) {
+      if (!tags.has(uq.tagDecl)) {
+        tags.set(uq.tagDecl, uq.tagDecl);
+        for (const m of uq.tagDecl.members) collectTagsFromType(m.type, tags);
+      }
+    }
+    if (uq instanceof Types.PointerType) collectTagsFromType(uq.baseType, tags);
+    if (uq instanceof Types.ArrayType) collectTagsFromType(uq.baseType, tags);
+    if (uq.isFunction()) {
+      collectTagsFromType(uq.returnType, tags);
+      for (const p of uq.paramTypes) collectTagsFromType(p, tags);
+    }
+  }
+
+  function collectTagsFromExpr(expr, tags) {
+    if (!expr) return;
+    collectTagsFromType(expr.type, tags);
+    if (expr.children) for (const c of expr.children) collectTagsFromExpr(c, tags);
+  }
+
+  function collectTagsFromStmt(stmt, tags) {
+    if (!stmt) return;
+    if (stmt instanceof AST.SCompound) {
+      for (const s of stmt.statements) collectTagsFromStmt(s, tags);
+    } else if (stmt instanceof AST.SExpr) {
+      collectTagsFromExpr(stmt.expr, tags);
+    } else if (stmt instanceof AST.SDecl) {
+      for (const d of stmt.declarations) {
+        collectTagsFromType(d.type, tags);
+        if (d.initExpr) collectTagsFromExpr(d.initExpr, tags);
+      }
+    } else if (stmt instanceof AST.SIf) {
+      collectTagsFromExpr(stmt.condition, tags);
+      collectTagsFromStmt(stmt.thenBranch, tags);
+      if (stmt.elseBranch) collectTagsFromStmt(stmt.elseBranch, tags);
+    } else if (stmt instanceof AST.SWhile) {
+      collectTagsFromExpr(stmt.condition, tags);
+      collectTagsFromStmt(stmt.body, tags);
+    } else if (stmt instanceof AST.SDoWhile) {
+      collectTagsFromStmt(stmt.body, tags);
+      collectTagsFromExpr(stmt.condition, tags);
+    } else if (stmt instanceof AST.SFor) {
+      if (stmt.init) collectTagsFromStmt(stmt.init, tags);
+      if (stmt.condition) collectTagsFromExpr(stmt.condition, tags);
+      if (stmt.increment) collectTagsFromExpr(stmt.increment, tags);
+      collectTagsFromStmt(stmt.body, tags);
+    } else if (stmt instanceof AST.SSwitch) {
+      collectTagsFromExpr(stmt.expr, tags);
+      collectTagsFromStmt(stmt.body, tags);
+    } else if (stmt instanceof AST.SReturn && stmt.expr) {
+      collectTagsFromExpr(stmt.expr, tags);
+    } else if (stmt instanceof AST.STryCatch) {
+      collectTagsFromStmt(stmt.tryBody, tags);
+      for (const cc of stmt.catches) collectTagsFromStmt(cc.body, tags);
+    } else if (stmt instanceof AST.SThrow) {
+      for (const a of stmt.args) collectTagsFromExpr(a, tags);
+    }
+  }
+
+  // --- Translation unit ---
+  function emitTUnit(unit) {
+    // Collect all top-level decls and sort by id (source order)
+    const allDecls = [];
+    for (const f of unit.importedFunctions) allDecls.push(f);
+    for (const f of unit.declaredFunctions) allDecls.push(f);
+    for (const f of unit.localDeclaredFunctions) allDecls.push(f);
+    for (const v of unit.externVariables) allDecls.push(v);
+    for (const v of unit.localExternVariables) allDecls.push(v);
+    for (const f of unit.definedFunctions) allDecls.push(f);
+    for (const f of unit.staticFunctions) allDecls.push(f);
+    for (const v of unit.definedVariables) allDecls.push(v);
+    allDecls.sort((a, b) => a.id - b.id);
+
+    // Collect all tag definitions referenced anywhere in this TU
+    const tags = new Map();
+    for (const decl of allDecls) {
+      if (decl.type) collectTagsFromType(decl.type, tags);
+      if (decl instanceof AST.DFunc) {
+        for (const p of decl.parameters) collectTagsFromType(p.type, tags);
+        if (decl.body) collectTagsFromStmt(decl.body, tags);
+      }
+    }
+    // Emit tag definitions sorted by decl id (definition order)
+    const sortedTags = [...tags.values()].sort((a, b) => a.id - b.id);
+    for (const tagDecl of sortedTags) {
+      if (!emittedTags.has(tagDecl)) {
+        emitTagDef(tagDecl, 0);
+        w(";\n\n");
+      }
+    }
+
+    for (const decl of allDecls) {
+      emitTopLevelDecl(decl);
+      w("\n");
+    }
+  }
+
+  for (const unit of units) {
+    if (!showStdlib && unit.filename.startsWith("__")) continue;
+    emitTUnit(unit);
+  }
+  return out.join("");
+}
+
 // Whole-program tree-shake. Walks the AST bag (referencedFunctions /
 // referencedVariables) from cross-TU roots: `main`, `alloca`, exports.
 // Any decl not reached from those roots — including non-static defined
@@ -10807,7 +11449,7 @@ function lowerSetjmpLongjmp(unit, exceptionTagRegistry) {
 }
 
 return {
-  dumpAst, parseTokens, parseSource,
+  dumpAst, printC, parseTokens, parseSource,
   gcSectionsPass,
   linkTranslationUnits,
   lowerSetjmpLongjmp,
@@ -19991,12 +20633,12 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // it walks the AST). Implicit-cast insertion happens inline at parse
     // time at each construction site.
     Parser.lowerSetjmpLongjmp(unit, exceptionTagRegistry);
-    INLINER.optimize(unit, { noUndefined: !!options?.compilerOptions?.noUndefined });
-    // Cross-block goto normalization: hoist labels in sibling/cousin scopes
-    // up to a structurally-enclosing position so the codegen's wasm `block`-
-    // based forward goto handling can reach them. Runs after INLINER (which
-    // may have eliminated some dead branches) and before codegen.
-    GOTO_NORMALIZER.optimize(unit);
+    if (!options?.compilerOptions?.noFold) {
+      INLINER.optimize(unit, { noUndefined: !!options?.compilerOptions?.noUndefined });
+    }
+    if (!options?.compilerOptions?.noGotoNormalize) {
+      GOTO_NORMALIZER.optimize(unit);
+    }
     // IRREDUCIBLE_LOWERING isn't a per-unit pass — it's invoked
     // on-demand at codegen time, only for functions whose structured
     // emit failed. The default path is structured codegen for everyone
@@ -20817,12 +21459,13 @@ function main() {
       compilerOptions.gcSections = true;
     } else if (args[i] === "--gc-no-export-roots") {
       compilerOptions.gcNoExportRoots = true;
+    } else if (args[i] === "--no-fold") {
+      compilerOptions.noFold = true;
+    } else if (args[i] === "--no-goto-normalize") {
+      compilerOptions.noGotoNormalize = true;
+    } else if (args[i] === "--print-stdlib") {
+      compilerOptions.printStdlib = true;
     } else if (args[i] === "--no-irreducible-lowering") {
-      // Disable the loop-switch fallback for functions with cross-block
-      // gotos. Useful for testing the structured-codegen error path
-      // (e.g. negative tests that assert the codegen rejects certain
-      // goto patterns) and for measuring whether a function would have
-      // codegen'd structurally.
       compilerOptions.noIrreducibleLowering = true;
     } else if (args[i] === "-v" || args[i] === "--verbose") {
       compilerOptions.verbose = true;
@@ -20884,7 +21527,7 @@ function main() {
         process.stdout.write(Lexer.formatToken(t) + "\n");
       }
     }
-  } else if (action === "parse" || action === "link" || action === "compile") {
+  } else if (action === "parse" || action === "print" || action === "link" || action === "compile") {
     const hrtime = () => {
       const [s, ns] = process.hrtime();
       return s * 1000 + ns / 1e6;
@@ -20894,6 +21537,8 @@ function main() {
 
     if (action === "parse") {
       process.stdout.write(Parser.dumpAst(units));
+    } else if (action === "print") {
+      process.stdout.write(Parser.printC(units, { showStdlib: compilerOptions.printStdlib }));
     } else if (action === "link") {
       const linkResult = Parser.linkTranslationUnits(units, compilerOptions);
       if (linkResult.errors.length > 0) {
@@ -21048,6 +21693,7 @@ var _exports = {
   parseTokens: Parser.parseTokens,
   parseSource: Parser.parseSource,
   dumpAst: Parser.dumpAst,
+  printC: Parser.printC,
   linkTranslationUnits: Parser.linkTranslationUnits,
   lowerSetjmpLongjmp: Parser.lowerSetjmpLongjmp,
   gcSectionsPass: Parser.gcSectionsPass,
