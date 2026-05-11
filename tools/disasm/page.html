@@ -1237,18 +1237,20 @@ function renderTabContent(tab) {
       parent: tab.contentEl.querySelector('.editor-wrap'),
     });
     tab.data.editorView = view;
-    // Source → Assembly hover highlighting
+    // Source → Assembly + Printed C hover highlighting
     var hoverLine = -1;
     view.contentDOM.addEventListener('mousemove', function(e) {
       var pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
-      if (pos === null) { clearAsmHoverHighlight(); hoverLine = -1; return; }
+      if (pos === null) { clearAsmHoverHighlight(); clearPrintedCHoverHighlight(); hoverLine = -1; return; }
       var line = view.state.doc.lineAt(pos).number;
       if (line === hoverLine) return;
       hoverLine = line;
       highlightAsmForSourceLine(tab.data.filename, line);
+      highlightPrintedCForSourceLine(tab.data.filename, line);
     });
     view.contentDOM.addEventListener('mouseleave', function() {
       clearAsmHoverHighlight();
+      clearPrintedCHoverHighlight();
       hoverLine = -1;
     });
     // Click source line → go to assembly
@@ -1283,6 +1285,27 @@ function renderTabContent(tab) {
       parent: tab.contentEl.querySelector('.editor-wrap'),
     });
     tab.data.editorView = pview;
+    var pcHoverLine = -1;
+    pview.contentDOM.addEventListener('mousemove', function(e) {
+      var pos = pview.posAtCoords({ x: e.clientX, y: e.clientY });
+      if (pos === null) { clearAsmHoverHighlight(); clearSourceHoverHighlight(); pcHoverLine = -1; return; }
+      var line = pview.state.doc.lineAt(pos).number;
+      if (line === pcHoverLine) return;
+      pcHoverLine = line;
+      if (lastPrintedCLineMap && lastPrintedCLineMap[line]) {
+        var loc = lastPrintedCLineMap[line];
+        highlightAsmForSourceLine(loc.file, loc.line);
+        highlightSourceLineHover(loc.file, loc.line);
+      } else {
+        clearAsmHoverHighlight();
+        clearSourceHoverHighlight();
+      }
+    });
+    pview.contentDOM.addEventListener('mouseleave', function() {
+      clearAsmHoverHighlight();
+      clearSourceHoverHighlight();
+      pcHoverLine = -1;
+    });
     return;
   }
 }
@@ -1717,16 +1740,20 @@ function renderFunctionDetail(tab) {
     openSourceTab(srcLink.getAttribute('data-src-file'), parseInt(srcLink.getAttribute('data-src-line')));
   });
 
-  // Assembly → Source hover highlighting
+  // Assembly → Source + Printed C hover highlighting
   wrap.addEventListener('mouseover', function(e) {
     var insn = e.target.closest('.insn[data-src-file]');
     if (!insn) return;
-    highlightSourceLineHover(insn.getAttribute('data-src-file'), parseInt(insn.getAttribute('data-src-line')));
+    var file = insn.getAttribute('data-src-file');
+    var line = parseInt(insn.getAttribute('data-src-line'));
+    highlightSourceLineHover(file, line);
+    highlightPrintedCForSourceLine(file, line);
   });
   wrap.addEventListener('mouseout', function(e) {
     var insn = e.target.closest('.insn[data-src-file]');
     if (!insn) return;
     clearSourceHoverHighlight();
+    clearPrintedCHoverHighlight();
   });
 
   // Local variable highlight on hover
@@ -2090,24 +2117,31 @@ var lastWasm = null;
 var lastSourceMap = null;
 var lastEmbeddedSources = null;
 var lastPrintedC = null;
+var lastPrintedCLineMap = null;
+var printedCReverseMap = null;
 var sourceReverseMap = null;
 var statusEl = document.getElementById('status');
 
 // Bidirectional hover highlight helpers
 var _hoverSourceEl = null;
 var _hoverAsmEls = [];
+var _hoverPrintedEls = [];
+
+function cmLineElAt(view, lineNum) {
+  if (lineNum < 1 || lineNum > view.state.doc.lines) return null;
+  var lineInfo = view.state.doc.line(lineNum);
+  var domInfo = view.domAtPos(lineInfo.from);
+  var el = domInfo.node;
+  if (el.nodeType === 3) el = el.parentNode;
+  while (el && !el.classList.contains('cm-line')) el = el.parentNode;
+  return el;
+}
 
 function highlightSourceLineHover(file, line) {
   clearSourceHoverHighlight();
   var srcTab = findTab('source', 'src-' + file);
   if (!srcTab || !srcTab.tab.data.editorView) return;
-  var view = srcTab.tab.data.editorView;
-  if (line < 1 || line > view.state.doc.lines) return;
-  var lineInfo = view.state.doc.line(line);
-  var domInfo = view.domAtPos(lineInfo.from);
-  var el = domInfo.node;
-  if (el.nodeType === 3) el = el.parentNode;
-  while (el && !el.classList.contains('cm-line')) el = el.parentNode;
+  var el = cmLineElAt(srcTab.tab.data.editorView, line);
   if (el) { el.classList.add('asm-hover'); _hoverSourceEl = el; }
 }
 
@@ -2124,6 +2158,25 @@ function highlightAsmForSourceLine(file, line) {
 function clearAsmHoverHighlight() {
   for (var i = 0; i < _hoverAsmEls.length; i++) _hoverAsmEls[i].classList.remove('source-hover');
   _hoverAsmEls = [];
+}
+
+function highlightPrintedCForSourceLine(file, line) {
+  clearPrintedCHoverHighlight();
+  if (!printedCReverseMap) return;
+  var pcLines = printedCReverseMap[file + '\0' + line];
+  if (!pcLines) return;
+  var pcTab = findTab('printed');
+  if (!pcTab || !pcTab.tab.data.editorView) return;
+  var view = pcTab.tab.data.editorView;
+  for (var i = 0; i < pcLines.length; i++) {
+    var el = cmLineElAt(view, pcLines[i]);
+    if (el) { el.classList.add('asm-hover'); _hoverPrintedEls.push(el); }
+  }
+}
+
+function clearPrintedCHoverHighlight() {
+  for (var i = 0; i < _hoverPrintedEls.length; i++) _hoverPrintedEls[i].classList.remove('asm-hover');
+  _hoverPrintedEls = [];
 }
 
 async function init() {
@@ -2156,6 +2209,8 @@ async function doCompile() {
   }
   lastWasm = null;
   lastPrintedC = null;
+  lastPrintedCLineMap = null;
+  printedCReverseMap = null;
 
   closeResultTabs();
 
@@ -2163,7 +2218,17 @@ async function doCompile() {
     var t0 = performance.now();
     var result = compileC(source);
     var compileMs = (performance.now() - t0).toFixed(0);
-    lastPrintedC = self.CompilerJS.printC(result.units);
+    var pcResult = self.CompilerJS.printC(result.units);
+    lastPrintedC = pcResult.text;
+    lastPrintedCLineMap = pcResult.lineMap;
+    printedCReverseMap = {};
+    for (var li = 1; li < lastPrintedCLineMap.length; li++) {
+      var lm = lastPrintedCLineMap[li];
+      if (!lm) continue;
+      var rk = lm.file + '\0' + lm.line;
+      if (!printedCReverseMap[rk]) printedCReverseMap[rk] = [];
+      printedCReverseMap[rk].push(li);
+    }
     doDisasmWasm(result.wasm, compileMs + 'ms compile, ');
   } catch (e) {
     createTab(paneForNewTab(), 'Error', 'error', { message: e.message || String(e) });
@@ -2346,6 +2411,8 @@ document.addEventListener('drop', function(e) {
   }
   lastWasm = null;
   lastPrintedC = null;
+  lastPrintedCLineMap = null;
+  printedCReverseMap = null;
 
   closeResultTabs();
 

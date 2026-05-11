@@ -6811,8 +6811,23 @@ function printC(units, options) {
   const showStdlib = !!(options && options.showStdlib);
   const out = [];
   const emittedTags = new Set();
+  let curLine = 1;
+  let curLoc = null;
+  const lineMap = [];
 
-  function w(s) { out.push(s); }
+  function w(s) {
+    out.push(s);
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '\n') {
+        if (curLoc && curLoc.filename !== '<generated>') {
+          if (!lineMap[curLine]) lineMap[curLine] = { file: curLoc.filename, line: curLoc.line };
+        }
+        curLine++;
+      }
+    }
+  }
+
+  function setLoc(loc) { if (loc) curLoc = loc; }
 
   // --- Type spelling (C's inside-out declaration syntax) ---
   // spellType(type, declarator) returns a string like "int (*x)[10]".
@@ -7137,6 +7152,7 @@ function printC(units, options) {
   // --- Statement emission ---
   function emitStmt(stmt, indent) {
     if (!stmt) return;
+    setLoc(stmt.loc);
     const ind = "  ".repeat(indent);
     if (stmt instanceof AST.SCompound) {
       w(ind + "{\n");
@@ -7260,6 +7276,7 @@ function printC(units, options) {
 
   // --- Local declarations ---
   function emitLocalDecl(decl, indent) {
+    setLoc(decl.loc);
     const ind = "  ".repeat(indent);
     if (decl instanceof AST.DVar) {
       let s = "";
@@ -7291,6 +7308,7 @@ function printC(units, options) {
   }
 
   function emitVarDecl(decl, indent) {
+    setLoc(decl.loc);
     const ind = "  ".repeat(indent);
     let s = storagePrefix(decl);
     // Check if we need to emit the tag definition inline
@@ -7307,6 +7325,7 @@ function printC(units, options) {
   }
 
   function emitFuncDecl(decl, indent) {
+    setLoc(decl.loc);
     const ind = "  ".repeat(indent);
     let prefix = storagePrefix(decl);
     if (decl.isInline) prefix += "inline ";
@@ -7437,7 +7456,7 @@ function printC(units, options) {
     if (!showStdlib && unit.filename.startsWith("__")) continue;
     emitTUnit(unit);
   }
-  return out.join("");
+  return { text: out.join(""), lineMap: lineMap };
 }
 
 // Whole-program tree-shake. Walks the AST bag (referencedFunctions /
@@ -21538,7 +21557,7 @@ function main() {
     if (action === "parse") {
       process.stdout.write(Parser.dumpAst(units));
     } else if (action === "print") {
-      process.stdout.write(Parser.printC(units, { showStdlib: compilerOptions.printStdlib }));
+      process.stdout.write(Parser.printC(units, { showStdlib: compilerOptions.printStdlib }).text);
     } else if (action === "link") {
       const linkResult = Parser.linkTranslationUnits(units, compilerOptions);
       if (linkResult.errors.length > 0) {
