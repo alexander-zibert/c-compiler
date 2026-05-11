@@ -13218,9 +13218,13 @@ class CodeGenerator {
       case AST.SGoto: {
         const target = stmt.target;
         const depth = target ? this.gotoLabelDepths.get(target) : undefined;
-        if (depth === undefined) {
-          // Out-of-scope or unresolved goto. Emit `unreachable` so the
-          // wasm validator is satisfied; surface a clean error to stderr.
+        // Treat both "label not in map" and "label registered at a
+        // deeper scope than we're currently at" as out-of-scope. The
+        // second case can occur when a label's block-opening was issued
+        // by a parent compound but we've descended into a sibling that
+        // doesn't structurally enclose it — the depth value is stale
+        // relative to our current emission position.
+        if (depth === undefined || depth > this.blockDepth) {
           const loc = stmt.loc || {};
           this.gotoErrors.push({
             message: `goto '${stmt.label}': target label not in scope (in function '${this.currentFuncDef?.name || '?'}') ` +
@@ -14956,13 +14960,56 @@ function generateCode(units, outputFile, options) {
     }
   }
 
-  // Emit function bodies
+  // Emit function bodies. Default path: structured codegen for every
+  // function. If a function accumulates "goto target not in scope"
+  // errors during its emit, roll back its byte/locals output, run the
+  // loop-switch lowering on it, and re-emit. Functions whose structured
+  // emit succeeds pay no extra cost beyond two length-snapshots.
+  const noLowering = !!options?.compilerOptions?.noIrreducibleLowering;
+  const verbose = !!options?.compilerOptions?.verbose;
+  const loweredFnNames = [];
   for (const unit of units) {
     for (const func of [...unit.definedFunctions, ...unit.staticFunctions]) {
       const fdef = func.definition || func;
       if (fdef !== func) continue;
+      const defIdx = cg.funcDefToWasmFuncIdx.get(fdef) - wmod.funcImports.length;
+      const wd = wmod.funcDefs[defIdx];
+      // Snapshot the small handful of arrays the emitter appends to.
+      // Per-function CodeGenerator state (locals, frame layout, scope
+      // maps) is cleared at the start of every emitFunctionBody, so it
+      // doesn't need rollback — only these module-level arrays do.
+      const bodyLen = wd.body.length;
+      const localsLen = wd.locals.length;
+      const errLen = cg.gotoErrors.length;
+      const smLen = cg.sourceMapEntries.length;
+      const lnLen = wmod.localNames.length;
+
       cg.emitFunctionBody(fdef);
+
+      if (!noLowering && cg.gotoErrors.length > errLen) {
+        // Structured emit hit out-of-scope gotos. Roll back everything
+        // we just appended, lower the function body into a loop-switch
+        // state machine, and re-emit. The lowered body has only
+        // structured control flow, so the second emit won't error.
+        wd.body.length = bodyLen;
+        wd.locals.length = localsLen;
+        cg.gotoErrors.length = errLen;
+        cg.sourceMapEntries.length = smLen;
+        wmod.localNames.length = lnLen;
+        if (process.env.IRRED_DEBUG) {
+          console.error(`[irreducible] lowering '${fdef.name}' (retry after structured emit failed)`);
+        }
+        IRREDUCIBLE_LOWERING.lower(fdef);
+        cg.emitFunctionBody(fdef);
+        loweredFnNames.push(fdef.name);
+      }
     }
+  }
+  if (verbose && loweredFnNames.length > 0) {
+    process.stderr.write(
+      `note: ${loweredFnNames.length} function(s) required loop-switch lowering ` +
+      `(irreducible / unresolved cross-block gotos):\n`);
+    for (const n of loweredFnNames) process.stderr.write(`  - ${n}\n`);
   }
 
   // Surface goto errors collected during emit. Out-of-scope gotos already
@@ -19795,14 +19842,11 @@ function parseAllUnits(fs, pp, inputFiles, options) {
     // based forward goto handling can reach them. Runs after INLINER (which
     // may have eliminated some dead branches) and before codegen.
     GOTO_NORMALIZER.optimize(unit);
-    // Loop-switch fallback for any function whose gotos couldn't be made
-    // structured by the normalizer. Runs after, paying the rewrite cost
-    // only for irreducible-mode functions. `--no-irreducible-lowering`
-    // disables this (the structured codegen then surfaces its own
-    // "target label not in scope" diagnostic).
-    IRREDUCIBLE_LOWERING.optimize(unit, {
-      disable: !!options?.compilerOptions?.noIrreducibleLowering,
-    });
+    // IRREDUCIBLE_LOWERING isn't a per-unit pass — it's invoked
+    // on-demand at codegen time, only for functions whose structured
+    // emit failed. The default path is structured codegen for everyone
+    // (faster, smaller wasm); we only pay the rewrite + retry cost for
+    // functions that genuinely can't be expressed structurally.
     if (timing) timing.parseMs += hrtime() - tParse;
     if (parseResult.errors.length > 0) {
       hasErrors = true;
@@ -20624,6 +20668,8 @@ function main() {
       // goto patterns) and for measuring whether a function would have
       // codegen'd structurally.
       compilerOptions.noIrreducibleLowering = true;
+    } else if (args[i] === "-v" || args[i] === "--verbose") {
+      compilerOptions.verbose = true;
     } else if (args[i] === "--no-undefined") {
       compilerOptions.noUndefined = true;
     } else if (args[i] === "--require-source") {
